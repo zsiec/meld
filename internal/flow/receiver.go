@@ -83,6 +83,7 @@ type genState struct {
 // generation whose deadline passes. Deterministic; not safe for concurrent use.
 type Receiver struct {
 	cfg         Config
+	pool        *code.Pool // recycles symbol payload buffers across generation decoders
 	gens        map[uint32]*genState
 	ready       map[uint32][]byte          // recovered/received payloads not yet delivered
 	symDL       map[uint32]clock.Timestamp // exact stamped deadline (write time + budget) of each directly-received id at/above the cursor; pruned as the cursor advances. A received symbol is delivered/evicted by its OWN deadline, so a generation written as one burst (a whole access unit at one instant) is not gated by the uniform-spacing deadline fit it violates.
@@ -170,6 +171,7 @@ type Receiver struct {
 func NewReceiver(cfg Config) *Receiver {
 	r := &Receiver{
 		cfg:         cfg,
+		pool:        code.NewPool(cfg.SymbolSize),
 		gens:        make(map[uint32]*genState),
 		ready:       make(map[uint32][]byte),
 		symDL:       make(map[uint32]clock.Timestamp),
@@ -336,7 +338,9 @@ func (r *Receiver) admit(sym wire.Symbol, n int, base uint32) bool {
 func (r *Receiver) gen(base uint32, n int) *genState {
 	g := r.gens[base]
 	if g == nil {
-		g = &genState{dec: code.NewDecoder(r.cfg.SymbolSize, base, n), n: n}
+		dec := code.NewDecoder(r.cfg.SymbolSize, base, n)
+		dec.SetPool(r.pool)
+		g = &genState{dec: dec, n: n}
 		r.gens[base] = g
 	}
 	return g
@@ -600,6 +604,7 @@ func (r *Receiver) FrameStats() FrameStats {
 func (r *Receiver) reap() {
 	for base, g := range r.gens {
 		if base+uint32(g.n) <= r.cursor {
+			g.dec.Release() // recycle the generation's payload buffers for the next decoder
 			delete(r.gens, base)
 		}
 	}

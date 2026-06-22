@@ -39,6 +39,7 @@ type retGen struct {
 // for concurrent use.
 type Sender struct {
 	cfg         Config
+	pool        *code.Pool            // recycles symbol payload buffers across generation encoders
 	live        *code.Encoder         // the generation currently filling
 	genDL       clock.Timestamp       // current generation's deadline
 	inGen       int                   // source symbols in the current generation
@@ -85,14 +86,17 @@ func (s *Sender) pruneFrameStarts(cur uint32) {
 
 // NewSender constructs a Sender for cfg.
 func NewSender(cfg Config) *Sender {
+	pool := code.NewPool(cfg.SymbolSize)
 	s := &Sender{
 		cfg:       cfg,
+		pool:      pool,
 		live:      code.NewEncoderAt(cfg.SymbolSize, 0),
 		retained:  make(map[uint32]*retGen),
 		rttMicros: defaultRTTMicros,
 		burstQ8:   burstQ8One,
 		bucket:    newTokenBucket(cfg.maxBitrate()),
 	}
+	s.live.SetPool(pool)
 	if cfg.CongestionControl {
 		s.cc = newCongestionController(0, cfg.SymbolSize+symHeaderBytes, cfg.maxBitrate())
 	}
@@ -234,6 +238,7 @@ func (s *Sender) closeGen(now clock.Timestamp) {
 	}
 	s.retained[base] = &retGen{enc: s.live, n: n, proactive: int(key), deadline: s.genDL, nextKey: key, closeAt: now, pri: pri}
 	s.live = code.NewEncoderAt(s.cfg.SymbolSize, base+uint32(n))
+	s.live.SetPool(s.pool)
 	s.inGen = 0
 	s.genMaxPri = 0 // reset for the next generation
 }
@@ -276,6 +281,7 @@ func (s *Sender) FeedFeedback(now clock.Timestamp, fb wire.Feedback) {
 	// Retire generations the receiver has fully decoded/delivered past.
 	for base, g := range s.retained {
 		if base+uint32(g.n) <= fb.DecodedLowEdge {
+			g.enc.Release() // recycle the generation's source buffers
 			delete(s.retained, base)
 		}
 	}
@@ -421,7 +427,13 @@ func (s *Sender) repairCountFor(n int) int {
 // layer must carry the full burst margin itself; it grows as the RTT shrinks relative to the
 // budget, letting reactive repair absorb the burst tail instead.
 func (s *Sender) reactiveRounds() int {
-	cycle := s.rttMicros + feedbackIntervalMicros
+	// One reactive cycle is a full round trip (the batch out, its effect back) plus a feedback
+	// interval to observe. Use 2×rttMicros for the round trip: the RTT estimate (updateRTT)
+	// tends to UNDER-count because HighestSeen is advanced by window-covering repair, so it
+	// tracks closer to one-way than round-trip. Doubling keeps reactiveRounds CONSERVATIVE — it
+	// must never over-credit reactive availability, or the burst margin is discounted on a link
+	// where reactive cannot actually land in time (under-protection at high RTT).
+	cycle := 2*s.rttMicros + feedbackIntervalMicros
 	if cycle <= 0 || s.cfg.BufferMicros <= 0 {
 		return 0
 	}
@@ -514,6 +526,7 @@ func (s *Sender) Tick(now clock.Timestamp) {
 	}
 	for base, g := range s.retained {
 		if now.After(g.deadline) {
+			g.enc.Release() // recycle the generation's source buffers
 			delete(s.retained, base)
 		}
 	}
@@ -567,6 +580,7 @@ func (s *Sender) emitRepair(enc *code.Encoder, key uint16, n int, pri uint8, rea
 		sym.PathID = uint8(s.sched.repairPath())
 	}
 	s.emit(sym)
+	enc.Recycle(pay) // emit copied the payload onto the wire (EncodeSymbol), so reuse the buffer
 	s.stats.Repair++
 	if reactive {
 		s.stats.ReactiveRepair++

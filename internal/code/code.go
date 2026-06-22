@@ -72,6 +72,40 @@ type Encoder struct {
 	symSize int
 	base    uint32
 	syms    [][]byte
+	pool    *Pool // optional symbol-buffer recycler (nil ⇒ allocate)
+}
+
+// SetPool gives the encoder a buffer pool to draw its source/repair payload buffers from.
+func (e *Encoder) SetPool(p *Pool) { e.pool = p }
+
+// Recycle returns a buffer the encoder produced (a Repair/RepairWindow payload) once the caller
+// has finished with it — after the host has serialized it onto the wire — for reuse. No-op
+// without a pool or for a wrong-size buffer.
+func (e *Encoder) Recycle(b []byte) {
+	if e.pool != nil {
+		e.pool.put(b)
+	}
+}
+
+// Release returns every source-symbol buffer the encoder holds to its pool. Call it when the
+// encoder is discarded (its generation retired). After Release the encoder must not be used.
+func (e *Encoder) Release() {
+	if e.pool == nil {
+		return
+	}
+	for i, b := range e.syms {
+		e.pool.put(b)
+		e.syms[i] = nil
+	}
+	e.syms = e.syms[:0]
+}
+
+// symBuf returns a zeroed symbol-size buffer from the pool, or a fresh one.
+func (e *Encoder) symBuf() []byte {
+	if e.pool != nil {
+		return e.pool.get()
+	}
+	return make([]byte, e.symSize)
 }
 
 // NewEncoder returns an Encoder for symbols of symSize bytes, with source ids
@@ -88,7 +122,7 @@ func NewEncoderAt(symSize int, base uint32) *Encoder {
 // Add copies data as the next source symbol (zero-padded to the symbol size) and
 // returns its source id. ids are assigned consecutively from the window base.
 func (e *Encoder) Add(data []byte) uint32 {
-	buf := make([]byte, e.symSize)
+	buf := e.symBuf() // zeroed, so the tail beyond len(data) is the zero pad
 	copy(buf, data)
 	id := e.base + uint32(len(e.syms))
 	e.syms = append(e.syms, buf)
@@ -118,7 +152,7 @@ func (e *Encoder) Source(id uint32) ([]byte, bool) {
 // fresh repairKey for each repair symbol over the same window.
 func (e *Encoder) Repair(repairKey uint16) (base uint32, n int, payload []byte) {
 	n = len(e.syms)
-	payload = make([]byte, e.symSize)
+	payload = e.symBuf() // zeroed, ready to accumulate the linear combination
 	coeffs := GenCoeffs(repairKey, n)
 	for j := 0; j < n; j++ {
 		gf.MulAdd(payload, e.syms[j], coeffs[j])
@@ -138,7 +172,7 @@ func (e *Encoder) RepairWindow(repairKey uint16, ew int) (base uint32, n int, pa
 	if ew > 0 && n > ew {
 		start, n = n-ew, ew
 	}
-	payload = make([]byte, e.symSize)
+	payload = e.symBuf() // zeroed, ready to accumulate the linear combination
 	coeffs := GenCoeffs(repairKey, n)
 	for j := 0; j < n; j++ {
 		gf.MulAdd(payload, e.syms[start+j], coeffs[j])
@@ -155,6 +189,11 @@ func (e *Encoder) SlideTo(newBase uint32) {
 	drop := int(newBase - e.base)
 	if drop > len(e.syms) {
 		drop = len(e.syms)
+	}
+	if e.pool != nil {
+		for i := 0; i < drop; i++ {
+			e.pool.put(e.syms[i]) // the slid-out source symbols are no longer needed
+		}
 	}
 	e.syms = e.syms[drop:]
 	e.base = newBase
@@ -192,6 +231,42 @@ type Decoder struct {
 	done     []bool // done[off]: source symbol at off has been recovered
 	data     [][]byte
 	ndecoded int
+	pool     *Pool // optional symbol-buffer recycler (nil ⇒ allocate)
+}
+
+// SetPool gives the decoder a buffer pool to recycle its symbol-size payload buffers through
+// (the dominant allocation). Call Release when the decoder is discarded to return its buffers.
+func (d *Decoder) SetPool(p *Pool) { d.pool = p }
+
+// Release returns every symbol-size buffer the decoder holds (recovered payloads and the
+// payloads of still-undetermined pivot rows) to its pool, for the next decoder to reuse. After
+// Release the decoder must not be used. Recovered payloads handed out earlier were copied by
+// the host (receiver.absorb), so the buffers are no longer aliased. No-op without a pool.
+func (d *Decoder) Release() {
+	if d.pool == nil {
+		return
+	}
+	for off, b := range d.data {
+		if b != nil {
+			d.pool.put(b)
+			d.data[off] = nil
+		}
+	}
+	for _, p := range d.pivots {
+		if r := d.rows[p]; r != nil {
+			d.pool.put(r.pay)
+			d.rows[p] = nil
+		}
+	}
+	d.pivots = d.pivots[:0]
+}
+
+// symBuf returns a zeroed symbol-size buffer from the pool, or a fresh one.
+func (d *Decoder) symBuf() []byte {
+	if d.pool != nil {
+		return d.pool.get()
+	}
+	return make([]byte, d.symSize)
 }
 
 // NewDecoder returns a Decoder for symbols of symSize bytes over the window
@@ -234,9 +309,9 @@ func (d *Decoder) AddRepair(base uint32, n int, repairKey uint16, payload []byte
 	return d.addEqn(coeffs, d.padded(payload))
 }
 
-// padded returns a fresh symSize-byte copy of data (zero-padded / truncated).
+// padded returns a symSize-byte copy of data (zero-padded / truncated), from the pool when set.
 func (d *Decoder) padded(data []byte) []byte {
-	p := make([]byte, d.symSize)
+	p := d.symBuf() // zeroed, so the tail beyond len(data) is the zero pad
 	copy(p, data)
 	return p
 }
@@ -272,7 +347,10 @@ func (d *Decoder) addEqn(coeffs, pay []byte) []Recovered {
 		}
 	}
 	if piv == -1 {
-		return nil // linearly dependent — no new information
+		if d.pool != nil {
+			d.pool.put(pay) // linearly dependent — no new information; recycle its payload buffer
+		}
+		return nil
 	}
 	if coeffs[piv] != 1 {
 		inv := gf.Inv(coeffs[piv])
