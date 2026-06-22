@@ -48,6 +48,7 @@ type Sender struct {
 	rttMicros   int64                 // EWMA RTT estimate (microseconds)
 	pEst        float64               // estimated channel erasure rate (from feedback)
 	burstQ8     int                   // estimated mean loss-run length, Q8 (from feedback; 256 = i.i.d.)
+	cleanRun    int                   // consecutive feedback reports observing zero loss (floor-decay confidence)
 	lastWrite   clock.Timestamp       // time of the last Write (for the idle flush)
 	now         clock.Timestamp       // most recent entry-point time (for the rate ceiling)
 	bucket      tokenBucket           // aggregate emit-rate ceiling (N1), driven by cc when present
@@ -260,6 +261,18 @@ func (s *Sender) FeedFeedback(now clock.Timestamp, fb wire.Feedback) {
 		}
 	}
 	s.pEst = float64(fb.LossRate) / 65535 // feed-forward channel erasure estimate
+	// Floor-decay confidence: count consecutive feedbacks that POSITIVELY report a clean link, and
+	// snap to zero on the first loss observation. Keyed on the report (fb.LossRate), never on the
+	// mere absence of a signal — a black hole or warmup delivers no feedback at all, so cleanRun
+	// stays 0 and the full onset floor is retained (the distinction the earlier pEst-keyed attempt
+	// missed). The decay also requires a reactive backstop, applied in effectiveFloor.
+	if fb.LossRate == 0 {
+		if s.cleanRun < cleanFloorConfirm {
+			s.cleanRun++
+		}
+	} else {
+		s.cleanRun = 0
+	}
 	if s.burstQ8 = int(fb.Burstiness); s.burstQ8 < burstQ8One {
 		s.burstQ8 = burstQ8One // mean loss-run length for the burst-aware sizer (N2)
 	}
@@ -415,10 +428,25 @@ func (s *Sender) repairCountFor(n int) int {
 	if ge := repairForGE(n, s.burstMarginalPPM(), s.burstQ8, delta); ge > r {
 		r += (ge - r) / (s.reactiveRounds() + 1)
 	}
-	if floor := s.cfg.repairFloor(n); r < floor {
+	if floor := s.effectiveFloor(n); r < floor {
 		r = floor
 	}
 	return r
+}
+
+// effectiveFloor returns the proactive repair floor, decayed to zero ONLY when the link is both
+// confirmed clean (cleanRun feedbacks in a row reporting no loss) and able to recover an onset
+// reactively (reactiveRounds >= reactiveFloorSafe gives an onset generation >= 2 reactive top-up
+// opportunities inside its deadline). On a confirmed-clean, reactive-capable link the static floor
+// recovers nothing — it is pure overhead — and any onset is caught by the reactive tier with margin
+// (its under-recovery probability is O(p^rounds), far below the floor's own decode-failure target);
+// everywhere else (warmup, any loss, high RTT, a black hole that yields no feedback) the full floor
+// is retained, so this can only remove waste, never protection that was load-bearing.
+func (s *Sender) effectiveFloor(n int) int {
+	if s.cleanRun >= cleanFloorConfirm && s.reactiveRounds() >= reactiveFloorSafe {
+		return 0
+	}
+	return s.cfg.repairFloor(n)
 }
 
 // reactiveRounds estimates how many reactive-repair top-ups the reactive tier can land inside

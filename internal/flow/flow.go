@@ -296,6 +296,16 @@ const (
 	// burstSampleCap bounds a single loss run's contribution to the burst EWMA (in
 	// symbols), so one long outage cannot dominate the mean-burst estimate.
 	burstSampleCap = 64
+	// cleanFloorConfirm is how many consecutive zero-loss feedbacks must be observed before the
+	// proactive redundancy floor is allowed to decay (effectiveFloor). Set high so a brief clean
+	// patch or warmup never triggers it — only a durably clean link, where the floor recovers
+	// nothing, does.
+	cleanFloorConfirm = 64
+	// reactiveFloorSafe is the minimum reactiveRounds required to decay the floor: an onset
+	// generation then has at least this many reactive top-up opportunities inside its deadline, so
+	// the reactive tier (not the floor) covers the onset. Conservative (> 1) so feedback or
+	// reactive-repair loss during the onset still leaves a retry within budget.
+	reactiveFloorSafe = 2
 	// defaultMaxGenSymbols / defaultMaxRetainedGens are the resource-safety floors
 	// (N1): a forged symbol cannot allocate a decoder wider than the former or push
 	// the live-decoder count / look-ahead horizon past the latter.
