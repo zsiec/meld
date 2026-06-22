@@ -19,6 +19,30 @@ importance**, protecting the bytes the *picture* depends on. The whole flow is a
 **sans-I/O deterministic state machine** so an oracle can score the exact
 recoverable set.
 
+**Unpacking the jargon above** — each phrase points at concrete code, design notes, and specs:
+
+- **coded symbol over a sliding window**, **recovery from any _k_-of-_n_ symbols** — sliding-window
+  random linear network coding (RLNC) over GF(2⁸): [`internal/code`](internal/code) and
+  [`docs/coding.md`](docs/coding.md). The seeded-coefficient sliding-window RLC lineage is
+  [RFC 8681](https://www.rfc-editor.org/rfc/rfc8681); the alternative block code is RaptorQ
+  ([RFC 6330](https://www.rfc-editor.org/rfc/rfc6330)).
+- **feedback _tightens_ the repair rate but does not _gate_ recovery on round trips** — the
+  feed-forward redundancy controller (`repairForTarget` sizes proactive repair to a target
+  decode-failure probability; the rank-deficit feedback only trims a reactive residual):
+  [`internal/flow`](internal/flow), [`docs/coding.md`](docs/coding.md).
+- **multipath is one erasure channel spread across paths — diversity, not duplication** — a
+  generation is spread over the paths and decoded from their union, sized by a correlation-aware
+  joint-tail estimator (`repairForJointTailN`): [`internal/flow/multipath.go`](internal/flow/multipath.go).
+- **redundancy allocated by deadline and media importance** — unequal error protection steered by
+  per-codec shapers that read the codec's dependency structure
+  ([AV1 Dependency Descriptor](https://aomediacodec.github.io/av1-rtp-spec/#dependency-descriptor-rtp-header-extension);
+  [RFC 6184](https://www.rfc-editor.org/rfc/rfc6184) / [RFC 7798](https://www.rfc-editor.org/rfc/rfc7798)
+  for AVC/HEVC): [`internal/shape`](internal/shape), [`docs/media-awareness.md`](docs/media-awareness.md).
+- **sans-I/O deterministic state machine scored by an oracle** — the core never reads a clock or
+  opens a socket ([sans-I/O](https://sans-io.readthedocs.io/)), and a rank oracle bounds the
+  recoverable set it may ever claim: [`internal/flow`](internal/flow) and
+  [`internal/code`](internal/code) (the `TestRankOracle` property).
+
 > **Meld** is a working codename (you weave coded threads across paths into one
 > fabric). Rename freely. The Go module path is `github.com/zsiec/meld`.
 
