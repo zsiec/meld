@@ -73,7 +73,7 @@ recoverable set.
 ## The bet
 
 SRT and RIST are the same animal: RTP-ish/UDP + sequence numbers + **named-packet
-ARQ** + **rigid block FEC** + **duplicate-everything bonding** (ST 2022-7). Five
+ARQ** + **rigid block FEC** + ST 2022-7 bonding (although I like how RIST does this over the SRT version). Five
 structural gaps, each instrumented in the lab:
 
 1. **ARQ is RTT-bound and 1-for-1.** Each NACK recovers one named packet at a cost
