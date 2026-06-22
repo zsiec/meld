@@ -70,12 +70,10 @@ type deliveredSym struct {
 	data []byte
 }
 
-// genState is one generation's decoder and deadline at the receiver.
+// genState is one generation's decoder at the receiver.
 type genState struct {
-	dec         *code.Decoder
-	n           int
-	deadline    clock.Timestamp
-	deadlineSet bool
+	dec *code.Decoder
+	n   int
 }
 
 // Receiver is the coded receive half of a flow. The host feeds inbound datagrams
@@ -86,11 +84,10 @@ type genState struct {
 type Receiver struct {
 	cfg         Config
 	gens        map[uint32]*genState
-	ready       map[uint32][]byte // recovered/received payloads not yet delivered
-	cursor      uint32            // next source id to deliver
-	highestSeen uint32            // one past the highest source id any symbol has covered
-	maxDeadline clock.Timestamp
-	sawDeadline bool
+	ready       map[uint32][]byte          // recovered/received payloads not yet delivered
+	symDL       map[uint32]clock.Timestamp // exact stamped deadline (write time + budget) of each directly-received id at/above the cursor; pruned as the cursor advances. A received symbol is delivered/evicted by its OWN deadline, so a generation written as one burst (a whole access unit at one instant) is not gated by the uniform-spacing deadline fit it violates.
+	cursor      uint32                     // next source id to deliver
+	highestSeen uint32                     // one past the highest source id any symbol has covered
 	lastFB      clock.Timestamp
 	fedOnce     bool
 	deliverQ    []deliveredSym
@@ -122,12 +119,13 @@ type Receiver struct {
 	// controller): the fraction of the dense systematic source-id sequence not
 	// directly received, over a sliding window, smoothed by an EWMA and a slow
 	// max-hold (the reported value is the larger, so a burst is covered).
-	lossStarted bool
-	lossBase    uint32 // source id at the current loss window's start
-	lossHighest uint32 // highest systematic id seen in the window
-	lossRecv    int    // systematic symbols directly received in the window
-	pEWMA       float64
-	pHold       float64
+	lossStarted      bool
+	lossBootstrapped bool   // first (short) loss window reported — subsequent ones use the full width
+	lossBase         uint32 // source id at the current loss window's start
+	lossHighest      uint32 // highest systematic id seen in the window
+	lossRecv         int    // systematic symbols directly received in the window
+	pEWMA            float64
+	pHold            float64
 
 	// Forward-gap walk over the dense source-id sequence (N1 honest loss + N2 burst
 	// structure): a first-arrival id past the expected one means [expectNext, id)
@@ -174,6 +172,7 @@ func NewReceiver(cfg Config) *Receiver {
 		cfg:         cfg,
 		gens:        make(map[uint32]*genState),
 		ready:       make(map[uint32][]byte),
+		symDL:       make(map[uint32]clock.Timestamp),
 		intervalUs:  1,
 		meanBurstQ8: burstQ8One, // start at the i.i.d. baseline (mean run length 1)
 		mpEnabled:   cfg.multipath(),
@@ -242,24 +241,23 @@ func (r *Receiver) FeedSymbolECN(now clock.Timestamp, datagram []byte, ecn ECN) 
 		}
 		return // every id in this generation is already delivered/skipped
 	}
+	// Clamp the peer-stamped deadline to a sane window around now before it drives any
+	// deadline state — a forged Deadline would otherwise overflow the extrapolation math
+	// (symDeadline) and poison the monotonic refDL backstop. A no-op for honest stamps.
+	dl := clampDeadline(now, clock.Timestamp(sym.Deadline), r.cfg.BufferMicros)
 	g := r.gen(base, n)
-	if !g.deadlineSet {
-		g.deadline = clock.Timestamp(sym.Deadline)
-		g.deadlineSet = true
-		if !r.sawDeadline || g.deadline.After(r.maxDeadline) {
-			r.maxDeadline = g.deadline
-			r.sawDeadline = true
-		}
-	}
 	switch sym.Kind {
 	case wire.Systematic:
-		r.updateRef(sym.SrcIndex, clock.Timestamp(sym.Deadline))
+		r.updateRef(sym.SrcIndex, dl)
+		if sym.SrcIndex >= r.cursor {
+			r.symDL[sym.SrcIndex] = dl // gate this id by its own true deadline, not the fit
+		}
 		if sym.SrcIndex < r.cursor || r.hasReady(sym.SrcIndex) {
 			r.stats.Duplicates++
 		}
 		r.absorb(g.dec.AddSystematic(sym.SrcIndex, sym.Payload), false)
 	case wire.Repair:
-		r.updateRef(base+uint32(n)-1, clock.Timestamp(sym.Deadline))
+		r.updateRef(base+uint32(n)-1, dl)
 		r.absorb(g.dec.AddRepair(base, n, sym.RepairKey, sym.Payload), true)
 	}
 	if end := base + uint32(n); end > r.highestSeen {
@@ -376,18 +374,24 @@ func (r *Receiver) pump(now clock.Timestamp) {
 			r.evictAt(id, r.hasReady(id))
 			continue
 		}
-		gd, gdKnown := r.symDeadline(id)
+		gd, gdKnown := r.deadlineOf(id)
 		payload, ready := r.ready[id]
 		switch {
 		case ready && (!gdKnown || !now.After(gd)):
 			r.attributeFrame(id, false)
 			r.deliverQ = append(r.deliverQ, deliveredSym{id, payload})
 			delete(r.ready, id)
+			delete(r.symDL, id)
 			r.cursor++
 			r.stats.Delivered++
 		case gdKnown && now.After(gd):
 			r.dropAt(id, ready)
-		case r.sawDeadline && now.After(r.maxDeadline):
+		case r.haveRef && r.refID >= id && now.After(r.refDL):
+			// Backstop for an id with no per-id deadline (never arrived, fit unprimed): drop
+			// only once a symbol for an id AT OR ABOVE the cursor is itself overdue. Deadlines
+			// are non-decreasing in id, so refDL (the highest id seen) ≥ this id's deadline —
+			// the id is provably past due, not merely behind a stale earlier-generation anchor
+			// (the clean-link cliff: a gap between bursts must wait, never evict on time).
 			r.dropAt(id, ready)
 		default:
 			return // waiting on an in-time, not-yet-ready symbol
@@ -400,6 +404,7 @@ func (r *Receiver) dropAt(id uint32, ready bool) {
 	if ready {
 		delete(r.ready, id)
 	}
+	delete(r.symDL, id)
 	r.cursor++
 	r.stats.Lost++
 }
@@ -413,6 +418,7 @@ func (r *Receiver) evictAt(id uint32, ready bool) {
 	if ready {
 		delete(r.ready, id)
 	}
+	delete(r.symDL, id)
 	r.cursor++
 	r.stats.Evicted++
 }
@@ -687,10 +693,19 @@ func (r *Receiver) observeLoss(id uint32) {
 	if w := 8 * r.cfg.GenSize; w > win {
 		win = w
 	}
+	// Bootstrap fast: report the FIRST estimate after a single generation rather than waiting the
+	// full variance-reduction window. Until then the sender's feed-forward proactive rate sits at
+	// the floor and under-protects (most visible at high RTT, where the feedback delay already
+	// postpones the estimate); a noisy-but-early estimate, kept conservative by the max-hold, is
+	// far better than zero. Subsequent windows use the full width for low steady-state variance.
+	if !r.lossBootstrapped && lossWindowMin < win {
+		win = lossWindowMin
+	}
 	span := int(r.lossHighest-r.lossBase) + 1
 	if span < win {
 		return
 	}
+	r.lossBootstrapped = true
 	loss := 1 - float64(r.lossRecv)/float64(span)
 	if loss < 0 {
 		loss = 0
@@ -830,10 +845,25 @@ func (r *Receiver) updateRef(id uint32, dl clock.Timestamp) {
 		span := int64(id - r.refID)
 		if sample := dl.Sub(r.refDL) / span; sample > 0 {
 			r.intervalUs = r.intervalUs - r.intervalUs/4 + sample/4
+			if r.intervalUs > maxIntervalMicros {
+				r.intervalUs = maxIntervalMicros // bound the extrapolation multiplier (forged stamps)
+			}
 			r.refSamples++
 		}
 		r.refID, r.refDL = id, dl
 	}
+}
+
+// deadlineOf returns id's delivery deadline and whether it is known. A directly-received
+// symbol carries its own exact stamp (write time + budget), which is authoritative — used
+// so a generation written as one burst (a whole access unit) is gated by each id's true
+// deadline, never by the uniform-spacing fit it violates. An id that never arrived
+// (recovered, or still missing) falls back to the extrapolated fit.
+func (r *Receiver) deadlineOf(id uint32) (clock.Timestamp, bool) {
+	if dl, ok := r.symDL[id]; ok {
+		return dl, true
+	}
+	return r.symDeadline(id)
 }
 
 // symDeadline returns id's extrapolated per-symbol deadline, or false until the fit

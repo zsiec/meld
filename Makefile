@@ -3,7 +3,7 @@
 GO   ?= go
 PKGS := $(shell $(GO) list ./... 2>/dev/null)
 
-.PHONY: build lint test bench check-deps check-core-imports tidy
+.PHONY: build lint test bench check-deps check-core-imports tidy demo-mirror
 
 build:
 	@$(GO) build ./... 2>/dev/null || echo "no packages yet"
@@ -20,6 +20,13 @@ test:
 bench:
 	@if [ -n "$(PKGS)" ]; then $(GO) test -bench=. -benchmem ./...; \
 		else echo "no packages to bench yet"; fi
+
+# demo-mirror — the live latency-mirror showcase: webcam -> Meld -> screen, both ends in
+# one process over loopback. Point the camera at the ffplay window for the recursive
+# latency tunnel. Requires ffmpeg + ffplay on PATH (brew install ffmpeg). Pass extra flags
+# via ARGS, e.g. `make demo-mirror ARGS="-loss 0.2"` or `ARGS="-input test"` (no camera).
+demo-mirror:
+	@$(GO) run ./cmd/meldmirror $(ARGS)
 
 # Dependency allowlist gate: stdlib + golang.org/x/{crypto,net,sys} only. x/sys is
 # admitted as a transitive dep of x/crypto (CPU-feature detection for its SIMD AEAD /

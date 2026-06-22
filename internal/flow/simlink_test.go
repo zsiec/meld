@@ -1,0 +1,192 @@
+package flow
+
+import (
+	"encoding/binary"
+
+	"github.com/zsiec/meld/internal/clock"
+	"github.com/zsiec/meld/internal/wire"
+)
+
+// simChunk builds a source chunk of size bytes carrying id in its first four bytes, so a
+// delivered payload's identity is self-describing (the receiver also reports the id).
+func simChunk(size int, id uint32) []byte {
+	b := make([]byte, size)
+	binary.BigEndian.PutUint32(b, id)
+	return b
+}
+
+// simLink streams n source chunks through Sender -> a lossy link with a real one-way
+// propagation delay -> Receiver, and loops feedback back over the SAME delay, on a manual
+// clock. Unlike runFlow (which hands every datagram to the peer at the same instant, i.e.
+// ~0 RTT), simLink models propagation so the RTT-dependent behavior of the reactive-repair
+// controller, the feedback cadence, and the absolute per-symbol deadline are exercised — the
+// regimes the txbench sweeps live in. Deterministic given drop.
+type simLink struct {
+	cfg          Config
+	owdMicros    int64                  // one-way propagation each direction; rtt = 2*owd
+	srcMicros    int64                  // spacing between source writes (the offered cadence)
+	stepMicros   int64                  // clock granularity (0 ⇒ 1 ms)
+	n            int                    // number of source chunks to send
+	drop         func(wire.Symbol) bool // wire loss; closed over a per-symbol coin by the caller
+	sliding      bool                   // use the band-form sliding coder instead of the generation coder
+	jitterMicros int64                  // max extra per-datagram delay (deterministic per symbol) — induces reorder
+	burst        int                    // source chunks written at one instant per srcMicros tick (0 ⇒ 1); models a media access unit (a whole video frame) written in one go, so a generation fills over a span of wall time rather than uniformly
+}
+
+// simResult is the observed outcome of a simLink run.
+type simResult struct {
+	n            int // source chunks offered (== simLink.n)
+	delivered    int
+	deliveredIDs []uint32
+	stats        ReceiverStats
+	sstats       SenderStats
+	peakGens     int // max len(receiver.gens) over the run — the receiver resource-bound witness
+	peakRetained int // max len(sender.retained) — the sender resource-bound witness
+	lateDeliv    bool
+	corrupt      bool // a delivered payload did not match its source id (false recovery)
+}
+
+// overhead returns the realized repair overhead (repair that actually went out, net of
+// throttle) as a fraction of the source symbols emitted.
+func (res simResult) overhead() float64 {
+	sent := res.sstats.Repair
+	if res.sstats.Throttled < sent {
+		sent -= res.sstats.Throttled
+	} else {
+		sent = 0
+	}
+	if res.sstats.Source == 0 {
+		return 0
+	}
+	return float64(sent) / float64(res.sstats.Source)
+}
+
+type inflight struct {
+	at   clock.Timestamp
+	data []byte
+}
+
+// run executes the sim and returns the observed outcome.
+func (sl simLink) run() simResult {
+	var s coreSenderT
+	var r coreReceiverT
+	if sl.sliding {
+		s, r = NewSlidingSender(sl.cfg), NewSlidingReceiver(sl.cfg)
+	} else {
+		s, r = NewSender(sl.cfg), NewReceiver(sl.cfg)
+	}
+	step := sl.stepMicros
+	if step <= 0 {
+		step = 1_000
+	}
+	res := simResult{n: sl.n}
+	srcDL := map[uint32]clock.Timestamp{}
+	var s2r, r2s []inflight
+	now := clock.Timestamp(0)
+	nextWrite := clock.Timestamp(0)
+	written := 0
+	endBy := clock.Timestamp(0)
+
+	deliverDue := func(q *[]inflight, to func(d []byte)) {
+		keep := (*q)[:0]
+		for _, p := range *q {
+			if p.at.After(now) {
+				keep = append(keep, p)
+			} else {
+				to(p.data)
+			}
+		}
+		*q = keep
+	}
+	pumpSender := func() {
+		for {
+			d, ok := s.PollSend()
+			if !ok {
+				break
+			}
+			sym, err := wire.DecodeSymbol(d)
+			if err != nil || sl.drop(sym) {
+				continue
+			}
+			extra := int64(0)
+			if sl.jitterMicros > 0 {
+				// Deterministic per-symbol jitter ⇒ datagrams reorder across the link without an
+				// rng (keeps the run reproducible). Reorder is a first-class invariant input.
+				extra = int64(coinU(0x31773, uint32(sym.Kind), sym.SrcIndex, sym.WindowBase, uint32(sym.RepairKey)) * float64(sl.jitterMicros))
+			}
+			s2r = append(s2r, inflight{now.Add(sl.owdMicros + extra), d})
+		}
+	}
+	pumpReceiver := func() {
+		for {
+			fb, ok := r.PollSend()
+			if !ok {
+				break
+			}
+			r2s = append(r2s, inflight{now.Add(sl.owdMicros), fb})
+		}
+		for {
+			id, d, ok := r.PollDeliver()
+			if !ok {
+				break
+			}
+			res.deliveredIDs = append(res.deliveredIDs, id)
+			res.delivered++
+			if len(d) >= 4 && binary.BigEndian.Uint32(d) != id {
+				res.corrupt = true // delivered the wrong bytes for this id — a false recovery
+			}
+			if dl, ok := srcDL[id]; ok && now.After(dl) {
+				res.lateDeliv = true
+			}
+		}
+	}
+
+	const maxSteps = 5_000_000
+	for steps := 0; steps < maxSteps; steps++ {
+		for written < sl.n && !nextWrite.After(now) {
+			b := sl.burst
+			if b < 1 {
+				b = 1
+			}
+			for k := 0; k < b && written < sl.n; k++ {
+				id := uint32(written)
+				srcDL[id] = now.Add(sl.cfg.BufferMicros)
+				s.Write(now, simChunk(sl.cfg.SymbolSize, id))
+				written++
+			}
+			nextWrite = nextWrite.Add(sl.srcMicros)
+		}
+		deliverDue(&s2r, func(d []byte) { r.FeedSymbol(now, d) })
+		deliverDue(&r2s, func(d []byte) {
+			if f, err := wire.DecodeFeedback(d); err == nil {
+				s.FeedFeedback(now, f)
+			}
+		})
+		s.Tick(now)
+		r.Tick(now)
+		pumpSender()
+		pumpReceiver()
+		if gr, ok := r.(*Receiver); ok {
+			if l := len(gr.gens); l > res.peakGens {
+				res.peakGens = l
+			}
+		}
+		if gs, ok := s.(*Sender); ok {
+			if l := len(gs.retained); l > res.peakRetained {
+				res.peakRetained = l
+			}
+		}
+		if written >= sl.n {
+			if endBy == 0 {
+				s.Flush(now)
+				endBy = now.Add(sl.cfg.BufferMicros + 6*sl.owdMicros + int64(sl.cfg.GenSize)*sl.srcMicros)
+			} else if now.After(endBy) && len(s2r) == 0 && len(r2s) == 0 {
+				break
+			}
+		}
+		now = now.Add(step)
+	}
+	res.stats = r.Stats()
+	res.sstats = s.Stats()
+	return res
+}

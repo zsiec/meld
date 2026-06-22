@@ -19,13 +19,17 @@ type SenderStats struct {
 // (in its own encoder, whose base is the generation base), its deadline, and the
 // next repair key / last reactive-send time for pacing.
 type retGen struct {
-	enc      *code.Encoder
-	n        int
-	deadline clock.Timestamp
-	nextKey  uint16          // next repair key (fixed repair used 0..R-1)
-	closeAt  clock.Timestamp // when the generation closed (RTT estimate)
-	lastRx   clock.Timestamp // last reactive-repair send (debounce)
-	pri      uint8           // the generation's protection tier (max over its units; for repair stamping)
+	enc         *code.Encoder
+	n           int
+	proactive   int // proactive repair symbols emitted at close (for the per-gen loss estimate)
+	deadline    clock.Timestamp
+	nextKey     uint16          // next repair key (fixed repair used 0..R-1)
+	closeAt     clock.Timestamp // when the generation closed (RTT estimate)
+	lastRx      clock.Timestamp // last reactive-repair send (pacing floor)
+	inflight    int             // reactive repair emitted but not yet reflectable in the feedback deficit
+	inflightAt  clock.Timestamp // when the in-flight reactive repair was last sent
+	lastDeficit int             // the deficit the previous feedback reported (to credit demonstrably-landed repair)
+	pri         uint8           // the generation's protection tier (max over its units; for repair stamping)
 }
 
 // Sender is the coded transmit half of a flow. It emits systematic symbols as
@@ -228,7 +232,7 @@ func (s *Sender) closeGen(now clock.Timestamp) {
 	for r := s.repairCountFor(n); int(key) < r; key++ {
 		s.emitRepair(s.live, key, n, pri, false)
 	}
-	s.retained[base] = &retGen{enc: s.live, n: n, deadline: s.genDL, nextKey: key, closeAt: now, pri: pri}
+	s.retained[base] = &retGen{enc: s.live, n: n, proactive: int(key), deadline: s.genDL, nextKey: key, closeAt: now, pri: pri}
 	s.live = code.NewEncoderAt(s.cfg.SymbolSize, base+uint32(n))
 	s.inGen = 0
 	s.genMaxPri = 0 // reset for the next generation
@@ -290,32 +294,79 @@ func (s *Sender) FeedFeedback(now clock.Timestamp, fb wire.Feedback) {
 	}
 }
 
-// reactiveRepair sends repair for one deficient generation, paced by ~1 RTT so a
-// batch can arrive and update the deficit before the next (debounce per
-// generation, so all deficient generations are serviced in parallel). The batch is
-// sized to clear the deficit in a single round despite the loss of the repair
-// symbols themselves (symbolsForDeficit), and it persists every RTT — like an ARQ
-// NACK loop — until the generation decodes (deficit drops out of the feedback) or
-// its deadline passes.
+// reactiveRepair tops up the repair for one deficient generation, persisting until the
+// generation decodes (the deficit drops out of feedback) or its deadline passes. It sends only
+// the SHORTFALL — the deficit minus the repair already in flight — so it does not re-send a
+// full batch each round. All deficient generations are serviced in parallel.
 func (s *Sender) reactiveRepair(now clock.Timestamp, g *retGen, deficit int) {
 	if now.After(g.deadline) {
 		return // too late to matter
 	}
-	interval := s.rttMicros
-	if interval < minReactiveIntervalMicros {
-		interval = minReactiveIntervalMicros
-	} else if interval > maxReactiveIntervalMicros {
-		interval = maxReactiveIntervalMicros
+	// Cap total reactive repair per generation: a generation of n source symbols needs at most
+	// ~n independent symbols to decode, so once it has been served this much reactive repair and
+	// is STILL deficient, the channel is erasing faster than any repair can fix within the budget
+	// — stop flooding it (its remaining holes are skipped at the deadline). Bounds the per-gen
+	// repair keyspace and the work a persistently-unrecoverable generation can demand.
+	if int(g.nextKey)-g.proactive >= maxRepairFactor*g.n {
+		return
 	}
-	if g.lastRx != 0 && now.Sub(g.lastRx) < interval {
-		return // debounce: a recent batch is still in flight
+	// Expire in-flight reactive repair presumed LOST: a batch sent longer ago than one reflection
+	// latency (a round trip to arrive plus a feedback interval to be reported) that has not shown
+	// up as a deficit drop is gone — drop it so a stuck generation is re-served.
+	if g.inflightAt != 0 && now.Sub(g.inflightAt) >= s.rttMicros+feedbackIntervalMicros {
+		g.inflight = 0
+	}
+	prev := g.lastDeficit
+	g.lastDeficit = deficit
+	// Convergence gate (the key to not over-sending, and RTT-estimate-free): a deficit that is
+	// still DROPPING — or seen for the first time — is converging on its own and must NOT be
+	// reacted to. The first feedback after a generation closes counts its still-in-flight
+	// systematic symbols as losses (a wildly inflated deficit that shrinks as they land), and a
+	// prior reactive batch landing also shows up as a drop; sizing to either floods the link —
+	// the low-RTT overhead inversion. Only a STUCK deficit (no improvement since the last
+	// feedback) is a genuine residual needing new repair. A drop IS repair / late systematic
+	// landing, so credit it against the in-flight tally and wait one more feedback.
+	if prev == 0 || deficit < prev {
+		if landed := prev - deficit; landed > 0 {
+			if g.inflight -= landed; g.inflight < 0 {
+				g.inflight = 0
+			}
+		}
+		return
+	}
+	// Per-generation loss estimate (lag-free): of the n + proactive symbols sent, being
+	// `deficit` short of rank n means ≈ (proactive + deficit) were lost; over GF(256)
+	// (negligible linear dependence) that fraction is an accurate erasure rate, and unlike the
+	// global EWMA it has no warmup lag and captures a burst that hit only this generation.
+	p := s.pEst
+	if sent := g.n + g.proactive; sent > 0 {
+		if pGen := float64(g.proactive+deficit) / float64(sent); pGen > p {
+			p = pGen
+		}
+	}
+	// Discount the repair already in flight by its expected arrivals (HARQ incremental
+	// redundancy): top up only the residual the in-flight batch will not cover.
+	effective := deficit - int(float64(g.inflight)*(1-p))
+	if effective <= 0 {
+		return // the in-flight batch should clear the deficit; wait for it to reflect
+	}
+	if g.lastRx != 0 && now.Sub(g.lastRx) < minReactiveIntervalMicros {
+		return // pacing floor: do not emit on every feedback packet in a burst
 	}
 	g.lastRx = now
-	extra := symbolsForDeficit(deficit, s.pEst, s.cfg.targetFailure())
+	// Size the reactive top-up to the generation's PROTECTION TIER, exactly as the proactive
+	// set-point does (repairCountFor): a keyframe/parameter-set generation gets a tighter
+	// decode-failure target (more repair per unit of deficit), a disposable leaf a looser one.
+	// Without this the reactive tier was flat across tiers, diluting unequal protection — the
+	// budget that should climb the dependency spine was spread evenly on every deficit.
+	delta := targetFailureForPriority(g.pri, s.cfg.targetFailure())
+	extra := symbolsForDeficit(effective, p, delta)
 	for i := 0; i < extra; i++ {
 		s.emitRepair(g.enc, g.nextKey, g.n, g.pri, true)
 		g.nextKey++
 	}
+	g.inflight += extra
+	g.inflightAt = now
 }
 
 // repairCountFor returns the proactive repair count for a generation of n source
@@ -346,13 +397,35 @@ func (s *Sender) repairCountFor(n int) int {
 	// burst 1 the GE tail ≈ the binomial, so this is a no-op. In multipath the GE term
 	// keys on the worse path's marginal — per-path burst is orthogonal to the cross-path
 	// correlation the joint-tail captures, so we provision for whichever tail is heavier.
+	//
+	// The burst MARGIN (the GE term above the i.i.d. set-point) provisions EVERY generation for
+	// the worst-case concentration of a loss run. But when reactive repair can run several rounds
+	// inside the deadline (RTT small relative to the budget), it cleans up those burst outliers
+	// on-demand — cheaply, and only on the generations a burst actually hit — so proactive need
+	// carry only a fraction of the margin. Carry the FULL margin when reactive cannot help (RTT
+	// ≥ budget); shrink it toward the i.i.d. set-point as more reactive rounds fit. This is the
+	// proactive analog of "common case eager, tail lazy": it cuts the bursty-LAN overhead that
+	// blanket GE sizing spends on every generation while reactive sits idle.
 	if ge := repairForGE(n, s.burstMarginalPPM(), s.burstQ8, delta); ge > r {
-		r = ge
+		r += (ge - r) / (s.reactiveRounds() + 1)
 	}
 	if floor := s.cfg.repairFloor(n); r < floor {
 		r = floor
 	}
 	return r
+}
+
+// reactiveRounds estimates how many reactive-repair top-ups the reactive tier can land inside
+// the deadline budget at the current RTT — each costs one round trip plus a feedback interval
+// to observe. It is 0 when that cycle does not fit the budget (high RTT), so the proactive
+// layer must carry the full burst margin itself; it grows as the RTT shrinks relative to the
+// budget, letting reactive repair absorb the burst tail instead.
+func (s *Sender) reactiveRounds() int {
+	cycle := s.rttMicros + feedbackIntervalMicros
+	if cycle <= 0 || s.cfg.BufferMicros <= 0 {
+		return 0
+	}
+	return int(s.cfg.BufferMicros / cycle)
 }
 
 // burstMarginalPPM is the marginal erasure rate (ppm) the GE burst term sizes against:

@@ -328,6 +328,12 @@ const (
 	// Flush at stream end. During continuous streaming the gap between writes is far
 	// smaller, so it never fires.
 	flushIdleMicros = 10_000 // 10 ms
+	// maxIntervalMicros caps the receiver's per-symbol deadline-interval EWMA. A
+	// legitimate inter-symbol interval is sub-millisecond at live bitrates; a value past
+	// this is a forged/garbage Deadline stamp, so capping it keeps the deadline
+	// extrapolation (id-refID)*intervalUs from overflowing int64 (a wire-reachable
+	// invariant break — a wrapped deadline drops in-time symbols or delivers late ones).
+	maxIntervalMicros = 1_000_000 // 1 s
 )
 
 // repairForTarget returns the smallest repair count r such that a generation of k
@@ -362,6 +368,15 @@ func binomTailGreater(n int, p float64, r int) float64 {
 	if r >= n {
 		return 0
 	}
+	// Degenerate probabilities: at p>=1 every trial succeeds (X=n, so P[X>r]=1 for r<n); at
+	// p<=0 none do (X=0, so P[X>r]=0 for r>=0). Handling them keeps the loop's p/(1-p) term
+	// finite — a NaN here would silently saturate symbolsForDeficit's sizing.
+	if p >= 1 {
+		return 1
+	}
+	if p <= 0 {
+		return 0
+	}
 	q := 1 - p
 	term := math.Pow(q, float64(n)) // P[X=0]
 	cdf := term
@@ -388,7 +403,10 @@ func symbolsForDeficit(deficit int, p, delta float64) int {
 	maxR := deficit*maxRepairFactor + 4
 	q := 1 - p // per-symbol arrival probability
 	if q <= 0 {
-		return maxR
+		return maxR // total loss: no finite batch clears it; saturate
+	}
+	if q >= 1 {
+		return deficit // lossless: every repair arrives, so exactly `deficit` clear it
 	}
 	want := 1 - delta
 	for r := deficit; r < maxR; r++ {
@@ -585,6 +603,26 @@ func (tb *tokenBucket) allowRepair(now clock.Timestamp, n int, pri uint8) bool {
 // p65535ToPPM converts a wire loss field (parts per 65535) to parts per million —
 // the unit the joint-tail sizer keys on. The inverse of receiver.ppmToP65535.
 func p65535ToPPM(v uint16) int { return int(int64(v) * 1_000_000 / 65535) }
+
+// clampDeadline bounds a peer-stamped deadline to a sane window around now, so a forged
+// far-future / far-past Deadline field cannot drive the int64 deadline arithmetic
+// (symDeadline extrapolation, the monotonic maxDeadline backstop) toward overflow. An honest
+// deadline is ≈ write_time + budget and is observed at write_time + one-way delay, so it sits
+// within ±(a small multiple of the budget) of now — well inside this window — making the clamp
+// a no-op for legitimate traffic and a guard only against forged stamps.
+func clampDeadline(now, dl clock.Timestamp, budget int64) clock.Timestamp {
+	slack := 16 * budget
+	if slack < 1_000_000 {
+		slack = 1_000_000 // floor so an unset/tiny budget still bounds the value
+	}
+	if hi := now.Add(slack); dl.After(hi) {
+		return hi
+	}
+	if lo := now.Add(-slack); dl.Before(lo) {
+		return lo
+	}
+	return dl
+}
 
 // genBaseOf returns the generation base (aligned to genSize) for a source id.
 func genBaseOf(id uint32, genSize int) uint32 {

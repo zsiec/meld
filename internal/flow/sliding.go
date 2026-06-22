@@ -33,6 +33,16 @@ type SlidingSender struct {
 	deadlines    map[uint32]clock.Timestamp
 	sendQ        [][]byte
 	stats        SenderStats
+
+	// codeRate memo: the proactive set-point depends only on (effectiveBand, pEst,
+	// burstQ8); recomputing the GE-tail search per source symbol made the controller
+	// O(symbols) instead of O(feedback) and detonated CPU/alloc under bursts. Cache it and
+	// recompute only when an input actually moves.
+	crBand    int
+	crPEst    float64
+	crBurstQ8 int
+	crRate    float64
+	crValid   bool
 }
 
 // RateBudgetBitsPerSec returns the send-rate budget the host pacer should release within.
@@ -184,6 +194,14 @@ func (s *SlidingSender) Stats() SenderStats { return s.stats }
 
 func (s *SlidingSender) codeRate() float64 {
 	b := s.effectiveBand()
+	// The set-point depends only on (effectiveBand, pEst, burstQ8) — delta is constant —
+	// so return the memo when none has moved. pEst/burstQ8 change only on feedback and the
+	// band only as the source cadence / RTT drift, so the expensive GE-tail search runs once
+	// per change instead of once per source symbol (the per-symbol cadence was the sliding
+	// profile's CPU/alloc pathology). The cached value is byte-identical to recomputing it.
+	if s.crValid && b == s.crBand && s.pEst == s.crPEst && s.burstQ8 == s.crBurstQ8 {
+		return s.crRate
+	}
 	delta := s.cfg.targetFailure()
 	r := repairForTarget(b, s.pEst, delta)
 	if ge := repairForGE(b, int(s.pEst*1e6), s.burstQ8, delta); ge > r {
@@ -193,6 +211,7 @@ func (s *SlidingSender) codeRate() float64 {
 	if rate < s.cfg.Redundancy {
 		rate = s.cfg.Redundancy
 	}
+	s.crBand, s.crPEst, s.crBurstQ8, s.crRate, s.crValid = b, s.pEst, s.burstQ8, rate, true
 	return rate
 }
 
@@ -210,7 +229,18 @@ func (s *SlidingSender) reactive(now clock.Timestamp, deficit int) {
 		return
 	}
 	s.lastReactive = now
-	for i := symbolsForDeficit(deficit, s.pEst, s.cfg.targetFailure()); i > 0; i-- {
+	// Size the batch to the loss the in-flight window actually experienced, not the global
+	// EWMA (which reports 0 through warmup and lags a burst). Over a band of b source symbols
+	// protected at the current code rate, being `deficit` short implies ≈ (b·rate + deficit) of
+	// the b·(1+rate) sent were lost — an accurate, lag-free per-window erasure rate.
+	p := s.pEst
+	if b := float64(s.effectiveBand()); b > 0 {
+		proactive := b * s.codeRate()
+		if pGen := (proactive + float64(deficit)) / (b + proactive); pGen > p {
+			p = pGen
+		}
+	}
+	for i := symbolsForDeficit(deficit, p, s.cfg.targetFailure()); i > 0; i-- {
 		s.emitRepair(now, true)
 	}
 }
@@ -298,9 +328,14 @@ func (r *SlidingReceiver) FeedSymbol(now clock.Timestamp, datagram []byte) {
 	if err != nil || sym.Flow != r.cfg.Flow {
 		return
 	}
+	dl := clampDeadline(now, clock.Timestamp(sym.Deadline), r.cfg.BufferMicros)
 	switch sym.Kind {
 	case wire.Systematic:
 		id := sym.SrcIndex
+		if !r.admit(id) {
+			r.stats.Rejected++
+			return
+		}
 		// Count the network arrival for the erasure estimate independent of the
 		// deadline/cursor — a symbol received late was not dropped by the channel, so
 		// counting it as loss would inflate the redundancy controller (see the
@@ -311,14 +346,39 @@ func (r *SlidingReceiver) FeedSymbol(now clock.Timestamp, datagram []byte) {
 		} else {
 			r.directRecv[id] = true
 		}
-		r.updateRef(id, clock.Timestamp(sym.Deadline))
+		r.updateRef(id, dl)
 		r.dec.AddSystematic(id, sym.Payload)
 	case wire.Repair:
-		r.updateRef(sym.WindowBase+uint32(sym.N)-1, clock.Timestamp(sym.Deadline))
-		r.dec.AddRepair(sym.WindowBase, int(sym.N), sym.RepairKey, sym.Payload)
+		n := int(sym.N)
+		if n <= 0 || uint64(sym.WindowBase)+uint64(n) > 1<<32 {
+			return // non-positive width, or a window that wraps the id space (forged)
+		}
+		hi := sym.WindowBase + uint32(n) - 1
+		if !r.admit(hi) {
+			r.stats.Rejected++
+			return
+		}
+		r.updateRef(hi, dl)
+		r.dec.AddRepair(sym.WindowBase, n, sym.RepairKey, sym.Payload)
 	}
 	r.pump(now)
 	r.maybeFeedback(now)
+}
+
+// admit bounds the frontier jump a single datagram can force on the band decoder. The
+// decoder's grow() advances the frontier one id at a time (delivering or skipping each), so a
+// forged id far beyond the window would stall it for O(id-cursor) iterations — a one-packet
+// receiver hang. This mirrors the generation receiver's admit() horizon: an id within the
+// delivery window is cheap; one more than a full window past the frontier can never be
+// delivered in-window, so it is refused. coverID is the highest source id the symbol touches.
+func (r *SlidingReceiver) admit(coverID uint32) bool {
+	if coverID < r.dec.Cursor() {
+		return true // duplicate of an already delivered/skipped id — no frontier growth
+	}
+	if h := r.dec.Highest(); coverID >= h && coverID-h > uint32(slidingMaxWin) {
+		return false
+	}
+	return true
 }
 
 // Tick advances time, enforcing deadline skips and periodic feedback.
@@ -426,6 +486,9 @@ func (r *SlidingReceiver) updateRef(id uint32, dl clock.Timestamp) {
 		span := int64(id - r.refID)
 		if sample := dl.Sub(r.refDL) / span; sample > 0 {
 			r.intervalUs = r.intervalUs - r.intervalUs/4 + sample/4
+			if r.intervalUs > maxIntervalMicros {
+				r.intervalUs = maxIntervalMicros // bound the extrapolation multiplier (forged stamps)
+			}
 			r.refSamples++
 		}
 		r.refID, r.refDL = id, dl
