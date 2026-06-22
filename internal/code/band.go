@@ -112,8 +112,45 @@ func (d *BandDecoder) AddSystematic(id uint32, data []byte) {
 	if r, ok := d.rows[id]; ok && len(r.coeffs) == 1 {
 		return // already a solved-equivalent pivot
 	}
+	// Fast path: an in-order systematic at the cursor with no pivot row already at its column is
+	// its own source value. Record it known and fold its column out of the <=b earlier rows that
+	// span it (the harvest elimination + cascade), skipping the equation build, pivot-row creation,
+	// lead scan, and normalize that reduce() would do — byte-identical result for this common case.
+	if id == d.cursor && d.rows[id] == nil {
+		d.known[id] = d.pad(data)
+		d.eliminateKnown(id)
+		d.deliverReady()
+		return
+	}
 	d.reduce(&beq{start: id, coeffs: []byte{1}, pay: d.pad(data)})
 	d.deliverReady()
+}
+
+// eliminateKnown folds the now-known source symbol at column id out of the <=b earlier rows whose
+// span reaches it, cascading any row that thereby collapses to a unit vector into a further solved
+// symbol (the same harvest cascade reduce() runs). Used by the AddSystematic fast path.
+func (d *BandDecoder) eliminateKnown(id uint32) {
+	val := d.known[id]
+	lo := uint32(0)
+	if id > uint32(d.b) {
+		lo = id - uint32(d.b)
+	}
+	if lo < d.cursor {
+		lo = d.cursor
+	}
+	var work []uint32
+	for q := lo; q < id; q++ {
+		r := d.rows[q]
+		if r == nil {
+			continue
+		}
+		if off := int(id - r.start); off < len(r.coeffs) && r.coeffs[off] != 0 {
+			gf.MulAdd(r.pay, val, r.coeffs[off])
+			r.coeffs[off] = 0
+			work = append(work, q)
+		}
+	}
+	d.harvest(work)
 }
 
 // AddRepair feeds a repair over the window [base, base+n) with coefficients
