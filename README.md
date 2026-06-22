@@ -84,11 +84,12 @@ structural gaps, each instrumented in the lab:
    burst longer than its interleave, and forces a full-block wait.
 3. **Bonding is duplication, not diversity.** ST 2022-7 costs N× bandwidth to
    survive one path dying and gains nothing when two paths are merely lossy — even
-   though the information that arrived may sum to more than 100%.
-4. **Recovery is packet-centric, not picture-centric.** Both retransmit a B-frame
+   though the information that arrived may sum to more than 100%. RIST *does* allow
+   for split/merge across links though.
+5. **Recovery is packet-centric, not picture-centric.** Both retransmit a B-frame
    as hard as an SPS/PPS or an IDR slice. Decodable-keyframe %, time-to-first-frame,
    and A/V skew — the metrics that matter — are left to luck.
-5. **Loss vs congestion is ambiguous; session identity is fragile.** Loss-as-
+6. **Loss vs congestion is ambiguous; session identity is fragile.** Loss-as-
    congestion on wireless, NAT rebind, interface flap.
 
 Meld collapses ARQ + FEC + bonding into **one coded primitive** and adds a
