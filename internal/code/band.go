@@ -224,6 +224,8 @@ func (d *BandDecoder) grow(id uint32) {
 // or after c, which the increasing scan then processes — leaving the equation
 // nonzero only at FREE columns; the first is the new pivot.
 func (d *BandDecoder) reduce(eq *beq) {
+	var lead uint32
+	ok := false
 	for i := 0; i < len(eq.coeffs); i++ {
 		c := eq.coeffs[i]
 		if c == 0 {
@@ -237,9 +239,15 @@ func (d *BandDecoder) reduce(eq *beq) {
 		}
 		if row := d.rows[col]; row != nil {
 			eqSubRow(eq, row, c) // zeros col, may extend eq into later (free) columns
+			continue
+		}
+		// A free column with nonzero c — and since eqSubRow only ever extends eq forward, every
+		// earlier column is already zero, so the first one reached is the pivot. Capturing it here
+		// folds the eqLead rescan of the (now zero) prefix into this single pass.
+		if !ok {
+			lead, ok = col, true
 		}
 	}
-	lead, ok := eqLead(eq)
 	if !ok {
 		return // linearly dependent — no new information
 	}
@@ -346,15 +354,6 @@ func (d *BandDecoder) pad(data []byte) []byte {
 	return p
 }
 
-// eqLead returns the first nonzero column of eq and true, or 0/false if eq is zero.
-func eqLead(eq *beq) (uint32, bool) {
-	for i, c := range eq.coeffs {
-		if c != 0 {
-			return eq.start + uint32(i), true
-		}
-	}
-	return 0, false
-}
 
 // eqSubRow does eq -= f*row (row.start >= eq.start), growing eq to cover the row.
 func eqSubRow(eq *beq, row *brow, f byte) {
