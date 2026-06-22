@@ -231,7 +231,17 @@ type Decoder struct {
 	done     []bool // done[off]: source symbol at off has been recovered
 	data     [][]byte
 	ndecoded int
-	pool     *Pool // optional symbol-buffer recycler (nil ⇒ allocate)
+	pool     *Pool   // optional symbol-buffer recycler (nil ⇒ allocate)
+	ops      []payOp // reusable scratch: payload operations recorded while reducing the coeffs
+}
+
+// payOp is one deferred payload elimination: pay ^= f·src. addEqn records these while it reduces
+// an incoming equation's coefficient vector, then replays them on the payload only if the equation
+// turns out to be independent — so a linearly dependent symbol (no new rank) never pays for the
+// payload copy or its GF mul-adds.
+type payOp struct {
+	src []byte
+	f   byte
 }
 
 // SetPool gives the decoder a buffer pool to recycle its symbol-size payload buffers through
@@ -293,7 +303,7 @@ func (d *Decoder) AddSystematic(id uint32, data []byte) []Recovered {
 	}
 	coeffs := make([]byte, d.win)
 	coeffs[off] = 1
-	return d.addEqn(coeffs, d.padded(data))
+	return d.addEqn(coeffs, data)
 }
 
 // AddRepair feeds a repair symbol described by the window (base, n) and repairKey
@@ -306,7 +316,7 @@ func (d *Decoder) AddRepair(base uint32, n int, repairKey uint16, payload []byte
 	}
 	coeffs := make([]byte, d.win)
 	copy(coeffs[start:], GenCoeffs(repairKey, n))
-	return d.addEqn(coeffs, d.padded(payload))
+	return d.addEqn(coeffs, payload)
 }
 
 // padded returns a symSize-byte copy of data (zero-padded / truncated), from the pool when set.
@@ -316,27 +326,29 @@ func (d *Decoder) padded(data []byte) []byte {
 	return p
 }
 
-// addEqn reduces an incoming equation (coeffs, pay) into the RREF matrix and
-// surfaces any source symbols that become determined. coeffs and pay are owned by
-// addEqn (it may store or mutate them).
-func (d *Decoder) addEqn(coeffs, pay []byte) []Recovered {
-	// Forward-reduce against already-recovered symbols and existing pivot rows.
-	// Processing offsets in increasing order is safe: a pivot row is zero at every
-	// column below its pivot, so eliminating it never reintroduces a nonzero into
-	// a column we have already passed.
+// addEqn reduces an incoming equation into the RREF matrix and surfaces any source symbols that
+// become determined. coeffs is owned by addEqn (it may store or mutate it); data is the equation's
+// raw payload, which addEqn copies (d.padded) only if the equation is independent — a linearly
+// dependent symbol adds no rank, so its payload copy and GF mul-adds would be pure waste.
+func (d *Decoder) addEqn(coeffs, data []byte) []Recovered {
+	// Phase 1 — reduce the COEFFICIENT vector against already-recovered symbols and existing pivot
+	// rows, recording each payload elimination to replay later. Processing offsets in increasing
+	// order is safe: a pivot row is zero at every column below its pivot, so eliminating it never
+	// reintroduces a nonzero into a column we have already passed.
+	d.ops = d.ops[:0]
 	for off := 0; off < d.win; off++ {
 		c := coeffs[off]
 		if c == 0 {
 			continue
 		}
 		if d.done[off] {
-			gf.MulAdd(pay, d.data[off], c)
+			d.ops = append(d.ops, payOp{d.data[off], c})
 			coeffs[off] = 0
 			continue
 		}
 		if r := d.rows[off]; r != nil {
 			gf.MulAdd(coeffs, r.coeffs, c)
-			gf.MulAdd(pay, r.pay, c)
+			d.ops = append(d.ops, payOp{r.pay, c})
 		}
 	}
 	piv := -1
@@ -347,10 +359,13 @@ func (d *Decoder) addEqn(coeffs, pay []byte) []Recovered {
 		}
 	}
 	if piv == -1 {
-		if d.pool != nil {
-			d.pool.put(pay) // linearly dependent — no new information; recycle its payload buffer
-		}
-		return nil
+		return nil // linearly dependent — no new information; the payload was never copied or touched
+	}
+	// Phase 2 (independent only) — now materialize the payload and replay the recorded reduction on
+	// it, reproducing exactly what the lockstep coeff+payload reduction would have computed.
+	pay := d.padded(data)
+	for i := range d.ops {
+		gf.MulAdd(pay, d.ops[i].src, d.ops[i].f)
 	}
 	if coeffs[piv] != 1 {
 		inv := gf.Inv(coeffs[piv])
