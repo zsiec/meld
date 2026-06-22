@@ -3,7 +3,7 @@
 *Media Erasure-coded Live Delivery*
 
 **A coded, media-aware, survivable transport for live and contribution-grade
-video.** Meld is a clean-sheet sibling to the author's SRT (`srtgo`/`srtrust`)
+video.** Meld is a clean-sheet sibling to my SRT (`srtgo`/`srtrust`)
 and RIST (`ristgo`/`ristrust`) stacks. It exists to answer one question: *given
 everything we learned building SRT and RIST twice each, and a deterministic
 impairment lab to prove it — what does a transport designed for **survivability**
