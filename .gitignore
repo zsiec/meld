@@ -1,0 +1,18 @@
+# Go build / test artifacts
+*.test
+*.out
+*.prof
+coverage.*
+/bin/
+/dist/
+
+# editors / OS
+.DS_Store
+*.swp
+
+# internal working docs (AI workflow, planning, build-progress) — not part of the
+# public repo; kept locally only
+/.claude/
+/CLAUDE.md
+/PLAN.md
+/ORCHESTRATION.md
