@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"math"
+	"sync"
 	"time"
 
 	"github.com/zsiec/meld/internal/crypto"
@@ -388,6 +389,13 @@ type openState struct {
 	cookies   *crypto.CookieChecker
 	threshold int
 	attempts  int
+
+	// ptPool recycles open-path plaintext buffers (set only for an encrypted session). openAll
+	// decrypts into a pooled buffer instead of allocating per symbol; Read returns the buffer once
+	// it has copied the plaintext out. Safe because in an encrypted session EVERY delivered buffer
+	// comes from a decrypt (the cleartext passthrough in openAll is unreachable when sec != nil), so
+	// Read can recycle unconditionally; a pointer so the embedding Receiver is copy-safe (go vet).
+	ptPool *sync.Pool
 }
 
 func newOpenState(sec *SecurityConfig, flowID uint32) (openState, error) {
@@ -402,6 +410,7 @@ func newOpenState(sec *SecurityConfig, flowID uint32) (openState, error) {
 			return openState{}, err // surface the RNG failure rather than silently disable the gate
 		}
 		os.cookies = cc
+		os.ptPool = &sync.Pool{}
 	}
 	return os, nil
 }
@@ -628,8 +637,12 @@ func (o *openState) openAll(ds []delivered) [][]byte {
 			continue
 		}
 		crypto.PutAAD(&o.aadBuf, o.flowID, uint16(epoch), d.id)
-		pt, err := op.Open(nil, d.data, o.aadBuf[:], d.id)
+		buf, _ := o.ptPool.Get().([]byte) // nil on a pool miss ⇒ Open allocates; recycled buffers self-size
+		pt, err := op.Open(buf[:0], d.data, o.aadBuf[:], d.id)
 		if err != nil {
+			if buf != nil {
+				o.ptPool.Put(buf[:0]) // auth failure: nothing was delivered, so return the buffer
+			}
 			continue
 		}
 		out = append(out, pt)

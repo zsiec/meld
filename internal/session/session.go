@@ -576,7 +576,13 @@ func (r *Receiver) Read(p []byte) (int, error) {
 	}
 	select {
 	case c := <-r.deliverCh:
-		return copy(p, c), nil
+		n := copy(p, c)
+		if r.ptPool != nil {
+			// Encrypted session: c is a pooled decrypt buffer (openAll). The plaintext has been
+			// copied into the caller's p, so the buffer can be recycled for the next decrypt.
+			r.ptPool.Put(c)
+		}
+		return n, nil
 	case <-timeout:
 		return 0, os.ErrDeadlineExceeded
 	case <-r.done:

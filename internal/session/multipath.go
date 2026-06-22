@@ -432,7 +432,11 @@ func (r *MultipathReceiver) Read(p []byte) (int, error) {
 	}
 	select {
 	case c := <-r.deliverCh:
-		return copy(p, c), nil
+		n := copy(p, c)
+		if r.ptPool != nil {
+			r.ptPool.Put(c) // encrypted session: recycle the decrypt buffer after copying it out
+		}
+		return n, nil
 	case <-timeout:
 		return 0, os.ErrDeadlineExceeded
 	case <-r.done:
