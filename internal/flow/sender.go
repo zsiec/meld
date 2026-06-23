@@ -349,22 +349,6 @@ func (s *Sender) reactiveRepair(now clock.Timestamp, g *retGen, deficit int) {
 	if now.After(g.deadline) {
 		return // too late to matter
 	}
-	// Proactive grace period (ModeCockroach), burst-aware. The proactive repair is emitted at
-	// generation CLOSE, so it cannot land and reflect for ~one round trip. On an i.i.d. channel the
-	// proactive one-shots, so the receiver's pre-proactive deficit report (it has seen only the lossy
-	// systematic) is SPURIOUS — reacting floods redundant repair the proactive is about to clear (the
-	// dominant overhead, worse at large GenSize as the slower fill delays the proactive further). So
-	// hold reactive one reflection latency there. But a BURST concentrates losses beyond what the
-	// proactive provisions, so its deficit is GENUINE and waiting a full round trip would HOL-block the
-	// burst generation. SHORTEN the grace in proportion to the estimated mean loss-run length
-	// (burstQ8 / burstQ8One): full at i.i.d. (burstQ8One), an eighth at mean-burst 8 — so a burst
-	// reacts promptly while the i.i.d. spurious flood stays suppressed.
-	if s.cfg.Mode == ModeCockroach {
-		grace := (s.rttMicros + feedbackIntervalMicros) * int64(burstQ8One) / int64(s.burstQ8)
-		if now.Sub(g.closeAt) < grace {
-			return
-		}
-	}
 	// Cap total reactive repair per generation. In ModeLatency: ~maxRepairFactor·n — once a
 	// generation has been served this much and is STILL deficient, the channel is erasing faster
 	// than repair can fix within the budget, so stop flooding (its holes are skipped at the
@@ -422,11 +406,24 @@ func (s *Sender) reactiveRepair(now clock.Timestamp, g *retGen, deficit int) {
 		// reflects. Genuine sustained loss sits below this, so it is unaffected.
 		p = cockroachMaxReactiveP
 	}
+	// Per-generation magnitude gate (ModeCockroach). The proactive repair is emitted at generation
+	// CLOSE and lands ~one round trip later, so while it is in flight the reported deficit reflects
+	// only the lossy systematic and OVERSTATES the true shortfall by the proactive's expected arrivals.
+	// Credit those, so reactive fires only on the residual the proactive will NOT cover — a burst that
+	// concentrated losses beyond what was provisioned. This replaces the channel-wide grace: it is
+	// per generation, so a CLEAN generation within a bursty channel (deficit ≤ proactive coverage)
+	// stays suppressed (no spurious flood) while a genuine burst generation reacts promptly, on its
+	// shortfall alone. Outside the window the proactive has reflected into the deficit, so the credit
+	// is 0 and this is a no-op.
+	proactiveCredit := 0
+	if s.cfg.Mode == ModeCockroach && now.Sub(g.closeAt) < s.rttMicros+feedbackIntervalMicros {
+		proactiveCredit = int(float64(g.proactive) * (1 - p))
+	}
 	// Discount the repair already in flight by its expected arrivals (HARQ incremental
-	// redundancy): top up only the residual the in-flight batch will not cover.
-	effective := deficit - int(float64(g.inflight)*(1-p))
+	// redundancy): top up only the residual the in-flight batch (proactive + reactive) will not cover.
+	effective := deficit - proactiveCredit - int(float64(g.inflight)*(1-p))
 	if effective <= 0 {
-		return // the in-flight batch should clear the deficit; wait for it to reflect
+		return // the in-flight repair should clear the deficit; wait for it to reflect
 	}
 	if g.lastRx != 0 && now.Sub(g.lastRx) < minReactiveIntervalMicros {
 		return // pacing floor: do not emit on every feedback packet in a burst
