@@ -16,6 +16,29 @@ import (
 //      decayed floor where it can land in time, and the floor stays full (gate closed) where it
 //      cannot, so neither regime under-covers the onset.
 
+// perfBudget is the playout/deadline budget these tests size against (200 ms, as the bench).
+const perfBudget = 200_000
+
+// perfCfg is the shared generation-coder config for the floor-decay tests: the bench's symbol/gen
+// size at the default 15% redundancy floor.
+func perfCfg() Config {
+	return Config{Flow: 1, SymbolSize: 256, GenSize: 16, Redundancy: 0.15, BufferMicros: perfBudget}
+}
+
+// onsetDrop forwards the first cleanCalls symbols cleanly (to arm the floor-decay confidence), then
+// switches to i.i.d. p loss — the clean→degradation transient the decay must not break.
+func onsetDrop(cleanCalls int, seed uint64, p float64) func(wire.Symbol) bool {
+	base := uniformDrop(seed, p)
+	n := 0
+	return func(sym wire.Symbol) bool {
+		n++
+		if n <= cleanCalls {
+			return false
+		}
+		return base(sym)
+	}
+}
+
 // TestFloorDecayReclaimsCleanWaste — property (1).
 func TestFloorDecayReclaimsCleanWaste(t *testing.T) {
 	const n = 6000 // long enough to build cleanRun past cleanFloorConfirm, then run decayed
