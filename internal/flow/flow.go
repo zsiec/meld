@@ -49,6 +49,14 @@ type Config struct {
 	// BufferMicros is the playout/deadline budget: a generation must be delivered
 	// within this of its start, or its still-missing symbols are declared lost.
 	BufferMicros int64
+	// ElasticMicros (0 = off) is the burst-elastic deadline extension: a generation that
+	// still has a rank deficit at its nominal deadline is held this much longer before
+	// eviction — fitting reactive rounds the steady budget cannot at a high RTT — so the
+	// sender can carry a smaller proactive burst margin (the discount counts the elastic
+	// rounds, reactiveRounds). Ready symbols still deliver immediately, so the extra latency
+	// falls only on the deficit symbols a burst actually hit: it trades a transient p99
+	// excursion (bounded by this) for proactive overhead, leaving p50 at the steady budget.
+	ElasticMicros int64
 	// Sliding selects the band-form sliding-window coder instead of the default
 	// generation coder: a repair is fungible across a coding window of CodingWindow
 	// symbols, delivered on decode (no per-generation close), at O(CodingWindow²)

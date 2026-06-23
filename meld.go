@@ -34,6 +34,11 @@ type Config struct {
 	TargetFailure float64
 	// BufferMicros is the playout/deadline budget in microseconds.
 	BufferMicros int64
+	// ElasticMicros (0 = off) is the burst-elastic deadline extension: a generation still in a
+	// rank deficit at its nominal deadline is held this much longer for reactive recovery, so the
+	// sender carries a smaller proactive burst margin. Ready symbols deliver immediately; only the
+	// deficit symbols a burst hit incur the extra latency (a transient p99 excursion for overhead).
+	ElasticMicros int64
 	// Sliding selects the band-form sliding-window coder instead of the default
 	// generation coder. It codes continuous, fungible repair over one elastic window
 	// and delivers each symbol the instant it decodes.
@@ -169,6 +174,7 @@ func (c Config) toFlow() flow.Config {
 		Redundancy:        c.Redundancy,
 		TargetFailure:     c.TargetFailure,
 		BufferMicros:      c.BufferMicros,
+		ElasticMicros:     c.ElasticMicros,
 		Sliding:           c.Sliding,
 		CodingWindow:      c.CodingWindow,
 		CongestionControl: c.CongestionControl,

@@ -462,10 +462,11 @@ func (s *Sender) reactiveRounds() int {
 	// must never over-credit reactive availability, or the burst margin is discounted on a link
 	// where reactive cannot actually land in time (under-protection at high RTT).
 	cycle := 2*s.rttMicros + feedbackIntervalMicros
-	if cycle <= 0 || s.cfg.BufferMicros <= 0 {
+	budget := s.cfg.BufferMicros + s.cfg.ElasticMicros // elastic deadline lets reactive land later
+	if cycle <= 0 || budget <= 0 {
 		return 0
 	}
-	return int(s.cfg.BufferMicros / cycle)
+	return int(budget / cycle)
 }
 
 // burstMarginalPPM is the marginal erasure rate (ppm) the GE burst term sizes against:

@@ -135,8 +135,8 @@ func (sl simLink) run() simResult {
 			if len(d) >= 4 && binary.BigEndian.Uint32(d) != id {
 				res.corrupt = true // delivered the wrong bytes for this id — a false recovery
 			}
-			if dl, ok := srcDL[id]; ok && now.After(dl) {
-				res.lateDeliv = true
+			if dl, ok := srcDL[id]; ok && now.After(dl.Add(sl.cfg.ElasticMicros)) {
+				res.lateDeliv = true // past the EFFECTIVE deadline (nominal + any elastic extension)
 			}
 		}
 	}

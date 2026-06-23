@@ -379,6 +379,17 @@ func (r *Receiver) pump(now clock.Timestamp) {
 			continue
 		}
 		gd, gdKnown := r.deadlineOf(id)
+		// Burst-elastic deadline: a still-missing (not-ready) symbol is held ElasticMicros past its
+		// nominal deadline so reactive repair gets the extra rounds. Ready symbols are unaffected —
+		// they deliver immediately below, well before the extended deadline — so the latency falls
+		// only on the deficit symbols a burst actually hit.
+		refDL := r.refDL
+		if r.cfg.ElasticMicros > 0 {
+			if gdKnown {
+				gd = gd.Add(r.cfg.ElasticMicros)
+			}
+			refDL = refDL.Add(r.cfg.ElasticMicros)
+		}
 		payload, ready := r.ready[id]
 		switch {
 		case ready && (!gdKnown || !now.After(gd)):
@@ -390,7 +401,7 @@ func (r *Receiver) pump(now clock.Timestamp) {
 			r.stats.Delivered++
 		case gdKnown && now.After(gd):
 			r.dropAt(id, ready)
-		case r.haveRef && r.refID >= id && now.After(r.refDL):
+		case r.haveRef && r.refID >= id && now.After(refDL):
 			// Backstop for an id with no per-id deadline (never arrived, fit unprimed): drop
 			// only once a symbol for an id AT OR ABOVE the cursor is itself overdue. Deadlines
 			// are non-decreasing in id, so refDL (the highest id seen) ≥ this id's deadline —
