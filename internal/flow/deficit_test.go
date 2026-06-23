@@ -13,15 +13,15 @@ import (
 
 // TestSymbolsForDeficitDegenerate covers the boundary inputs.
 func TestSymbolsForDeficitDegenerate(t *testing.T) {
-	if r := symbolsForDeficit(0, 0.1, 1e-3); r != 0 {
+	if r := symbolsForDeficit(0, 0.1, 1e-3, maxRepairFactor); r != 0 {
 		t.Fatalf("zero deficit must need no repair, got %d", r)
 	}
-	if r := symbolsForDeficit(-3, 0.1, 1e-3); r != 0 {
+	if r := symbolsForDeficit(-3, 0.1, 1e-3, maxRepairFactor); r != 0 {
 		t.Fatalf("negative deficit must need no repair, got %d", r)
 	}
 	// A total-loss channel saturates at the cap rather than looping forever.
 	maxR := 4*maxRepairFactor + 4
-	if r := symbolsForDeficit(4, 1.0, 1e-3); r != maxR {
+	if r := symbolsForDeficit(4, 1.0, 1e-3, maxRepairFactor); r != maxR {
 		t.Fatalf("total-loss channel should saturate at the cap %d, got %d", maxR, r)
 	}
 }
@@ -35,10 +35,10 @@ func TestSymbolsForDeficitDegenerate(t *testing.T) {
 // never passes p=0 with a real deficit; (2) the sizer itself is now exact at the degenerate
 // probabilities. So this can assert the correct minimal value.
 func TestSymbolsForDeficitZeroLoss(t *testing.T) {
-	if got := symbolsForDeficit(5, 0.0, 1e-3); got != 5 {
+	if got := symbolsForDeficit(5, 0.0, 1e-3, maxRepairFactor); got != 5 {
 		t.Fatalf("lossless channel should need exactly the deficit (5), got %d", got)
 	}
-	if got := symbolsForDeficit(5, 1e-6, 1e-3); got > 7 {
+	if got := symbolsForDeficit(5, 1e-6, 1e-3, maxRepairFactor); got > 7 {
 		t.Fatalf("near-lossless channel should need ~deficit symbols, got %d", got)
 	}
 }
@@ -50,7 +50,7 @@ func TestSymbolsForDeficitAchievesTarget(t *testing.T) {
 	for _, deficit := range []int{1, 2, 4, 8} {
 		for _, p := range []float64{0.05, 0.1, 0.2, 0.3, 0.4} {
 			for _, delta := range []float64{1e-2, 1e-3} {
-				r := symbolsForDeficit(deficit, p, delta)
+				r := symbolsForDeficit(deficit, p, delta, maxRepairFactor)
 				if r < deficit {
 					t.Fatalf("deficit=%d p=%g: r=%d < deficit (can't clear it even losslessly)", deficit, p, r)
 				}
@@ -80,7 +80,7 @@ func TestSymbolsForDeficitMonotone(t *testing.T) {
 	// Non-decreasing in deficit.
 	prev := -1
 	for d := 0; d <= 10; d++ {
-		r := symbolsForDeficit(d, 0.2, 1e-3)
+		r := symbolsForDeficit(d, 0.2, 1e-3, maxRepairFactor)
 		if r < prev {
 			t.Fatalf("not monotone in deficit: d=%d gave %d < %d", d, r, prev)
 		}
@@ -90,7 +90,7 @@ func TestSymbolsForDeficitMonotone(t *testing.T) {
 	// separately in TestSymbolsForDeficitZeroLossOverSend).
 	prev = -1
 	for _, p := range []float64{0.05, 0.1, 0.2, 0.3, 0.4, 0.5} {
-		r := symbolsForDeficit(4, p, 1e-3)
+		r := symbolsForDeficit(4, p, 1e-3, maxRepairFactor)
 		if r < prev {
 			t.Fatalf("not monotone in p: p=%g gave %d < %d", p, r, prev)
 		}
@@ -109,7 +109,7 @@ func TestSymbolsForDeficitEmpirical(t *testing.T) {
 	rng := rand.New(rand.NewSource(42))
 	for _, deficit := range []int{2, 5} {
 		for _, p := range []float64{0.1, 0.25} {
-			r := symbolsForDeficit(deficit, p, delta)
+			r := symbolsForDeficit(deficit, p, delta, maxRepairFactor)
 			if r >= deficit*maxRepairFactor+4 {
 				continue // saturated
 			}

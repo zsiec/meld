@@ -25,6 +25,23 @@ import (
 	"github.com/zsiec/meld/internal/clock"
 )
 
+// Mode selects the delivery contract a Sender/Receiver pair optimizes for.
+type Mode uint8
+
+const (
+	// ModeLatency (the default) bounds latency: a generation is delivered within its deadline
+	// (optionally extended by ElasticMicros) or declared lost. This is Meld's low-latency identity.
+	ModeLatency Mode = iota
+	// ModeCockroach inverts the contract: reliability is the invariant, latency the soft variable.
+	// Reactive coded repair becomes RATELESS — it persists for a deficient generation, uncapped,
+	// to the full retention bound (deadline + ElasticMicros, which an operator sets deep, e.g.
+	// seconds) instead of stopping at the nominal deadline. Combined with the receiver retaining
+	// un-decoded generations to that same bound, it rides out total outages (up to the retention
+	// depth) and sustained extreme loss, delivering everything eventually at flexed latency. It
+	// does NOT change the latency-mode default; it is opt-in per flow.
+	ModeCockroach
+)
+
 // Config parameterizes a Sender/Receiver pair. Both ends must agree on Flow,
 // SymbolSize, and GenSize; Redundancy, TargetFailure, and BufferMicros are
 // sender-side policy.
@@ -57,6 +74,10 @@ type Config struct {
 	// falls only on the deficit symbols a burst actually hit: it trades a transient p99
 	// excursion (bounded by this) for proactive overhead, leaving p50 at the steady budget.
 	ElasticMicros int64
+	// Mode selects the delivery contract (ModeLatency default, ModeCockroach for reliability-first
+	// rateless recovery). ModeCockroach is typically paired with a deep ElasticMicros (the retention
+	// depth = how long the receiver holds an un-decoded generation and the sender keeps repairing it).
+	Mode Mode
 	// Sliding selects the band-form sliding-window coder instead of the default
 	// generation coder: a repair is fungible across a coding window of CodingWindow
 	// symbols, delivered on decode (no per-generation close), at O(CodingWindow²)
@@ -291,6 +312,16 @@ const (
 	// maxRepairFactor caps the proactive code rate at this multiple of the
 	// generation size, bounding overhead under an extreme or mis-estimated loss.
 	maxRepairFactor = 3
+	// cockroachRepairFactor caps total RATELESS reactive repair per generation in ModeCockroach at
+	// this multiple of the generation size. It is far higher than maxRepairFactor — recovery is
+	// rateless within the retention window, so to deliver n source symbols under loss p the sender
+	// emits ~n/(1-p) symbols, and 64× covers loss up to ~98% — yet the retention deadline and the
+	// convergence gate (react only to a STUCK deficit) do the real limiting; this is only a backstop
+	// against a permanently dead generation demanding unbounded work.
+	cockroachRepairFactor = 64
+	// maxRepairKeys bounds the per-generation repair keyspace under the uint16 key width, with
+	// headroom for the proactive prefix, so the cockroach cap can never overflow nextKey.
+	maxRepairKeys = 60000
 	// lossWindowMin is the smallest source-id span the receiver averages channel
 	// loss over before reporting; a wider span lowers estimator variance.
 	lossWindowMin = 64
@@ -414,11 +445,11 @@ func binomTailGreater(n int, p float64, r int) float64 {
 // random combination, so arrivals ~ Binomial(r, 1-p); this sizes a reactive batch
 // to clear the deficit in ONE round despite the loss of the repair symbols
 // themselves — instead of a fixed margin that stalls convergence under heavy loss.
-func symbolsForDeficit(deficit int, p, delta float64) int {
+func symbolsForDeficit(deficit int, p, delta float64, maxFactor int) int {
 	if deficit <= 0 {
 		return 0
 	}
-	maxR := deficit*maxRepairFactor + 4
+	maxR := deficit*maxFactor + 4
 	q := 1 - p // per-symbol arrival probability
 	if q <= 0 {
 		return maxR // total loss: no finite batch clears it; saturate

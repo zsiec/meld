@@ -240,7 +240,7 @@ func (s *SlidingSender) reactive(now clock.Timestamp, deficit int) {
 			p = pGen
 		}
 	}
-	for i := symbolsForDeficit(deficit, p, s.cfg.targetFailure()); i > 0; i-- {
+	for i := symbolsForDeficit(deficit, p, s.cfg.targetFailure(), maxRepairFactor); i > 0; i-- {
 		s.emitRepair(now, true)
 	}
 }

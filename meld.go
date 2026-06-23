@@ -39,6 +39,13 @@ type Config struct {
 	// sender carries a smaller proactive burst margin. Ready symbols deliver immediately; only the
 	// deficit symbols a burst hit incur the extra latency (a transient p99 excursion for overhead).
 	ElasticMicros int64
+	// Cockroach selects reliability-first "cockroach mode": reactive coded repair becomes rateless,
+	// persisting (uncapped) for a deficient generation to the full retention bound (BufferMicros +
+	// ElasticMicros) rather than stopping at the nominal deadline, and the receiver retains
+	// un-decoded generations to that bound. Paired with a deep ElasticMicros it rides out total
+	// outages and sustained extreme loss, delivering everything eventually at flexed latency.
+	// Opt-in; does not change the low-latency default. Maps to flow.ModeCockroach.
+	Cockroach bool
 	// Sliding selects the band-form sliding-window coder instead of the default
 	// generation coder. It codes continuous, fungible repair over one elastic window
 	// and delivers each symbol the instant it decodes.
@@ -166,6 +173,14 @@ func DefaultConfig() Config {
 	}
 }
 
+// flowMode maps the Cockroach flag to the flow delivery mode.
+func (c Config) flowMode() flow.Mode {
+	if c.Cockroach {
+		return flow.ModeCockroach
+	}
+	return flow.ModeLatency
+}
+
 func (c Config) toFlow() flow.Config {
 	return flow.Config{
 		Flow:              c.Flow,
@@ -175,6 +190,7 @@ func (c Config) toFlow() flow.Config {
 		TargetFailure:     c.TargetFailure,
 		BufferMicros:      c.BufferMicros,
 		ElasticMicros:     c.ElasticMicros,
+		Mode:              c.flowMode(),
 		Sliding:           c.Sliding,
 		CodingWindow:      c.CodingWindow,
 		CongestionControl: c.CongestionControl,

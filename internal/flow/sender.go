@@ -237,7 +237,11 @@ func (s *Sender) closeGen(now clock.Timestamp) {
 	for r := s.repairCountFor(n); int(key) < r; key++ {
 		s.emitRepair(s.live, key, n, pri, false)
 	}
-	s.retained[base] = &retGen{enc: s.live, n: n, proactive: int(key), deadline: s.genDL, nextKey: key, closeAt: now, pri: pri}
+	// Reactive repair persists to the RETENTION bound (nominal deadline + ElasticMicros), not the
+	// nominal deadline — the receiver retains an un-decoded generation that long, so the sender must
+	// keep repairing it that long too. In ModeLatency with ElasticMicros=0 this is the nominal
+	// deadline (unchanged); under the elastic deadline or cockroach mode it is the deep bound.
+	s.retained[base] = &retGen{enc: s.live, n: n, proactive: int(key), deadline: s.genDL.Add(s.cfg.ElasticMicros), nextKey: key, closeAt: now, pri: pri}
 	s.live = code.NewEncoderAt(s.cfg.SymbolSize, base+uint32(n))
 	s.live.SetPool(s.pool)
 	s.inGen = 0
@@ -313,6 +317,30 @@ func (s *Sender) FeedFeedback(now clock.Timestamp, fb wire.Feedback) {
 	}
 }
 
+// repairFactor is the per-deficit reactive sizing multiple for the active mode. ModeLatency uses the
+// tight maxRepairFactor flood guard (avoids the low-RTT overhead inversion); ModeCockroach lifts it
+// so a single batch can clear a deficit in ~one round even under extreme loss — to land `deficit`
+// symbols over an erasure rate p the sender must emit ~deficit/(1-p), which at p=0.85 is ~6.7×,
+// beyond the 3× latency guard. It bounds both the per-round batch (symbolsForDeficit) and the
+// per-generation total (reactiveCap).
+func (s *Sender) repairFactor() int {
+	if s.cfg.Mode == ModeCockroach {
+		return cockroachRepairFactor
+	}
+	return maxRepairFactor
+}
+
+// reactiveCap returns the maximum total reactive repair (symbols) a single generation may be served,
+// bounding the keyspace a persistently-deficient generation can demand. ModeCockroach lifts it to a
+// rateless backstop (clamped under the uint16 repair keyspace) so recovery persists for the full
+// retention window instead of being abandoned after a few rounds.
+func (s *Sender) reactiveCap(n int) int {
+	if c := s.repairFactor() * n; c < maxRepairKeys {
+		return c
+	}
+	return maxRepairKeys
+}
+
 // reactiveRepair tops up the repair for one deficient generation, persisting until the
 // generation decodes (the deficit drops out of feedback) or its deadline passes. It sends only
 // the SHORTFALL — the deficit minus the repair already in flight — so it does not re-send a
@@ -321,12 +349,12 @@ func (s *Sender) reactiveRepair(now clock.Timestamp, g *retGen, deficit int) {
 	if now.After(g.deadline) {
 		return // too late to matter
 	}
-	// Cap total reactive repair per generation: a generation of n source symbols needs at most
-	// ~n independent symbols to decode, so once it has been served this much reactive repair and
-	// is STILL deficient, the channel is erasing faster than any repair can fix within the budget
-	// — stop flooding it (its remaining holes are skipped at the deadline). Bounds the per-gen
-	// repair keyspace and the work a persistently-unrecoverable generation can demand.
-	if int(g.nextKey)-g.proactive >= maxRepairFactor*g.n {
+	// Cap total reactive repair per generation. In ModeLatency: ~maxRepairFactor·n — once a
+	// generation has been served this much and is STILL deficient, the channel is erasing faster
+	// than repair can fix within the budget, so stop flooding (its holes are skipped at the
+	// deadline). In ModeCockroach the cap is far higher (rateless within retention); the retention
+	// deadline above and the convergence gate below do the real limiting.
+	if int(g.nextKey)-g.proactive >= s.reactiveCap(g.n) {
 		return
 	}
 	// Expire in-flight reactive repair presumed LOST: a batch sent longer ago than one reflection
@@ -351,7 +379,14 @@ func (s *Sender) reactiveRepair(now clock.Timestamp, g *retGen, deficit int) {
 				g.inflight = 0
 			}
 		}
-		return
+		// ModeLatency defers on ANY drop (a dropping deficit is converging; reacting floods — the
+		// low-RTT overhead inversion). ModeCockroach defers ONLY the first (inflated) feedback after a
+		// generation closes, then keeps pushing even while the deficit drops slowly: under extreme
+		// loss the systematic trickles in over many rounds, so waiting for the deficit to fully stall
+		// would burn the retention window. The in-flight discount below still prevents flooding.
+		if s.cfg.Mode != ModeCockroach || prev == 0 {
+			return
+		}
 	}
 	// Per-generation loss estimate (lag-free): of the n + proactive symbols sent, being
 	// `deficit` short of rank n means ≈ (proactive + deficit) were lost; over GF(256)
@@ -379,7 +414,7 @@ func (s *Sender) reactiveRepair(now clock.Timestamp, g *retGen, deficit int) {
 	// Without this the reactive tier was flat across tiers, diluting unequal protection — the
 	// budget that should climb the dependency spine was spread evenly on every deficit.
 	delta := targetFailureForPriority(g.pri, s.cfg.targetFailure())
-	extra := symbolsForDeficit(effective, p, delta)
+	extra := symbolsForDeficit(effective, p, delta, s.repairFactor())
 	for i := 0; i < extra; i++ {
 		s.emitRepair(g.enc, g.nextKey, g.n, g.pri, true)
 		g.nextKey++

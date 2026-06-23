@@ -179,7 +179,9 @@ func (sl simLink) run() simResult {
 		if written >= sl.n {
 			if endBy == 0 {
 				s.Flush(now)
-				endBy = now.Add(sl.cfg.BufferMicros + 6*sl.owdMicros + int64(sl.cfg.GenSize)*sl.srcMicros)
+				// Run past the full RETENTION window (deadline + ElasticMicros), so cockroach mode's
+				// deep-retention rateless recovery completes before the harness stops.
+				endBy = now.Add(sl.cfg.BufferMicros + sl.cfg.ElasticMicros + 6*sl.owdMicros + int64(sl.cfg.GenSize)*sl.srcMicros)
 			} else if now.After(endBy) && len(s2r) == 0 && len(r2s) == 0 {
 				break
 			}
