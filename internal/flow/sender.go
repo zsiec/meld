@@ -398,6 +398,14 @@ func (s *Sender) reactiveRepair(now clock.Timestamp, g *retGen, deficit int) {
 			p = pGen
 		}
 	}
+	if s.cfg.Mode == ModeCockroach && p > cockroachMaxReactiveP {
+		// A total outage erases ~a full estimator window, spiking the loss estimate toward 1.0 — at
+		// which symbolsForDeficit saturates to the per-generation cap in ONE round, blowing reactiveCap
+		// and abandoning a still-recoverable generation. Cap the sizing erasure rate so a freshly
+		// detached generation gets a proportionate batch with room to retry as the (now clean) link
+		// reflects. Genuine sustained loss sits below this, so it is unaffected.
+		p = cockroachMaxReactiveP
+	}
 	// Discount the repair already in flight by its expected arrivals (HARQ incremental
 	// redundancy): top up only the residual the in-flight batch will not cover.
 	effective := deficit - int(float64(g.inflight)*(1-p))

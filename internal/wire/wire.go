@@ -103,7 +103,7 @@ const (
 // MaxFeedbackGens is the number of consecutive generations (from the delivery
 // cursor) whose rank deficit a Feedback report carries, so the sender can repair
 // every deficient generation in parallel rather than only the blocking one.
-const MaxFeedbackGens = 8
+const MaxFeedbackGens = 32
 
 // feedbackLen is the v1 BASE feedback length (through Deficits). feedbackLenExt adds the
 // CongestionLoss (N1) and Burstiness (N2) tail fields; after it comes the variable per-path

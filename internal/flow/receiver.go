@@ -632,13 +632,25 @@ func (r *Receiver) maybeFeedback(now clock.Timestamp) {
 	cursorGen := r.genBaseOf(r.cursor)
 	var defs [wire.MaxFeedbackGens]uint8
 	for i := range defs {
-		if g := r.gens[cursorGen+uint32(i*r.cfg.GenSize)]; g != nil {
+		base := cursorGen + uint32(i*r.cfg.GenSize)
+		if g := r.gens[base]; g != nil {
 			if d := g.dec.Deficit(g.n); d > 0 {
 				if d > 255 {
 					d = 255
 				}
 				defs[i] = uint8(d)
 			}
+		} else if r.cfg.Mode == ModeCockroach && base+uint32(r.cfg.GenSize) <= r.highestSeen {
+			// Cockroach: a generation that lies entirely below the highest seen id yet has NO decoder
+			// lost 100% of its symbols (a total outage erased the whole generation). The sender cannot
+			// infer this from a missing feedback entry, so report a full-generation deficit to drive
+			// rateless repair that rebuilds it from scratch — the key to riding out a total outage.
+			// The first repair to arrive creates the decoder; subsequent repair fills it to rank.
+			d := r.cfg.GenSize
+			if d > 255 {
+				d = 255
+			}
+			defs[i] = uint8(d)
 		}
 	}
 	var ceFrac uint16

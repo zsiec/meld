@@ -322,6 +322,11 @@ const (
 	// maxRepairKeys bounds the per-generation repair keyspace under the uint16 key width, with
 	// headroom for the proactive prefix, so the cockroach cap can never overflow nextKey.
 	maxRepairKeys = 60000
+	// cockroachMaxReactiveP caps the erasure rate used to SIZE a cockroach reactive batch. A total
+	// outage spikes the loss estimate to ~1.0; without this the batch saturates to the per-gen cap in
+	// one round and abandons a recoverable generation. Sustained real loss sits below it (so it is
+	// unaffected); only the post-outage transient is clipped.
+	cockroachMaxReactiveP = 0.95
 	// lossWindowMin is the smallest source-id span the receiver averages channel
 	// loss over before reporting; a wider span lowers estimator variance.
 	lossWindowMin = 64

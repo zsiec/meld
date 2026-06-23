@@ -31,6 +31,17 @@ type simLink struct {
 	sliding      bool                   // use the band-form sliding coder instead of the generation coder
 	jitterMicros int64                  // max extra per-datagram delay (deterministic per symbol) — induces reorder
 	burst        int                    // source chunks written at one instant per srcMicros tick (0 ⇒ 1); models a media access unit (a whole video frame) written in one go, so a generation fills over a span of wall time rather than uniformly
+	outageStart  int64                  // total-outage window [start, stop) in micros from t=0: BOTH directions dropped (link gone). 0,0 ⇒ none
+	outageStop   int64
+}
+
+// inOutage reports whether now falls in the total-outage window (both link directions down).
+func (sl simLink) inOutage(now clock.Timestamp) bool {
+	if sl.outageStop <= sl.outageStart {
+		return false
+	}
+	cur := now.Sub(clock.Timestamp(0))
+	return cur >= sl.outageStart && cur < sl.outageStop
 }
 
 // simResult is the observed outcome of a simLink run.
@@ -105,7 +116,7 @@ func (sl simLink) run() simResult {
 				break
 			}
 			sym, err := wire.DecodeSymbol(d)
-			if err != nil || sl.drop(sym) {
+			if err != nil || sl.inOutage(now) || sl.drop(sym) {
 				continue
 			}
 			extra := int64(0)
@@ -122,6 +133,9 @@ func (sl simLink) run() simResult {
 			fb, ok := r.PollSend()
 			if !ok {
 				break
+			}
+			if sl.inOutage(now) {
+				continue // total outage: the feedback (return) path is down too
 			}
 			r2s = append(r2s, inflight{now.Add(sl.owdMicros), fb})
 		}
