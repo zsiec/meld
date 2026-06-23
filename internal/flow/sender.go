@@ -349,6 +349,17 @@ func (s *Sender) reactiveRepair(now clock.Timestamp, g *retGen, deficit int) {
 	if now.After(g.deadline) {
 		return // too late to matter
 	}
+	// Proactive grace period (ModeCockroach): the proactive repair is emitted at generation CLOSE,
+	// so it cannot land and reflect for ~one round trip. Until then the receiver's deficit report
+	// reflects only the (lossy) systematic — it has not yet seen the proactive — so reacting would
+	// flood redundant repair the proactive is about to clear. This is the dominant overhead at large
+	// GenSize: a bigger generation fills slower, so its proactive (sent at close) lands even later
+	// relative to the deficit report, and the flood scales with the generation. Holding off one
+	// reflection latency lets the proactive land; if a residual remains after it, the reactive fires
+	// on the true shortfall. Safe under the deep retention — a round trip of delay is immaterial.
+	if s.cfg.Mode == ModeCockroach && now.Sub(g.closeAt) < s.rttMicros+feedbackIntervalMicros {
+		return
+	}
 	// Cap total reactive repair per generation. In ModeLatency: ~maxRepairFactor·n — once a
 	// generation has been served this much and is STILL deficient, the channel is erasing faster
 	// than repair can fix within the budget, so stop flooding (its holes are skipped at the

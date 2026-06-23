@@ -433,6 +433,21 @@ func binomTailGreater(n int, p float64, r int) float64 {
 	}
 	q := 1 - p
 	term := math.Pow(q, float64(n)) // P[X=0]
+	if term == 0 {
+		// (1-p)^n underflowed to 0 (n large — a big generation plus its repair): the iterative seed
+		// P[X=0] is below the float64 floor, so the sum would read 0 and the tail would read 1,
+		// silently saturating the sizer. Fall back to the de Moivre–Laplace normal approximation with
+		// a continuity correction — exact at this scale — for P[X > r].
+		mean := float64(n) * p
+		sd := math.Sqrt(float64(n) * p * q)
+		if sd <= 0 {
+			if float64(r) < mean {
+				return 1
+			}
+			return 0
+		}
+		return 0.5 * math.Erfc(((float64(r)+0.5-mean)/sd)/math.Sqrt2)
+	}
 	cdf := term
 	for j := 0; j < r; j++ {
 		term *= float64(n-j) / float64(j+1) * p / q
