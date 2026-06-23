@@ -349,16 +349,21 @@ func (s *Sender) reactiveRepair(now clock.Timestamp, g *retGen, deficit int) {
 	if now.After(g.deadline) {
 		return // too late to matter
 	}
-	// Proactive grace period (ModeCockroach): the proactive repair is emitted at generation CLOSE,
-	// so it cannot land and reflect for ~one round trip. Until then the receiver's deficit report
-	// reflects only the (lossy) systematic — it has not yet seen the proactive — so reacting would
-	// flood redundant repair the proactive is about to clear. This is the dominant overhead at large
-	// GenSize: a bigger generation fills slower, so its proactive (sent at close) lands even later
-	// relative to the deficit report, and the flood scales with the generation. Holding off one
-	// reflection latency lets the proactive land; if a residual remains after it, the reactive fires
-	// on the true shortfall. Safe under the deep retention — a round trip of delay is immaterial.
-	if s.cfg.Mode == ModeCockroach && now.Sub(g.closeAt) < s.rttMicros+feedbackIntervalMicros {
-		return
+	// Proactive grace period (ModeCockroach), burst-aware. The proactive repair is emitted at
+	// generation CLOSE, so it cannot land and reflect for ~one round trip. On an i.i.d. channel the
+	// proactive one-shots, so the receiver's pre-proactive deficit report (it has seen only the lossy
+	// systematic) is SPURIOUS — reacting floods redundant repair the proactive is about to clear (the
+	// dominant overhead, worse at large GenSize as the slower fill delays the proactive further). So
+	// hold reactive one reflection latency there. But a BURST concentrates losses beyond what the
+	// proactive provisions, so its deficit is GENUINE and waiting a full round trip would HOL-block the
+	// burst generation. SHORTEN the grace in proportion to the estimated mean loss-run length
+	// (burstQ8 / burstQ8One): full at i.i.d. (burstQ8One), an eighth at mean-burst 8 — so a burst
+	// reacts promptly while the i.i.d. spurious flood stays suppressed.
+	if s.cfg.Mode == ModeCockroach {
+		grace := (s.rttMicros + feedbackIntervalMicros) * int64(burstQ8One) / int64(s.burstQ8)
+		if now.Sub(g.closeAt) < grace {
+			return
+		}
 	}
 	// Cap total reactive repair per generation. In ModeLatency: ~maxRepairFactor·n — once a
 	// generation has been served this much and is STILL deficient, the channel is erasing faster
