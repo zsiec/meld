@@ -3,7 +3,7 @@
 *Media Erasure-coded Live Delivery*
 
 **A coded, media-aware, survivable transport for live and contribution-grade
-video.** Meld is a clean-sheet sibling to the author's SRT (`srtgo`/`srtrust`)
+video.** Meld is a clean-sheet sibling to my SRT (`srtgo`/`srtrust`)
 and RIST (`ristgo`/`ristrust`) stacks. It exists to answer one question: *given
 everything we learned building SRT and RIST twice each, and a deterministic
 impairment lab to prove it — what does a transport designed for **survivability**
@@ -73,7 +73,7 @@ recoverable set.
 ## The bet
 
 SRT and RIST are the same animal: RTP-ish/UDP + sequence numbers + **named-packet
-ARQ** + **rigid block FEC** + **duplicate-everything bonding** (ST 2022-7). Five
+ARQ** + **rigid block FEC** + ST 2022-7 bonding (although I like how RIST does this over the SRT version). Five
 structural gaps, each instrumented in the lab:
 
 1. **ARQ is RTT-bound and 1-for-1.** Each NACK recovers one named packet at a cost
@@ -84,11 +84,12 @@ structural gaps, each instrumented in the lab:
    burst longer than its interleave, and forces a full-block wait.
 3. **Bonding is duplication, not diversity.** ST 2022-7 costs N× bandwidth to
    survive one path dying and gains nothing when two paths are merely lossy — even
-   though the information that arrived may sum to more than 100%.
-4. **Recovery is packet-centric, not picture-centric.** Both retransmit a B-frame
+   though the information that arrived may sum to more than 100%. RIST *does* allow
+   for split/merge across links though.
+5. **Recovery is packet-centric, not picture-centric.** Both retransmit a B-frame
    as hard as an SPS/PPS or an IDR slice. Decodable-keyframe %, time-to-first-frame,
    and A/V skew — the metrics that matter — are left to luck.
-5. **Loss vs congestion is ambiguous; session identity is fragile.** Loss-as-
+6. **Loss vs congestion is ambiguous; session identity is fragile.** Loss-as-
    congestion on wireless, NAT rebind, interface flap.
 
 Meld collapses ARQ + FEC + bonding into **one coded primitive** and adds a
