@@ -431,6 +431,34 @@ func (s *Sender) reactiveRepair(now clock.Timestamp, g *retGen, deficit int) {
 	g.inflightAt = now
 }
 
+// proactiveTarget returns the decode-failure target the PROACTIVE layer sizes to. ModeLatency uses
+// the configured target. ModeCockroach loosens it RTT-aware (target ≈ C/RTTms², clamped) so the
+// proactive layer carries more of the tail where a reactive round is expensive (high RTT → flat
+// latency) and leans where it is cheap (low RTT → less overhead, the rateless reactive mops up). It
+// never goes tighter than the configured target, so a deployment can only loosen further. The
+// reactive tier keeps the configured (tight) target and is rateless, so delivery is unaffected.
+func (s *Sender) proactiveTarget() float64 {
+	d := s.cfg.targetFailure()
+	if s.cfg.Mode != ModeCockroach {
+		return d
+	}
+	rttMs := float64(s.rttMicros) / 1000
+	if rttMs < 1 {
+		rttMs = 1
+	}
+	rttAware := cockroachProactiveC / (rttMs * rttMs)
+	if rttAware > cockroachProactiveMax {
+		rttAware = cockroachProactiveMax
+	}
+	if rttAware < cockroachProactiveMin {
+		rttAware = cockroachProactiveMin
+	}
+	if rttAware > d { // loosen toward the RTT-aware knee; never tighter than configured
+		d = rttAware
+	}
+	return d
+}
+
 // repairCountFor returns the proactive repair count for a generation of n source
 // symbols: the feed-forward set-point sized to the target decode-failure
 // probability at the current estimated erasure rate, floored at the configured
@@ -441,7 +469,7 @@ func (s *Sender) repairCountFor(n int) int {
 	// baseline tightened/loosened by its protection tier — parameter sets and RAPs get an
 	// exponentially smaller δ (more repair), disposable leaves a larger one (less), so a
 	// fixed budget is steered up the dependency spine.
-	delta := targetFailureForPriority(s.genMaxPri, s.cfg.targetFailure())
+	delta := targetFailureForPriority(s.genMaxPri, s.proactiveTarget())
 	var r int
 	if s.sched != nil {
 		// Multipath: size the TOTAL repair against the JOINT erasure tail across all paths

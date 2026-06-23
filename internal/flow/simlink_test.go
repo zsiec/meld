@@ -2,6 +2,7 @@ package flow
 
 import (
 	"encoding/binary"
+	"sort"
 
 	"github.com/zsiec/meld/internal/clock"
 	"github.com/zsiec/meld/internal/wire"
@@ -46,15 +47,27 @@ func (sl simLink) inOutage(now clock.Timestamp) bool {
 
 // simResult is the observed outcome of a simLink run.
 type simResult struct {
-	n            int // source chunks offered (== simLink.n)
-	delivered    int
-	deliveredIDs []uint32
-	stats        ReceiverStats
-	sstats       SenderStats
-	peakGens     int // max len(receiver.gens) over the run — the receiver resource-bound witness
-	peakRetained int // max len(sender.retained) — the sender resource-bound witness
-	lateDeliv    bool
-	corrupt      bool // a delivered payload did not match its source id (false recovery)
+	n             int // source chunks offered (== simLink.n)
+	delivered     int
+	deliveredIDs  []uint32
+	stats         ReceiverStats
+	sstats        SenderStats
+	peakGens      int // max len(receiver.gens) over the run — the receiver resource-bound witness
+	peakRetained  int // max len(sender.retained) — the sender resource-bound witness
+	lateDeliv     bool
+	corrupt       bool    // a delivered payload did not match its source id (false recovery)
+	latencyMicros []int64 // per-delivered-symbol latency (now - write time), for p50/p99
+}
+
+// pctlMicros returns the p-th percentile (0..1) of the latency samples in microseconds, or 0 if empty.
+func pctlMicros(xs []int64, p float64) int64 {
+	if len(xs) == 0 {
+		return 0
+	}
+	s := append([]int64(nil), xs...)
+	sort.Slice(s, func(i, j int) bool { return s[i] < s[j] })
+	i := int(p * float64(len(s)-1))
+	return s[i]
 }
 
 // overhead returns the realized repair overhead (repair that actually went out, net of
@@ -149,8 +162,12 @@ func (sl simLink) run() simResult {
 			if len(d) >= 4 && binary.BigEndian.Uint32(d) != id {
 				res.corrupt = true // delivered the wrong bytes for this id — a false recovery
 			}
-			if dl, ok := srcDL[id]; ok && now.After(dl.Add(sl.cfg.ElasticMicros)) {
-				res.lateDeliv = true // past the EFFECTIVE deadline (nominal + any elastic extension)
+			if dl, ok := srcDL[id]; ok {
+				// delivery latency = now - write time; write time = dl - BufferMicros.
+				res.latencyMicros = append(res.latencyMicros, int64(now.Sub(dl))+sl.cfg.BufferMicros)
+				if now.After(dl.Add(sl.cfg.ElasticMicros)) {
+					res.lateDeliv = true // past the EFFECTIVE deadline (nominal + any elastic extension)
+				}
 			}
 		}
 	}
