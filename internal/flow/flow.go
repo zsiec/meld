@@ -327,17 +327,6 @@ const (
 	// one round and abandons a recoverable generation. Sustained real loss sits below it (so it is
 	// unaffected); only the post-outage transient is clipped.
 	cockroachMaxReactiveP = 0.95
-	// cockroachProactiveC/Min/Max parameterize the RTT-aware PROACTIVE decode-failure target in
-	// cockroach mode: target ≈ C/RTTms², clamped to [Min, Max]. A reactive round costs ~one RTT of
-	// in-order head-of-line delay, so at high RTT the proactive layer should provision more of the
-	// tail (tighter target → most generations one-shot, flat latency); at low RTT reactive is cheap,
-	// so the proactive leans (looser target → the rateless reactive mops up) and overhead drops. The
-	// 1/RTT² shape and C=1000 fit the empirically measured latency knee (TestZZTradeoffKnee): ~0.1 at
-	// RTT 100, ~0.011 at RTT 300, clamped to 0.005 by RTT 600. The reactive tier keeps the tight
-	// configured target and is rateless, so delivery is unchanged — this trades only overhead↔latency.
-	cockroachProactiveC   = 1000.0
-	cockroachProactiveMin = 0.005
-	cockroachProactiveMax = 0.1
 	// lossWindowMin is the smallest source-id span the receiver averages channel
 	// loss over before reporting; a wider span lowers estimator variance.
 	lossWindowMin = 64
