@@ -162,7 +162,7 @@ func (e *coLossEstimator) slotDist() []int { return e.histPpm }
 // distribution is the slots-fold convolution of slotDistPpm; r is the smallest count whose
 // upper tail is ≤ delta. Fixed-point Q30 throughout (bit-reproducible). The final partial
 // slot (≤ N−1 tail symbols) is folded in as a full slot — negligible at k ≫ N.
-func repairForJointTailN(k int, slotDistPpm []int, delta float64) int {
+func repairForJointTailN(k int, slotDistPpm []int, delta float64, maxFactor int) int {
 	n := len(slotDistPpm) - 1 // paths per slot
 	if k <= 0 || n < 1 {
 		return 0
@@ -183,7 +183,7 @@ func repairForJointTailN(k int, slotDistPpm []int, delta float64) int {
 	for j := range slotDist { // renormalize so the histogram sums to exactly geScale
 		slotDist[j] = slotDist[j] * geScale / sum
 	}
-	maxR := k * maxRepairFactor
+	maxR := k * maxFactor
 	deltaQ := int64(delta * geScale)
 	for r := 0; r < maxR; r++ {
 		slots := (k + r) / n // N symbols per aligned slot; the partial tail slot is folded in below
@@ -202,7 +202,7 @@ func repairForJointTailN(k int, slotDistPpm []int, delta float64) int {
 // pBothPpm — clamping pBoth to the Fréchet bounds [max(0, pa+pb−1), min(pa, pb)] so the cell
 // probabilities stay valid — and defers to repairForJointTailN. The i.i.d.-union sizer is the
 // special case pBothPpm = pa·pb (independence); a positive co-loss makes the tail heavier.
-func repairForJointTail(k, paPpm, pbPpm, pBothPpm int, delta float64) int {
+func repairForJointTail(k, paPpm, pbPpm, pBothPpm int, delta float64, maxFactor int) int {
 	if k <= 0 || (paPpm <= 0 && pbPpm <= 0) {
 		return 0
 	}
@@ -220,7 +220,7 @@ func repairForJointTail(k, paPpm, pbPpm, pBothPpm int, delta float64) int {
 	if pBoth > pbPpm {
 		pBoth = pbPpm
 	}
-	return repairForJointTailN(k, []int{scale - paPpm - pbPpm + pBoth, paPpm + pbPpm - 2*pBoth, pBoth}, delta)
+	return repairForJointTailN(k, []int{scale - paPpm - pbPpm + pBoth, paPpm + pbPpm - 2*pBoth, pBoth}, delta, maxFactor)
 }
 
 // jointTailGreaterN returns P[total erasures over `slots` aligned N-path slots > r] in Q30,

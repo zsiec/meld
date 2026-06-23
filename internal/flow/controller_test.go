@@ -29,7 +29,7 @@ func TestRepairForTargetAchievesTarget(t *testing.T) {
 	for _, k := range []int{8, 16, 32} {
 		for _, p := range []float64{0.05, 0.1, 0.2, 0.3, 0.4} {
 			for _, delta := range []float64{1e-2, 1e-3, 1e-4} {
-				r := repairForTarget(k, p, delta)
+				r := repairForTarget(k, p, delta, maxRepairFactor)
 				cap := k * maxRepairFactor
 				if r < 0 || r > cap {
 					t.Fatalf("k=%d p=%g d=%g: r=%d out of range", k, p, delta, r)
@@ -61,19 +61,19 @@ func TestRepairForTargetMonotone(t *testing.T) {
 	// Increasing p ⇒ non-decreasing r.
 	prev := -1
 	for _, p := range []float64{0.0, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5} {
-		r := repairForTarget(k, p, 1e-3)
+		r := repairForTarget(k, p, 1e-3, maxRepairFactor)
 		if r < prev {
 			t.Fatalf("r not monotone in p: p=%g gave %d < %d", p, r, prev)
 		}
 		prev = r
 	}
 	// Stricter target (smaller delta) ⇒ at least as much redundancy.
-	if repairForTarget(k, 0.2, 1e-5) < repairForTarget(k, 0.2, 1e-2) {
+	if repairForTarget(k, 0.2, 1e-5, maxRepairFactor) < repairForTarget(k, 0.2, 1e-2, maxRepairFactor) {
 		t.Fatal("smaller delta should not reduce redundancy")
 	}
 	// The variance margin: at 20% loss with k=16 the set-point exceeds the mean
 	// (3.2) — this is the term a mean-tracking AIMD omits.
-	if r := repairForTarget(16, 0.2, 1e-3); r <= 3 {
+	if r := repairForTarget(16, 0.2, 1e-3, maxRepairFactor); r <= 3 {
 		t.Fatalf("expected a variance margin above the mean ~3.2, got r=%d", r)
 	}
 }

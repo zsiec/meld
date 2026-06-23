@@ -93,8 +93,8 @@ func TestGESizerHoldsWhereBinomialFails(t *testing.T) {
 	pGB := pMean * pBG / (1 - pMean)
 	piB := pGB / (pGB + pBG)
 
-	rBinom := repairForTarget(k, pMean, delta)
-	rGE := repairForGE(k, int(pMean*1e6), int(meanBurst*256), delta)
+	rBinom := repairForTarget(k, pMean, delta, maxRepairFactor)
+	rGE := repairForGE(k, int(pMean*1e6), int(meanBurst*256), delta, maxRepairFactor)
 	if rGE <= rBinom {
 		t.Fatalf("burst-aware sizer (%d) should provision more than the binomial sizer (%d)", rGE, rBinom)
 	}

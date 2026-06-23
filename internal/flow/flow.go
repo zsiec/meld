@@ -399,11 +399,11 @@ const (
 // GF(256) RLNC behaves as an ideal MDS code (linear-dependence probability ~1/255),
 // so decode failure is governed by the erasure count, exactly this tail. r is
 // capped at maxRepairFactor*k.
-func repairForTarget(k int, p, delta float64) int {
+func repairForTarget(k int, p, delta float64, maxFactor int) int {
 	if k <= 0 || p <= 0 {
 		return 0
 	}
-	maxR := k * maxRepairFactor
+	maxR := k * maxFactor
 	if p >= 1 {
 		return maxR
 	}
@@ -488,11 +488,11 @@ const geScale = 1 << 30
 // burst 1 it tracks the binomial sizer; as bursts lengthen it provisions for the
 // concentration of erasures within one generation that the binomial tail assigns near
 // zero probability. r is capped at maxRepairFactor·k.
-func repairForGE(k, pMeanPPM, meanBurstQ8 int, delta float64) int {
+func repairForGE(k, pMeanPPM, meanBurstQ8 int, delta float64, maxFactor int) int {
 	if k <= 0 || pMeanPPM <= 0 {
 		return 0
 	}
-	maxR := k * maxRepairFactor
+	maxR := k * maxFactor
 	// pBG = geScale·(1/meanBurst) = geScale·256/meanBurstQ8 (meanBurstQ8 ≥ 256 ⇒ ≤ geScale).
 	if meanBurstQ8 < burstQ8One {
 		meanBurstQ8 = burstQ8One

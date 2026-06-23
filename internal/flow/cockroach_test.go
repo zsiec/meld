@@ -48,6 +48,30 @@ func TestCockroachOutageSurvival(t *testing.T) {
 	}
 }
 
+// TestCockroachProactiveOneShot guards the high-loss proactive boost — the fix for the
+// high-RTT/extreme-loss in-order head-of-line (HOL) blowup. In cockroach mode the proactive layer is
+// provisioned (uncapped to the cockroach repair factor) to recover extreme loss in ONE shot, so most
+// generations decode on arrival, the delivery cursor keeps advancing, and the receiver's generation
+// backlog stays SHALLOW — no HOL stall. Before the boost the proactive capped at 3x·n, generations
+// went deficient, reactive rounds piled up behind the cursor at high RTT, and the backlog ran ~135
+// deep (the p50 2070ms blowup). Here at RTT 300 / 70% loss the backlog must stay well under that.
+func TestCockroachProactiveOneShot(t *testing.T) {
+	const n = 3200
+	owd := int64(150_000) // RTT 300 — the cell where the HOL tail blew up
+	res := simLink{cfg: cockroachCfg(true, 3_000_000), owdMicros: owd, srcMicros: 1_000, n: n, drop: uniformDrop(0xBEEF, 0.70)}.run()
+	assertCoreInvariants(t, res, n, "cockroach RTT300/70%")
+	d := 100 * float64(res.delivered) / float64(n)
+	t.Logf("RTT300/70%%: deliv=%.1f%% peakGens=%d (HOL backlog ran ~135 before the proactive boost)", d, res.peakGens)
+	if d < 99.5 {
+		t.Fatalf("delivery %.1f%% < 99.5%%", d)
+	}
+	// Shallow backlog ⇒ one-shot proactive recovery, no HOL. The in-flight window at RTT 300 is ~20
+	// generations; a deep backlog (the pre-fix HOL) ran 100+. Bound it well below that.
+	if res.peakGens > 50 {
+		t.Fatalf("peakGens=%d too deep — proactive not recovering one-shot, HOL stall returned", res.peakGens)
+	}
+}
+
 // cockroachCfg builds a config pair: latency mode (bounded reactive, nominal deadline) vs cockroach
 // mode (rateless reactive, deep retention). retainMicros is the cockroach retention depth.
 func cockroachCfg(cockroach bool, retainMicros int64) Config {

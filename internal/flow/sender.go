@@ -449,9 +449,9 @@ func (s *Sender) repairCountFor(n int) int {
 		// per-slot erasure-count histogram embeds the cross-path correlation, so a
 		// correlated channel provisions more than an i.i.d.-union sizer; at zero
 		// correlation it reduces to the binomial.
-		r = repairForJointTailN(n, s.slotDistribution(), delta)
+		r = repairForJointTailN(n, s.slotDistribution(), delta, s.repairFactor())
 	} else {
-		r = repairForTarget(n, s.pEst, delta)
+		r = repairForTarget(n, s.pEst, delta, s.repairFactor())
 	}
 	// Burst-aware set-point: size for the Gilbert-Elliott tail when the channel is
 	// bursty, taking the larger so an i.i.d. channel is never under the base sizer and a
@@ -468,7 +468,7 @@ func (s *Sender) repairCountFor(n int) int {
 	// ≥ budget); shrink it toward the i.i.d. set-point as more reactive rounds fit. This is the
 	// proactive analog of "common case eager, tail lazy": it cuts the bursty-LAN overhead that
 	// blanket GE sizing spends on every generation while reactive sits idle.
-	if ge := repairForGE(n, s.burstMarginalPPM(), s.burstQ8, delta); ge > r {
+	if ge := repairForGE(n, s.burstMarginalPPM(), s.burstQ8, delta, s.repairFactor()); ge > r {
 		r += (ge - r) / (s.reactiveRounds() + 1)
 	}
 	if floor := s.effectiveFloor(n); r < floor {

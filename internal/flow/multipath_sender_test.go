@@ -122,7 +122,7 @@ func TestMultipathSizingProvisionsForCorrelation(t *testing.T) {
 	// Independent paths: pBoth = pa*pb. Should track the single-path binomial sizer.
 	s.pathLossPpm, s.slotDistPpm = []int{ppm(p), ppm(p)}, slot2Ppm(p, p, p*p)
 	rIndep := s.repairCountFor(cfg.GenSize)
-	rBinom := repairForTarget(cfg.GenSize, p, delta)
+	rBinom := repairForTarget(cfg.GenSize, p, delta, maxRepairFactor)
 	if d := rIndep - rBinom; d < -2 || d > 2 {
 		t.Fatalf("independent-path sizing r=%d differs from binomial r=%d by %d", rIndep, rBinom, d)
 	}

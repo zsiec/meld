@@ -141,7 +141,7 @@ func (s *SlidingSender) Flush(now clock.Timestamp) {
 	if n == 0 {
 		return
 	}
-	r := repairForTarget(n, s.pEst, s.cfg.targetFailure())
+	r := repairForTarget(n, s.pEst, s.cfg.targetFailure(), maxRepairFactor)
 	if floor := s.cfg.repairFloor(n); r < floor {
 		r = floor
 	}
@@ -203,8 +203,8 @@ func (s *SlidingSender) codeRate() float64 {
 		return s.crRate
 	}
 	delta := s.cfg.targetFailure()
-	r := repairForTarget(b, s.pEst, delta)
-	if ge := repairForGE(b, int(s.pEst*1e6), s.burstQ8, delta); ge > r {
+	r := repairForTarget(b, s.pEst, delta, maxRepairFactor)
+	if ge := repairForGE(b, int(s.pEst*1e6), s.burstQ8, delta, maxRepairFactor); ge > r {
 		r = ge // burst-aware set-point (N2): size for the GE tail on a bursty channel
 	}
 	rate := float64(r) / float64(b)

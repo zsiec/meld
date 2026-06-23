@@ -38,8 +38,8 @@ func TestJointTailHoldsWhereIIDFails(t *testing.T) {
 		// Pearson-correlation form of the joint-erasure probability.
 		pBoth := pa*pb + rho*math.Sqrt(pa*(1-pa)*pb*(1-pb))
 
-		rIID := repairForJointTail(k, ppm(pa), ppm(pb), ppm(pa*pb), delta) // assumes independence
-		rJoint := repairForJointTail(k, ppm(pa), ppm(pb), ppm(pBoth), delta)
+		rIID := repairForJointTail(k, ppm(pa), ppm(pb), ppm(pa*pb), delta, maxRepairFactor) // assumes independence
+		rJoint := repairForJointTail(k, ppm(pa), ppm(pb), ppm(pBoth), delta, maxRepairFactor)
 		if rho > 0 && rJoint <= rIID {
 			t.Fatalf("rho=%.1f: joint sizer (%d) should provision more than the i.i.d. sizer (%d)", rho, rJoint, rIID)
 		}
@@ -84,10 +84,10 @@ func TestJointTailHoldsWhereIIDFails(t *testing.T) {
 func TestJointTailReducesToIID(t *testing.T) {
 	const k, delta = 32, 1e-3
 	for _, p := range []float64{0.1, 0.25, 0.4} {
-		rJoint := repairForJointTail(k, ppm(p), ppm(p), ppm(p*p), delta)
+		rJoint := repairForJointTail(k, ppm(p), ppm(p), ppm(p*p), delta, maxRepairFactor)
 		// The independent two-path total erasures ~ Binomial(k+r, p); the binomial
 		// sizer is the reference. Allow a 1-symbol slack for the slot-parity rounding.
-		rBinom := repairForTarget(k, p, delta)
+		rBinom := repairForTarget(k, p, delta, maxRepairFactor)
 		if d := rJoint - rBinom; d < -2 || d > 2 {
 			t.Fatalf("p=%.2f: joint(indep) r=%d vs binomial r=%d differ by %d", p, rJoint, rBinom, d)
 		}
@@ -144,8 +144,8 @@ func TestCoLossEstimatorRecoversAndCloses(t *testing.T) {
 		t.Fatalf("estimator pa=%d pb=%d pBoth=%d, want ≈ %d/%d/%d", epa, epb, epBoth, ppm(pa), ppm(pb), ppm(pBoth))
 	}
 
-	rEst := repairForJointTail(k, epa, epb, epBoth, delta)              // correlation-aware
-	rIndep := repairForJointTail(k, epa, epb, epa*epb/1_000_000, delta) // assumes independence
+	rEst := repairForJointTail(k, epa, epb, epBoth, delta, maxRepairFactor)              // correlation-aware
+	rIndep := repairForJointTail(k, epa, epb, epa*epb/1_000_000, delta, maxRepairFactor) // assumes independence
 	var failEst, failIndep int
 	for i := 0; i < trials; i++ {
 		e := 0
