@@ -25,7 +25,7 @@ func TestEndToEnd(t *testing.T) {
 	prologue := []byte("flow-context")
 
 	// 2. The LIVE hybrid handshake agrees a master secret on both ends.
-	init, err := NewInitiator(psk, prologue)
+	init, err := NewInitiator(psk, prologue, testEpochSize)
 	if err != nil {
 		t.Fatalf("NewInitiator: %v", err)
 	}

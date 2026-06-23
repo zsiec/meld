@@ -63,7 +63,7 @@ func NewMultipathSender(remotes []string, cfg flow.Config, sec *SecurityConfig) 
 	}
 	if sec.active() {
 		s.hsDone = make(chan struct{})
-		init, err := crypto.NewInitiator(s.psk, beU32(cfg.Flow))
+		init, err := crypto.NewInitiator(s.psk, beU32(cfg.Flow), sec.epochSize())
 		if err != nil {
 			closeConns(subs)
 			return nil, err

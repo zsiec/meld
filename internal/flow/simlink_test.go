@@ -26,23 +26,14 @@ type simLink struct {
 	cfg          Config
 	owdMicros    int64                  // one-way propagation each direction; rtt = 2*owd
 	srcMicros    int64                  // spacing between source writes (the offered cadence)
+	srcMicros2   int64                  // cadence after rateChangeAt writes (0 ⇒ constant; for the AutoGenSize rate-change test)
+	rateChangeAt int                    // write index at which the cadence switches to srcMicros2
 	stepMicros   int64                  // clock granularity (0 ⇒ 1 ms)
 	n            int                    // number of source chunks to send
 	drop         func(wire.Symbol) bool // wire loss; closed over a per-symbol coin by the caller
 	sliding      bool                   // use the band-form sliding coder instead of the generation coder
 	jitterMicros int64                  // max extra per-datagram delay (deterministic per symbol) — induces reorder
 	burst        int                    // source chunks written at one instant per srcMicros tick (0 ⇒ 1); models a media access unit (a whole video frame) written in one go, so a generation fills over a span of wall time rather than uniformly
-	outageStart  int64                  // total-outage window [start, stop) in micros from t=0: BOTH directions dropped (link gone). 0,0 ⇒ none
-	outageStop   int64
-}
-
-// inOutage reports whether now falls in the total-outage window (both link directions down).
-func (sl simLink) inOutage(now clock.Timestamp) bool {
-	if sl.outageStop <= sl.outageStart {
-		return false
-	}
-	cur := now.Sub(clock.Timestamp(0))
-	return cur >= sl.outageStart && cur < sl.outageStop
 }
 
 // simResult is the observed outcome of a simLink run.
@@ -129,7 +120,7 @@ func (sl simLink) run() simResult {
 				break
 			}
 			sym, err := wire.DecodeSymbol(d)
-			if err != nil || sl.inOutage(now) || sl.drop(sym) {
+			if err != nil || sl.drop(sym) {
 				continue
 			}
 			extra := int64(0)
@@ -147,9 +138,6 @@ func (sl simLink) run() simResult {
 			if !ok {
 				break
 			}
-			if sl.inOutage(now) {
-				continue // total outage: the feedback (return) path is down too
-			}
 			r2s = append(r2s, inflight{now.Add(sl.owdMicros), fb})
 		}
 		for {
@@ -165,8 +153,8 @@ func (sl simLink) run() simResult {
 			if dl, ok := srcDL[id]; ok {
 				// delivery latency = now - write time; write time = dl - BufferMicros.
 				res.latencyMicros = append(res.latencyMicros, int64(now.Sub(dl))+sl.cfg.BufferMicros)
-				if now.After(dl.Add(sl.cfg.ElasticMicros)) {
-					res.lateDeliv = true // past the EFFECTIVE deadline (nominal + any elastic extension)
+				if now.After(dl) {
+					res.lateDeliv = true // delivered past its deadline
 				}
 			}
 		}
@@ -185,7 +173,11 @@ func (sl simLink) run() simResult {
 				s.Write(now, simChunk(sl.cfg.SymbolSize, id))
 				written++
 			}
-			nextWrite = nextWrite.Add(sl.srcMicros)
+			cadence := sl.srcMicros
+			if sl.srcMicros2 > 0 && written >= sl.rateChangeAt {
+				cadence = sl.srcMicros2 // mid-stream bitrate change
+			}
+			nextWrite = nextWrite.Add(cadence)
 		}
 		deliverDue(&s2r, func(d []byte) { r.FeedSymbol(now, d) })
 		deliverDue(&r2s, func(d []byte) {
@@ -210,9 +202,7 @@ func (sl simLink) run() simResult {
 		if written >= sl.n {
 			if endBy == 0 {
 				s.Flush(now)
-				// Run past the full RETENTION window (deadline + ElasticMicros), so cockroach mode's
-				// deep-retention rateless recovery completes before the harness stops.
-				endBy = now.Add(sl.cfg.BufferMicros + sl.cfg.ElasticMicros + 6*sl.owdMicros + int64(sl.cfg.GenSize)*sl.srcMicros)
+				endBy = now.Add(sl.cfg.BufferMicros + 6*sl.owdMicros + int64(sl.cfg.GenSize)*sl.srcMicros)
 			} else if now.After(endBy) && len(s2r) == 0 && len(r2s) == 0 {
 				break
 			}

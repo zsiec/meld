@@ -353,11 +353,12 @@ func (k *epochKeyer) openerFor(epoch uint32) *crypto.Opener {
 // inbound symbol authenticates under these keys (tryPromote), so a replayed or forged
 // message 1 — which can never produce such a symbol — cannot displace the live session.
 type pendingState struct {
-	keyer   epochKeyer
-	ctlSend []byte // directional control keys, installed on promotion
-	ctlRecv []byte
-	hsKeys  []byte // the initiator's ephemeral pubs, to recognize a retransmit of THIS pending
-	msg2    []byte // framed message 2, resent on a pending retransmit
+	keyer     epochKeyer
+	ctlSend   []byte // directional control keys, installed on promotion
+	ctlRecv   []byte
+	hsKeys    []byte // the initiator's ephemeral pubs, to recognize a retransmit of THIS pending
+	msg2      []byte // framed message 2, resent on a pending retransmit
+	epochSize uint32 // the (re-handshaked) sender's epoch size, adopted on promotion
 }
 
 // openState is the receiver-side encryption keying shared by both hosts: a ratcheting
@@ -512,16 +513,20 @@ func (o *openState) respondInit(payload, peerID []byte) initResult {
 		kp := epochKeyer{recvSecret: sess.RecvTrafficSecret()}
 		kp.openerFor(0)
 		o.pending = &pendingState{
-			keyer:   kp,
-			ctlSend: sess.SendControlKey(),
-			ctlRecv: sess.RecvControlKey(),
-			hsKeys:  append([]byte(nil), keys...),
-			msg2:    framed,
+			keyer:     kp,
+			ctlSend:   sess.SendControlKey(),
+			ctlRecv:   sess.RecvControlKey(),
+			hsKeys:    append([]byte(nil), keys...),
+			msg2:      framed,
+			epochSize: sess.EpochSize, // adopt the re-handshaked sender's epoch size on promotion
 		}
 		return initResult{send: framed}
 	}
-	// First contact: establish the live session immediately.
+	// First contact: establish the live session immediately. The epoch size is the SENDER's,
+	// carried in the handshake (sender-authoritative) — not this receiver's own config — so the
+	// two ends key every epoch identically without a both-ends-agree configuration trap.
 	o.epochKeyer = epochKeyer{recvSecret: sess.RecvTrafficSecret()}
+	o.epochSize = sess.EpochSize
 	o.ctl.setKeys(sess.SendControlKey(), sess.RecvControlKey())
 	o.hsKeys = append([]byte(nil), keys...)
 	o.activeMsg2 = framed
@@ -547,11 +552,14 @@ func (o *openState) respondInit(payload, peerID []byte) initResult {
 //     open path is, so the trial agrees with delivery byte-for-byte. Sound only while
 //     maxTrialEpochs keeps the trialed epoch within uint16 of a low base; widening the cap past
 //     65535 (or trialing a keyer already beyond epoch 65535) would alias epochs and mis-key.
-func (o *openState) trialOpen(base epochKeyer, sym wire.Symbol) bool {
+func (o *openState) trialOpen(base epochKeyer, epochSize uint32, sym wire.Symbol) bool {
 	if sym.Kind != wire.Systematic {
 		return false
 	}
-	epoch := sym.SrcIndex / o.epochSize
+	if epochSize == 0 { // never in production (crypto rejects a 0 in the handshake); fail closed, don't divide
+		return false
+	}
+	epoch := sym.SrcIndex / epochSize
 	if epoch < base.openEpoch || epoch-base.openEpoch > maxTrialEpochs {
 		return false
 	}
@@ -582,10 +590,11 @@ func (o *openState) tryPromote(sym wire.Symbol) bool {
 	if o.pending == nil {
 		return false
 	}
-	if !o.trialOpen(o.pending.keyer, sym) {
+	if !o.trialOpen(o.pending.keyer, o.pending.epochSize, sym) {
 		return false
 	}
 	o.epochKeyer = o.pending.keyer // commit at the pending base epoch (0), never advanced to sym's epoch
+	o.epochSize = o.pending.epochSize
 	o.ctl.setKeys(o.pending.ctlSend, o.pending.ctlRecv)
 	o.hsKeys = o.pending.hsKeys
 	o.activeMsg2 = o.pending.msg2
@@ -607,7 +616,7 @@ func (o *openState) staleStraggler(sym wire.Symbol) bool {
 	if epoch < o.openEpoch || epoch-o.openEpoch > maxTrialEpochs {
 		return false // not cheaply judgeable here — let the core handle it
 	}
-	return !o.trialOpen(o.epochKeyer, sym)
+	return !o.trialOpen(o.epochKeyer, o.epochSize, sym)
 }
 
 // authenticates reports whether sym opens under the LIVE receive keys at its epoch, without
@@ -618,7 +627,7 @@ func (o *openState) authenticates(sym wire.Symbol) bool {
 	if o.sec == nil {
 		return true
 	}
-	return o.trialOpen(o.epochKeyer, sym)
+	return o.trialOpen(o.epochKeyer, o.epochSize, sym)
 }
 
 // openAll opens (or, when cleartext, passes through) a batch of delivered symbols. A

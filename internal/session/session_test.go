@@ -87,7 +87,7 @@ func TestRespondInitCommitAfterConfirm(t *testing.T) {
 	}
 	pid := []byte("198.51.100.7")
 	mk := func() []byte { // a fresh initiator's message 1 (distinct ephemeral keys each call)
-		init, err := crypto.NewInitiator(o.psk, beU32(flowID))
+		init, err := crypto.NewInitiator(o.psk, beU32(flowID), 1<<14)
 		if err != nil {
 			t.Fatalf("NewInitiator: %v", err)
 		}
@@ -144,7 +144,9 @@ func TestTryPromoteBoundedAndStateless(t *testing.T) {
 	}
 	o.established = true
 	o.hsKeys = []byte("live-keys-placeholder")
-	o.pending = &pendingState{keyer: epochKeyer{recvSecret: o.psk}} // any secret; trials must fail-closed
+	// any secret (trials must fail-closed); a real epochSize so the bound below is the epoch-distance
+	// check, not the degenerate epochSize==0 short-circuit.
+	o.pending = &pendingState{keyer: epochKeyer{recvSecret: o.psk}, epochSize: sec.epochSize()}
 
 	// A forged systematic with an enormous SrcIndex (epoch ≈ 2^32/epochSize) must be rejected
 	// cheaply: its epoch is far beyond maxTrialEpochs, so trialOpen returns false WITHOUT
@@ -247,7 +249,7 @@ func TestRespondInitUnauthedDoesNotChargeCookieGate(t *testing.T) {
 	}
 	pid := []byte("198.51.100.7")
 	// A real message 1 with a flipped mac1 byte: valid length, but mac1 fails.
-	init, _ := crypto.NewInitiator(o.psk, beU32(flowID))
+	init, _ := crypto.NewInitiator(o.psk, beU32(flowID), 1<<14)
 	m1, _ := init.WriteMessage1()
 	bad := append([]byte(nil), m1...)
 	bad[len(bad)-20] ^= 0x40 // inside the mac1 region (before the zero mac2 trailer)
@@ -470,7 +472,10 @@ func TestPromoteCommitsAtBaseEpoch(t *testing.T) {
 		t.Fatalf("newOpenState: %v", err)
 	}
 	mkInit := func() *crypto.Initiator {
-		init, err := crypto.NewInitiator(o.psk, beU32(flowID))
+		// The sender is authoritative for epochSize: it negotiates the same value it seals with
+		// (sec.epochSize() == epochSize), so the receiver's trial keys the confirming symbol at the
+		// same epoch the sender sealed it (192/64 == 3), not at a stale receiver-config epoch.
+		init, err := crypto.NewInitiator(o.psk, beU32(flowID), epochSize)
 		if err != nil {
 			t.Fatalf("NewInitiator: %v", err)
 		}

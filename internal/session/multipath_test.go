@@ -164,10 +164,15 @@ func TestMultipathSurvivesBadPath(t *testing.T) {
 	if !byteExact {
 		t.Fatal("a delivered chunk did not match what was sent")
 	}
+	// recvLoop keeps writing n1 (under cmu) until rx.Close(), so snapshot it under the lock before
+	// reading — a bare read here races the loss-coin closure.
+	cmu.Lock()
+	seen1 := n1
+	cmu.Unlock()
 	// Allow a small residual for the ramp-up before the per-path estimate converges.
 	if len(got) < n*97/100 {
-		t.Fatalf("only %d/%d delivered with one 70%%-loss path (path-1 symbols seen=%d)", len(got), n, n1)
+		t.Fatalf("only %d/%d delivered with one 70%%-loss path (path-1 symbols seen=%d)", len(got), n, seen1)
 	}
 	st := rx.Stats()
-	t.Logf("bad-path survival: delivered %d/%d (recovered=%d, path-1 symbols=%d)", len(got), n, st.Recovered, n1)
+	t.Logf("bad-path survival: delivered %d/%d (recovered=%d, path-1 symbols=%d)", len(got), n, st.Recovered, seen1)
 }

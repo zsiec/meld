@@ -304,16 +304,22 @@ fs := r.FrameStats() // DecodableFrames / DecodableKeyframes / …
 ## Configuration
 
 `meld.Config` (constructed via `meld.DefaultConfig()` and overridden). Both ends
-must agree on `Flow`, `SymbolSize`, `GenSize`, and `BufferMicros`; the crypto and
+must agree on `Flow`, `SymbolSize`, `GenSize`, and `BufferMicros` (and, when
+`AdaptiveGenSize` is on, `NominalRTTMicros` + `NominalBitrateBps`); the crypto and
 multipath fields must also match.
 
 | Field | Default | Meaning |
 |---|---|---|
 | `Flow` | `0` | Flow identifier on the wire. |
 | `SymbolSize` | `1316` | Fixed media-chunk / coded-symbol size (bytes). 1316 = 7×188 MPEG-TS. |
-| `GenSize` | `16` | Coding generation (window) size in source symbols. |
+| `GenSize` | `16` | Coding generation (window) size in source symbols. With `AutoGenSize` on (the default) this is the floor / bootstrap width the sender adapts up from. |
+| `AutoGenSize` | `true` | **Zero-config overhead reduction — on by default.** The sender measures its own RTT and source rate and sizes the generation itself (no hints), re-sizing if either drifts mid-stream; the receiver follows the per-generation width stamped on every symbol, so it needs nothing. A real-timing sweep shows it a Pareto win over a fixed `GenSize` (lower overhead, never worse delivery/p99). Set `false` to pin a fixed `GenSize`. See [overhead efficiency](docs/coding.md). |
+| `AdaptiveGenSize` | `false` | The manual form of `AutoGenSize`: widen the generation 16→64 from **static** `NominalRTTMicros` + `NominalBitrateBps` hints, set the **same on both ends**. Prefer `AutoGenSize` unless you need explicit control; `NewSender`/`NewReceiver` warn if a hint is missing. |
+| `NominalRTTMicros` | `0` | Static path-RTT hint (µs) that sizes the adaptive width. Shared/static, both ends equal. Ignored unless `AdaptiveGenSize`. |
+| `NominalBitrateBps` | `0` | Static source-rate hint (bits/s): the fill-time gate that keeps the adaptive width safe across bitrates (full width when it fills fast, near `GenSize` at low bitrate). Shared/static. Ignored unless `AdaptiveGenSize`. |
 | `Redundancy` | `0.15` | **Floor** proactive code rate (repair per source symbol); the controller raises it as measured loss requires. |
 | `TargetFailure` | `1e-3` | Per-generation decode-failure probability the sizer targets (the QoS knob). |
+| `ProactiveDecay` | `true` | Offload the i.i.d. variance margin to the reactive tier on a reactive-capable link (lower overhead); burst-guarded and a no-op where reactive can't land, so safe on by default. Single-path. |
 | `BufferMicros` | `200000` | Playout / deadline budget (µs). |
 | `Sliding` | `false` | Use the band-form sliding-window coder instead of generations. Reach for it when the budget is **tighter than the RTT** (low-latency long-haul); see [`docs/sliding-window.md`](docs/sliding-window.md). |
 | `CodingWindow` | `0` (auto) | Max sliding band width (source symbols); the sender adapts the span below it to fit the deadline. Ignored unless `Sliding`. |

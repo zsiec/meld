@@ -3,6 +3,7 @@ package crypto
 import (
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/binary"
 )
 
 // This file is the Meld handshake: a 2-message, PSK-authenticated, forward-secret,
@@ -42,12 +43,20 @@ const handshakeName = "Meld_v1_NNpsk0_X25519+MLKEM768_ChaCha20Poly1305_SHA256"
 const (
 	macSize     = 16 // truncated HMAC-SHA256 mac1 / mac2 / confirmation tag length
 	confirmSize = 16
-	// msg1 = pubs ‖ mac1 (PSK proof) ‖ mac2 (cookie; zero unless the responder is under
-	// load). mac1 covers pubs; mac2 covers pubs‖mac1 (the cookie.go anti-amplification
-	// gate). msg2 = responder pubs ‖ ML-KEM ciphertext ‖ key-confirmation ‖ mac1.
-	msg1PubsLen = X25519KeySize + MLKEM768EncapKeySize                           // 1216
-	msg1Len     = msg1PubsLen + macSize + macSize                                // 1248
-	msg2Len     = X25519KeySize + MLKEM768CiphertextSize + confirmSize + macSize // 1152
+	// msg1 = pubs ‖ epochSize ‖ mac1 (PSK proof) ‖ mac2 (cookie; zero unless the responder is
+	// under load). The initiator (the media sender) carries its EpochSize in message 1 so the
+	// responder (receiver) adopts it for opening rather than both ends deriving it from
+	// independently-configured values — a mismatch otherwise silently mis-keys every symbol past
+	// the first epoch (the sender-authoritative principle, like the coding-window width). mac1
+	// covers pubs‖epochSize and the value is folded into the transcript hash, so a tampered
+	// epochSize fails the handshake (the confirmation tag won't verify). mac2 covers
+	// pubs‖epochSize‖mac1 (the cookie.go anti-amplification gate). msg2 = responder pubs ‖ ML-KEM
+	// ciphertext ‖ key-confirmation ‖ mac1.
+	msg1PubsLen  = X25519KeySize + MLKEM768EncapKeySize                           // 1216 (pubs only; HandshakeInitKeys)
+	epochSizeLen = 4                                                              // big-endian uint32 EpochSize
+	msg1BodyLen  = msg1PubsLen + epochSizeLen                                     // 1220 (mac1-covered, transcript-mixed)
+	msg1Len      = msg1BodyLen + macSize + macSize                                // 1252
+	msg2Len      = X25519KeySize + MLKEM768CiphertextSize + confirmSize + macSize // 1152
 )
 
 // symmetricState is the running transcript hash and chaining key of a handshake.
@@ -113,6 +122,7 @@ type Session struct {
 	Master     []byte   // handshake master secret (KeySize bytes)
 	Transcript [32]byte // final transcript hash (channel binding / records)
 	Initiator  bool     // true on the side that sent message 1 (the media sender)
+	EpochSize  uint32   // the media sender's epoch size, carried in message 1 (sender-authoritative; the receiver opens with this, not its own config)
 }
 
 // SendTrafficSecret / RecvTrafficSecret return the epoch-0 directional traffic secrets
@@ -140,16 +150,18 @@ func flip(d Direction) Direction {
 // Initiator is the handshake half that speaks first (the media sender). Use is
 // WriteMessage1 then ReadMessage2; it is single-shot and not safe for concurrent use.
 type Initiator struct {
-	psk  []byte
-	keys *EphemeralKeys
-	sym  *symmetricState
-	sent bool
-	body []byte // cached pubs‖mac1, so a cookie retry only swaps the mac2 trailer
+	psk       []byte
+	keys      *EphemeralKeys
+	sym       *symmetricState
+	epochSize uint32 // the media sender's epoch size, stamped into message 1
+	sent      bool
+	body      []byte // cached pubs‖epochSize‖mac1, so a cookie retry only swaps the mac2 trailer
 }
 
 // NewInitiator starts an initiator handshake from the (Argon2id-derived) PSK and a
-// prologue binding context. It generates the ephemeral hybrid keypair.
-func NewInitiator(psk, prologue []byte) (*Initiator, error) {
+// prologue binding context, carrying the media sender's epochSize so the receiver adopts
+// it (sender-authoritative). It generates the ephemeral hybrid keypair.
+func NewInitiator(psk, prologue []byte, epochSize uint32) (*Initiator, error) {
 	if len(psk) != KeySize {
 		return nil, ErrShortKey
 	}
@@ -159,7 +171,7 @@ func NewInitiator(psk, prologue []byte) (*Initiator, error) {
 	}
 	s := newSymmetric(prologue)
 	s.mixKey(psk)
-	return &Initiator{psk: psk, keys: keys, sym: s}, nil
+	return &Initiator{psk: psk, keys: keys, sym: s, epochSize: epochSize}, nil
 }
 
 // WriteMessage1 produces the first handshake message to send the responder. Its mac2
@@ -170,11 +182,12 @@ func (i *Initiator) WriteMessage1() ([]byte, error) {
 		return nil, ErrHandshakeState
 	}
 	xpub, ekey := i.keys.Public()
-	pubs := make([]byte, 0, msg1PubsLen)
-	pubs = append(pubs, xpub...)
-	pubs = append(pubs, ekey...)
-	i.sym.mixHash(pubs)
-	i.body = append(pubs, mac(mac1Key(i.psk), pubs)...) // pubs ‖ mac1
+	body := make([]byte, 0, msg1BodyLen)
+	body = append(body, xpub...)
+	body = append(body, ekey...)
+	body = binary.BigEndian.AppendUint32(body, i.epochSize) // pubs ‖ epochSize
+	i.sym.mixHash(body)
+	i.body = append(body, mac(mac1Key(i.psk), body)...) // pubs ‖ epochSize ‖ mac1
 	i.sent = true
 	return append(append([]byte(nil), i.body...), make([]byte, macSize)...), nil
 }
@@ -225,7 +238,7 @@ func (i *Initiator) ReadMessage2(msg2 []byte) (*Session, error) {
 		return nil, ErrBadHandshake
 	}
 	*i.sym = sym // commit only after the confirmation tag verifies
-	return &Session{Master: master, Transcript: sym.h, Initiator: true}, nil
+	return &Session{Master: master, Transcript: sym.h, Initiator: true, EpochSize: i.epochSize}, nil
 }
 
 // HandshakeInitKeys returns the initiator's ephemeral public material (X25519 public key ‖
@@ -244,11 +257,12 @@ func HandshakeInitKeys(msg1 []byte) (keys []byte, ok bool) {
 // Responder is the handshake half that replies (the media receiver). Use is
 // ReadMessage1 then WriteMessage2; single-shot, not safe for concurrent use.
 type Responder struct {
-	psk      []byte
-	sym      *symmetricState
-	initX    []byte
-	initEKey []byte
-	got1     bool
+	psk       []byte
+	sym       *symmetricState
+	initX     []byte
+	initEKey  []byte
+	epochSize uint32 // the initiator's (media sender's) epoch size, read from message 1
+	got1      bool
 }
 
 // NewResponder starts a responder handshake from the PSK and the prologue.
@@ -271,14 +285,22 @@ func (r *Responder) ReadMessage1(msg1 []byte) error {
 	if len(msg1) != msg1Len {
 		return ErrBadHandshake
 	}
-	pubs := msg1[:msg1PubsLen]
-	mac1 := msg1[msg1PubsLen : msg1PubsLen+macSize]
-	if !hmac.Equal(mac1, mac(mac1Key(r.psk), pubs)) {
+	body := msg1[:msg1BodyLen] // pubs ‖ epochSize, what mac1 covers and the transcript folds in
+	mac1 := msg1[msg1BodyLen : msg1BodyLen+macSize]
+	if !hmac.Equal(mac1, mac(mac1Key(r.psk), body)) {
 		return ErrBadHandshake
 	}
+	pubs := body[:msg1PubsLen]
 	r.initX = append([]byte(nil), pubs[:X25519KeySize]...)
 	r.initEKey = append([]byte(nil), pubs[X25519KeySize:]...)
-	r.sym.mixHash(pubs)
+	r.epochSize = binary.BigEndian.Uint32(body[msg1PubsLen:]) // the sender's epoch size, authenticated by mac1 + transcript
+	// A zero epoch size is malformed: the host keys every symbol by id/epochSize, so a peer that
+	// sent 0 would divide by zero on the receive path. Reject it as a bad handshake (the only
+	// constraint crypto enforces on the value; the session layer applies its own size policy).
+	if r.epochSize == 0 {
+		return ErrBadHandshake
+	}
+	r.sym.mixHash(body)
 	r.got1 = true
 	return nil
 }
@@ -305,5 +327,5 @@ func (r *Responder) WriteMessage2() ([]byte, *Session, error) {
 	body = append(body, ct...)
 	body = append(body, confirmTag(master, r.sym.h)...)
 	out := append(body, mac(mac1Key(r.psk), body)...)
-	return out, &Session{Master: master, Transcript: r.sym.h, Initiator: false}, nil
+	return out, &Session{Master: master, Transcript: r.sym.h, Initiator: false, EpochSize: r.epochSize}, nil
 }

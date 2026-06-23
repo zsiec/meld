@@ -5,10 +5,14 @@ import (
 	"testing"
 )
 
+// testEpochSize is a deliberately NON-default epoch size, so a test that checks it propagated
+// proves the value was negotiated from the initiator, not defaulted independently on each side.
+const testEpochSize uint32 = 4096
+
 // runHandshake drives a full exchange and returns both sessions (or a fatal error).
 func runHandshake(t *testing.T, initPSK, respPSK, initPro, respPro []byte) (*Session, *Session, error) {
 	t.Helper()
-	init, err := NewInitiator(initPSK, initPro)
+	init, err := NewInitiator(initPSK, initPro, testEpochSize)
 	if err != nil {
 		t.Fatalf("NewInitiator: %v", err)
 	}
@@ -59,6 +63,11 @@ func TestHandshakeSucceedsAndKeysLineUp(t *testing.T) {
 	if !isess.Initiator || rsess.Initiator {
 		t.Fatal("session roles are wrong")
 	}
+	// The initiator's (media sender's) epoch size is carried in message 1 and adopted by both
+	// sessions — sender-authoritative, so the receiver never relies on its own configured value.
+	if isess.EpochSize != testEpochSize || rsess.EpochSize != testEpochSize {
+		t.Fatalf("EpochSize not negotiated: initiator=%d responder=%d want %d", isess.EpochSize, rsess.EpochSize, testEpochSize)
+	}
 	// One side's send key must equal the other's receive key, in both directions.
 	if !bytes.Equal(sendEpochKey(isess, 7), recvEpochKey(rsess, 7)) {
 		t.Fatal("initiator send key != responder recv key")
@@ -108,12 +117,13 @@ func TestHandshakeDifferentPrologueRejected(t *testing.T) {
 func TestHandshakeTamperedMessagesRejected(t *testing.T) {
 	psk := testKey(0x42)
 	// Tamper message 1: responder rejects.
-	init, _ := NewInitiator(psk, nil)
+	init, _ := NewInitiator(psk, nil, testEpochSize)
 	resp, _ := NewResponder(psk, nil)
 	m1, _ := init.WriteMessage1()
-	// Positions inside the mac1-covered region (pubs ‖ mac1); the mac2 trailer is only
-	// checked under load (cookie.go), so it is deliberately not covered here.
-	for _, pos := range []int{0, X25519KeySize, msg1PubsLen + macSize - 1} {
+	// Positions inside the mac1-covered region (pubs ‖ epochSize ‖ mac1); the mac2 trailer is
+	// only checked under load (cookie.go), so it is deliberately not covered here. msg1PubsLen is
+	// the first epochSize byte — tampering it must be rejected (mac1 + the transcript bind it).
+	for _, pos := range []int{0, X25519KeySize, msg1PubsLen, msg1BodyLen + macSize - 1} {
 		bad := append([]byte(nil), m1...)
 		bad[pos] ^= 0x40
 		if err := resp.ReadMessage1(bad); err != ErrBadHandshake {
@@ -123,7 +133,7 @@ func TestHandshakeTamperedMessagesRejected(t *testing.T) {
 	}
 
 	// Tamper message 2: initiator rejects.
-	init2, _ := NewInitiator(psk, nil)
+	init2, _ := NewInitiator(psk, nil, testEpochSize)
 	resp2, _ := NewResponder(psk, nil)
 	m1b, _ := init2.WriteMessage1()
 	if err := resp2.ReadMessage1(m1b); err != nil {
@@ -137,13 +147,32 @@ func TestHandshakeTamperedMessagesRejected(t *testing.T) {
 	}
 }
 
+func TestHandshakeZeroEpochSizeRejected(t *testing.T) {
+	// The host keys every symbol by id/epochSize, so a peer advertising epochSize 0 would divide
+	// by zero downstream. ReadMessage1 must reject it as a bad handshake even though mac1 verifies
+	// (the value is authenticated — this is a malformed, not a forged, message).
+	psk := testKey(0x42)
+	init, err := NewInitiator(psk, nil, 0)
+	if err != nil {
+		t.Fatalf("NewInitiator: %v", err)
+	}
+	m1, err := init.WriteMessage1()
+	if err != nil {
+		t.Fatalf("WriteMessage1: %v", err)
+	}
+	resp, _ := NewResponder(psk, nil)
+	if err := resp.ReadMessage1(m1); err != ErrBadHandshake {
+		t.Fatalf("zero epochSize: got %v, want ErrBadHandshake", err)
+	}
+}
+
 func TestHandshakeStateOrdering(t *testing.T) {
 	psk := testKey(0x42)
 	resp, _ := NewResponder(psk, nil)
 	if _, _, err := resp.WriteMessage2(); err != ErrHandshakeState {
 		t.Errorf("WriteMessage2 before ReadMessage1: got %v, want ErrHandshakeState", err)
 	}
-	init, _ := NewInitiator(psk, nil)
+	init, _ := NewInitiator(psk, nil, testEpochSize)
 	if _, err := init.ReadMessage2(make([]byte, msg2Len)); err != ErrHandshakeState {
 		t.Errorf("ReadMessage2 before WriteMessage1: got %v, want ErrHandshakeState", err)
 	}
@@ -161,7 +190,7 @@ func TestHandshakeMalformedLengthRejected(t *testing.T) {
 	if err := resp.ReadMessage1(make([]byte, msg1Len-1)); err != ErrBadHandshake {
 		t.Errorf("short msg1: got %v, want ErrBadHandshake", err)
 	}
-	init, _ := NewInitiator(psk, nil)
+	init, _ := NewInitiator(psk, nil, testEpochSize)
 	_, _ = init.WriteMessage1()
 	if _, err := init.ReadMessage2(make([]byte, msg2Len+1)); err != ErrBadHandshake {
 		t.Errorf("long msg2: got %v, want ErrBadHandshake", err)
@@ -186,7 +215,7 @@ func FuzzResponderReadMessage1NoPanic(f *testing.F) {
 func FuzzInitiatorReadMessage2NoPanic(f *testing.F) {
 	f.Add([]byte{})
 	f.Add(make([]byte, msg2Len))
-	init, err := NewInitiator(testKey(0x42), nil)
+	init, err := NewInitiator(testKey(0x42), nil, testEpochSize)
 	if err != nil {
 		f.Fatalf("NewInitiator: %v", err)
 	}

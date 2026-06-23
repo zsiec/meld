@@ -9,6 +9,7 @@
 package meld
 
 import (
+	"log"
 	"time"
 
 	"github.com/zsiec/meld/internal/crypto"
@@ -24,8 +25,62 @@ type Config struct {
 	Flow uint32
 	// SymbolSize is the fixed media-chunk / coded-symbol size in bytes.
 	SymbolSize int
-	// GenSize is the coding generation (window) size in source symbols.
+	// GenSize is the coding generation (window) size in source symbols. With
+	// AdaptiveGenSize off this is the exact, fixed generation width; with it on it is the
+	// floor (the budget-below-RTT width).
 	GenSize int
+	// AdaptiveGenSize widens the generation toward 64 source symbols when the latency
+	// budget (BufferMicros) comfortably exceeds a reactive round (NominalRTTMicros +
+	// feedback), which amortizes the proactive repair margin over more symbols and CUTS
+	// REPAIR OVERHEAD substantially at a generous budget (the bench shows roughly a halving
+	// 16→64), with no loss of completeness. It stays at GenSize when the budget is below a
+	// reactive round (budget < RTT), and the fill-time gate (NominalBitrateBps) holds it narrow
+	// at low bitrate, where a wider generation would otherwise raise latency.
+	//
+	// RECOMMENDED for a known fixed-rate path. A real-timing sweep (bitrate × RTT × loss ×
+	// burst, vs librist/libsrt) finds it lower-overhead everywhere AND the only config that
+	// stays complete in the worst corner — 50 Mbps, bursty 10% loss, high RTT — where the fixed
+	// GenSize-16 default drops a few points of delivery (96–98%); with this on, the wider window
+	// holds ~100% there at ~3× lower p50 and lower overhead. Enable it WITH both hints below.
+	//
+	// Off by default — not because it loses (it does not) but because it cannot be a safe
+	// default: it is inert without NominalRTTMicros, and the generation STRIDE must be identical
+	// on both ends from the first packet, so BOTH ends must set the SAME GenSize, BufferMicros,
+	// AdaptiveGenSize, NominalRTTMicros, and NominalBitrateBps — a mismatch corrupts delivery, a
+	// guarantee a library default cannot make. NewSender/NewReceiver warn (Config.Check) if it is
+	// enabled without the hints. Generation coder only (ignored when Sliding).
+	AdaptiveGenSize bool
+	// AutoGenSize is the zero-config form of AdaptiveGenSize and is ON BY DEFAULT (DefaultConfig):
+	// the SENDER measures its own RTT and source rate and sizes the generation
+	// itself — no NominalRTTMicros / NominalBitrateBps, and nothing to set on the receiver, which
+	// follows the per-generation width stamped on every symbol. It re-sizes automatically if the
+	// bitrate or RTT changes mid-stream, and starts narrow-and-safe until it has measured the path.
+	// Set it on the sender (harmless on the receiver). Takes precedence over AdaptiveGenSize.
+	// Generation coder only (ignored when Sliding).
+	AutoGenSize bool
+	// NominalRTTMicros is a static path round-trip-time hint, in microseconds, used only to
+	// derive the AdaptiveGenSize width — it must be shared and static so both ends compute the
+	// same generation width. Set it to your path's expected RTT. 0 ⇒ AdaptiveGenSize does not
+	// widen. Ignored unless AdaptiveGenSize.
+	NominalRTTMicros int64
+	// NominalBitrateBps is your source bitrate in bits/sec. It gates AdaptiveGenSize by generation
+	// FILL TIME so the generation widens only when it fills fast enough that the wait doesn't cost
+	// latency: at a high bitrate (the win is free) it widens fully; at a low bitrate it stays near
+	// GenSize. This makes one config safe across bitrates — the lever helps where it helps and no-ops
+	// where a slow-filling wide generation would raise latency. Shared/static like NominalRTTMicros.
+	// 0 ⇒ no fill gate. Ignored unless AdaptiveGenSize.
+	NominalBitrateBps int64
+	// ProactiveDecay lowers steady-state repair overhead on a reactive-capable link (latency
+	// budget comfortably above the RTT) by letting the reactive tier carry the variance margin:
+	// the proactive code rate sends the mean expected loss plus a reactive-scaled fraction of the
+	// margin, and reactive repair tops up the generations that drew above-mean loss. It is a no-op
+	// where reactive cannot land (RTT ≥ budget), so it never under-protects there. A burst guard
+	// makes it self-revert to full protection on a bursty channel, so it sheds only the i.i.d.
+	// variance tail. ON by default (DefaultConfig) — proven within ~1 point of the full-protection
+	// baseline across a regime sweep, at parity below ~2% loss. Set false for the lowest tail latency
+	// at higher overhead. Single-path only (multipath keeps the joint-tail set-point); sender-side
+	// policy (the two ends may differ).
+	ProactiveDecay bool
 	// Redundancy is the FLOOR proactive code rate (repair per source symbol); the
 	// controller raises the rate above it as the measured loss requires.
 	Redundancy float64
@@ -34,18 +89,6 @@ type Config struct {
 	TargetFailure float64
 	// BufferMicros is the playout/deadline budget in microseconds.
 	BufferMicros int64
-	// ElasticMicros (0 = off) is the burst-elastic deadline extension: a generation still in a
-	// rank deficit at its nominal deadline is held this much longer for reactive recovery, so the
-	// sender carries a smaller proactive burst margin. Ready symbols deliver immediately; only the
-	// deficit symbols a burst hit incur the extra latency (a transient p99 excursion for overhead).
-	ElasticMicros int64
-	// Cockroach selects reliability-first "cockroach mode": reactive coded repair becomes rateless,
-	// persisting (uncapped) for a deficient generation to the full retention bound (BufferMicros +
-	// ElasticMicros) rather than stopping at the nominal deadline, and the receiver retains
-	// un-decoded generations to that bound. Paired with a deep ElasticMicros it rides out total
-	// outages and sustained extreme loss, delivering everything eventually at flexed latency.
-	// Opt-in; does not change the low-latency default. Maps to flow.ModeCockroach.
-	Cockroach bool
 	// Sliding selects the band-form sliding-window coder instead of the default
 	// generation coder. It codes continuous, fungible repair over one elastic window
 	// and delivers each symbol the instant it decodes.
@@ -164,21 +207,15 @@ func (c Config) MaxChunk() int {
 func DefaultConfig() Config {
 	c := flow.DefaultConfig()
 	return Config{
-		SymbolSize:    c.SymbolSize,
-		GenSize:       c.GenSize,
-		Redundancy:    c.Redundancy,
-		TargetFailure: c.TargetFailure,
-		BufferMicros:  c.BufferMicros,
-		Pace:          c.Pace, // on by default (flow.DefaultConfig)
+		SymbolSize:     c.SymbolSize,
+		GenSize:        c.GenSize,
+		Redundancy:     c.Redundancy,
+		TargetFailure:  c.TargetFailure,
+		BufferMicros:   c.BufferMicros,
+		Pace:           c.Pace,           // on by default (flow.DefaultConfig)
+		ProactiveDecay: c.ProactiveDecay, // on by default (flow.DefaultConfig)
+		AutoGenSize:    c.AutoGenSize,    // on by default (flow.DefaultConfig): zero-config adaptive width
 	}
-}
-
-// flowMode maps the Cockroach flag to the flow delivery mode.
-func (c Config) flowMode() flow.Mode {
-	if c.Cockroach {
-		return flow.ModeCockroach
-	}
-	return flow.ModeLatency
 }
 
 func (c Config) toFlow() flow.Config {
@@ -186,11 +223,14 @@ func (c Config) toFlow() flow.Config {
 		Flow:              c.Flow,
 		SymbolSize:        c.SymbolSize,
 		GenSize:           c.GenSize,
+		AdaptiveGenSize:   c.AdaptiveGenSize,
+		AutoGenSize:       c.AutoGenSize,
+		NominalRTTMicros:  c.NominalRTTMicros,
+		NominalBitrateBps: c.NominalBitrateBps,
+		ProactiveDecay:    c.ProactiveDecay,
 		Redundancy:        c.Redundancy,
 		TargetFailure:     c.TargetFailure,
 		BufferMicros:      c.BufferMicros,
-		ElasticMicros:     c.ElasticMicros,
-		Mode:              c.flowMode(),
 		Sliding:           c.Sliding,
 		CodingWindow:      c.CodingWindow,
 		CongestionControl: c.CongestionControl,
@@ -267,11 +307,44 @@ type ReceiverStats struct {
 	Evicted    uint64 // source ids dropped early as undecodable (Config.EvictBrokenFrames)
 }
 
+// Check returns advisory warnings about a Config whose options are set in a way that
+// makes them inert or likely to under-perform — an empty slice when the config is sound.
+// It is pure (no I/O) and may be called before NewSender/NewReceiver, which surface these
+// warnings via the standard logger. The findings are advisory, not errors: a flagged
+// config still runs (just not as intended).
+//
+// Today it checks the AdaptiveGenSize hints: that lever is the recommended setting for a
+// fixed-rate path (it lowers overhead everywhere and is the only config that stays complete
+// in the worst burst+high-RTT corner — see the AdaptiveGenSize doc), but it is inert without
+// NominalRTTMicros and unsafe at low bitrate without NominalBitrateBps, and both must match on
+// the two ends.
+func (c Config) Check() []string {
+	var w []string
+	if c.AdaptiveGenSize && !c.AutoGenSize && !c.Sliding {
+		switch {
+		case c.NominalRTTMicros <= 0:
+			w = append(w, "meld: AdaptiveGenSize is on but NominalRTTMicros is unset — the generation "+
+				"will NOT widen (the lever is inert). Either set NominalRTTMicros + NominalBitrateBps "+
+				"(both ends, matched), or — simpler — use AutoGenSize, which measures them itself and "+
+				"needs nothing on the receiver.")
+		case c.NominalBitrateBps <= 0:
+			w = append(w, "meld: AdaptiveGenSize is on without NominalBitrateBps — the fill-time gate is "+
+				"OFF, so a low-bitrate path can regress latency (a wide generation fills slowly and "+
+				"head-of-line-blocks). Set NominalBitrateBps to your source rate (both ends), or — "+
+				"simpler — use AutoGenSize, which measures it itself.")
+		}
+	}
+	return w
+}
+
 // Sender transmits a coded media flow to a remote Receiver.
 type Sender struct{ s *session.Sender }
 
 // NewSender dials remote ("host:port") and starts a coded sender.
 func NewSender(remote string, cfg Config) (*Sender, error) {
+	for _, warn := range cfg.Check() {
+		log.Println(warn)
+	}
 	s, err := session.NewSender(remote, cfg.toFlow(), cfg.toSecurity())
 	if err != nil {
 		return nil, err
@@ -315,6 +388,9 @@ type Receiver struct{ r *session.Receiver }
 // NewReceiver binds bind ("host:port"; use :0 for an ephemeral port) and starts a
 // coded receiver.
 func NewReceiver(bind string, cfg Config) (*Receiver, error) {
+	for _, warn := range cfg.Check() {
+		log.Println(warn)
+	}
 	r, err := session.NewReceiver(bind, cfg.toFlow(), cfg.toSecurity())
 	if err != nil {
 		return nil, err

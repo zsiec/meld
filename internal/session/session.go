@@ -149,7 +149,7 @@ func newSenderCfg(sub Substrate, cfg flow.Config, clk clock.Clock, sec *Security
 	}
 	if sec.active() {
 		s.hsDone = make(chan struct{})
-		init, err := crypto.NewInitiator(s.psk, beU32(cfg.Flow))
+		init, err := crypto.NewInitiator(s.psk, beU32(cfg.Flow), sec.epochSize())
 		if err != nil {
 			sub.Close()
 			return nil, err

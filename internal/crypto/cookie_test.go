@@ -27,7 +27,7 @@ func TestCookieRoundTrip(t *testing.T) {
 		t.Fatalf("OpenCookieReply: %v", err)
 	}
 
-	init, _ := NewInitiator(psk, nil)
+	init, _ := NewInitiator(psk, nil, testEpochSize)
 	if _, err := init.WriteMessage1(); err != nil {
 		t.Fatalf("WriteMessage1: %v", err)
 	}
@@ -43,7 +43,7 @@ func TestCookieRoundTrip(t *testing.T) {
 	if cc.Valid(m1, []byte("198.51.100.9:51000")) {
 		t.Fatal("cookie accepted for the wrong source address (no return-routability)")
 	}
-	zero, _ := NewInitiator(psk, nil)
+	zero, _ := NewInitiator(psk, nil, testEpochSize)
 	m1zero, _ := zero.WriteMessage1() // mac2 = zeros
 	if cc.Valid(m1zero, peerID) {
 		t.Fatal("a zero mac2 was accepted under load")

@@ -25,23 +25,6 @@ import (
 	"github.com/zsiec/meld/internal/clock"
 )
 
-// Mode selects the delivery contract a Sender/Receiver pair optimizes for.
-type Mode uint8
-
-const (
-	// ModeLatency (the default) bounds latency: a generation is delivered within its deadline
-	// (optionally extended by ElasticMicros) or declared lost. This is Meld's low-latency identity.
-	ModeLatency Mode = iota
-	// ModeCockroach inverts the contract: reliability is the invariant, latency the soft variable.
-	// Reactive coded repair becomes RATELESS — it persists for a deficient generation, uncapped,
-	// to the full retention bound (deadline + ElasticMicros, which an operator sets deep, e.g.
-	// seconds) instead of stopping at the nominal deadline. Combined with the receiver retaining
-	// un-decoded generations to that same bound, it rides out total outages (up to the retention
-	// depth) and sustained extreme loss, delivering everything eventually at flexed latency. It
-	// does NOT change the latency-mode default; it is opt-in per flow.
-	ModeCockroach
-)
-
 // Config parameterizes a Sender/Receiver pair. Both ends must agree on Flow,
 // SymbolSize, and GenSize; Redundancy, TargetFailure, and BufferMicros are
 // sender-side policy.
@@ -50,8 +33,66 @@ type Config struct {
 	Flow uint32
 	// SymbolSize is the fixed coded-symbol size in bytes (one source media chunk).
 	SymbolSize int
-	// GenSize is the number of source symbols per generation (the coding window).
+	// GenSize is the number of source symbols per generation (the coding window). With
+	// AdaptiveGenSize off it is the exact, fixed generation width; with it on it is the
+	// FLOOR width (the narrow, budget-below-RTT value) and genWidth derives the effective
+	// width up from it.
 	GenSize int
+	// AdaptiveGenSize widens the generation from GenSize toward maxAdaptiveGenWidth when the
+	// deadline budget exceeds a reactive round (RTT + feedback), amortizing the proactive
+	// variance/burst margin over more symbols — markedly lower repair overhead at a generous
+	// budget. It NEVER widens past what the budget can recover: below a reactive round
+	// (budget < RTT, the all-proactive regime) it stays at GenSize, because a deadline-evicted
+	// wide generation loses more symbols at once with no reactive backstop. Both ends derive
+	// the width identically from shared config (BufferMicros + NominalRTTMicros), preserving
+	// the fixed-stride generation addressing, so BOTH must set the same AdaptiveGenSize,
+	// BufferMicros, and NominalRTTMicros. Off ⇒ a fixed GenSize (unchanged). Generation coder
+	// only (the sliding coder has no generations). Requires NominalRTTMicros > 0.
+	AdaptiveGenSize bool
+	// AutoGenSize is the zero-config, self-measuring form of AdaptiveGenSize: the SENDER derives the
+	// generation width from its OWN measured RTT and write cadence (no NominalRTTMicros/
+	// NominalBitrateBps hints), re-sizing as either drifts — including a mid-stream bitrate change. It
+	// is SENDER-SIDE ONLY: the receiver follows the per-generation width stamped on every symbol, so
+	// it needs no matching config (the both-ends-agree burden of AdaptiveGenSize is gone). The width
+	// is fixed for each generation and bootstraps to GenSize until both a cadence and a real RTT
+	// sample exist, so the stream starts narrow-and-safe and widens only once it has measured that
+	// widening is safe. Takes precedence over AdaptiveGenSize when set. Generation coder only. ON BY
+	// DEFAULT (DefaultConfig): a real-timing sweep shows it a Pareto win over a fixed GenSize (lower
+	// overhead, never worse delivery or p99, and it fixes the fixed-width burst/high-RTT delivery
+	// holes), no-opping where it cannot help. Set false to pin a fixed GenSize.
+	AutoGenSize bool
+	// NominalRTTMicros is the operator's path round-trip hint, in microseconds, used ONLY to
+	// derive the adaptive generation width (it must be a static, shared input so both ends
+	// compute the same width; the live RTT estimate cannot be used — the receiver does not
+	// measure it). 0 ⇒ AdaptiveGenSize does not widen (stays at GenSize). Ignored unless
+	// AdaptiveGenSize.
+	NominalRTTMicros int64
+	// NominalBitrateBps is the operator's source bitrate hint, bits/sec, used ONLY to gate the
+	// adaptive generation width by GENERATION FILL TIME: a wide generation only pays off when it
+	// fills quickly (a symbol lost early waits out the fill before its repair, and everything in
+	// order behind it waits with it), so the width is capped so the fill time (width × per-symbol
+	// interval) stays within a small latency tax. At a high bitrate the fill is negligible and the
+	// width widens fully; at a low bitrate the cap holds it near GenSize — so one config gives the
+	// overhead win where it is free and no-ops where it would cost latency. Like NominalRTTMicros it
+	// must be a static, shared input (both ends compute the same width). 0 ⇒ no fill gate (the width
+	// is set by budget/RTT alone). Ignored unless AdaptiveGenSize.
+	NominalBitrateBps int64
+	// ProactiveDecay lets the reactive tier carry the i.i.d. VARIANCE margin on a
+	// reactive-capable link (budget comfortably above the RTT), instead of the proactive code
+	// rate provisioning the full binomial set-point on every generation. The proactive rate
+	// then carries the mean expected loss plus a reactive-scaled fraction of the margin
+	// (1/(reactiveRounds+1), the same conservative discount the burst margin already uses), and
+	// reactive repair cleans up the ~half of generations that drew an above-mean loss — cheaply,
+	// on demand, only where needed. It is a no-op where reactive cannot land (RTT ≥ budget ⇒
+	// reactiveRounds 0 ⇒ full set-point retained), so it only removes overhead the reactive tier
+	// can recover, never load-bearing protection. A burst guard keys the offload on how memoryless
+	// the channel is (it self-reverts to the full set-point on a bursty channel, where a concentrated
+	// run needs the margin proactively), so it sheds only the i.i.d. variance tail. ON by default
+	// (DefaultConfig) — a regime sweep holds it within ~1 point of the full-protection baseline
+	// everywhere and at parity below ~2% loss, the contribution norm. Single-path only (multipath
+	// keeps the joint-tail set-point). Set false to carry the full proactive set-point (lowest tail
+	// latency, highest overhead). Trades a touch of latency on the offloaded generations.
+	ProactiveDecay bool
 	// Redundancy is the FLOOR proactive code rate (repair per source symbol): the
 	// minimum protection even at ~0 estimated loss, covering the lag before the
 	// loss estimate catches a sudden onset. The redundancy controller raises the
@@ -66,18 +107,6 @@ type Config struct {
 	// BufferMicros is the playout/deadline budget: a generation must be delivered
 	// within this of its start, or its still-missing symbols are declared lost.
 	BufferMicros int64
-	// ElasticMicros (0 = off) is the burst-elastic deadline extension: a generation that
-	// still has a rank deficit at its nominal deadline is held this much longer before
-	// eviction — fitting reactive rounds the steady budget cannot at a high RTT — so the
-	// sender can carry a smaller proactive burst margin (the discount counts the elastic
-	// rounds, reactiveRounds). Ready symbols still deliver immediately, so the extra latency
-	// falls only on the deficit symbols a burst actually hit: it trades a transient p99
-	// excursion (bounded by this) for proactive overhead, leaving p50 at the steady budget.
-	ElasticMicros int64
-	// Mode selects the delivery contract (ModeLatency default, ModeCockroach for reliability-first
-	// rateless recovery). ModeCockroach is typically paired with a deep ElasticMicros (the retention
-	// depth = how long the receiver holds an un-decoded generation and the sender keeps repairing it).
-	Mode Mode
 	// Sliding selects the band-form sliding-window coder instead of the default
 	// generation coder: a repair is fungible across a coding window of CodingWindow
 	// symbols, delivered on decode (no per-generation close), at O(CodingWindow²)
@@ -227,12 +256,14 @@ func (c Config) codingWindow() int {
 // media chunk (the bench/RTP payload size).
 func DefaultConfig() Config {
 	return Config{
-		SymbolSize:    1316,
-		GenSize:       16,
-		Redundancy:    0.15, // floor; the controller adapts above it
-		TargetFailure: 1e-3,
-		BufferMicros:  200_000, // 200 ms
-		Pace:          true,    // host pacer on: smooth to the budget, backpressure the source
+		SymbolSize:     1316,
+		GenSize:        16,
+		Redundancy:     0.15, // floor; the controller adapts above it
+		TargetFailure:  1e-3,
+		BufferMicros:   200_000, // 200 ms
+		Pace:           true,    // host pacer on: smooth to the budget, backpressure the source
+		ProactiveDecay: true,    // on by default: burst-guarded variance-margin offload (cuts overhead, self-reverts on bursts)
+		AutoGenSize:    true,    // on by default: zero-config self-measuring generation width (Pareto win over fixed GenSize across a real-timing sweep; no-op where it can't help, fixes the fixed-width burst/high-RTT delivery holes)
 	}
 }
 
@@ -312,21 +343,6 @@ const (
 	// maxRepairFactor caps the proactive code rate at this multiple of the
 	// generation size, bounding overhead under an extreme or mis-estimated loss.
 	maxRepairFactor = 3
-	// cockroachRepairFactor caps total RATELESS reactive repair per generation in ModeCockroach at
-	// this multiple of the generation size. It is far higher than maxRepairFactor — recovery is
-	// rateless within the retention window, so to deliver n source symbols under loss p the sender
-	// emits ~n/(1-p) symbols, and 64× covers loss up to ~98% — yet the retention deadline and the
-	// convergence gate (react only to a STUCK deficit) do the real limiting; this is only a backstop
-	// against a permanently dead generation demanding unbounded work.
-	cockroachRepairFactor = 64
-	// maxRepairKeys bounds the per-generation repair keyspace under the uint16 key width, with
-	// headroom for the proactive prefix, so the cockroach cap can never overflow nextKey.
-	maxRepairKeys = 60000
-	// cockroachMaxReactiveP caps the erasure rate used to SIZE a cockroach reactive batch. A total
-	// outage spikes the loss estimate to ~1.0; without this the batch saturates to the per-gen cap in
-	// one round and abandons a recoverable generation. Sustained real loss sits below it (so it is
-	// unaffected); only the post-outage transient is clipped.
-	cockroachMaxReactiveP = 0.95
 	// lossWindowMin is the smallest source-id span the receiver averages channel
 	// loss over before reporting; a wider span lowers estimator variance.
 	lossWindowMin = 64
@@ -413,6 +429,27 @@ func repairForTarget(k int, p, delta float64, maxFactor int) int {
 		}
 	}
 	return maxR
+}
+
+// meanRepairCount returns the mean-sufficient repair for a generation of k source symbols
+// over an i.i.d. erasure channel of probability p: the smallest r whose expected survivors
+// (k+r)(1−p) still cover the k source symbols, i.e. ⌈k·p/(1−p)⌉. This is the repair a
+// mean-tracking controller would send; the proactive set-point (repairForTarget) sits ABOVE
+// it by the variance margin. ProactiveDecay carries this floor plus a reactive-scaled fraction
+// of that margin, letting reactive repair clean up the above-mean generations.
+func meanRepairCount(k int, p float64) int {
+	if k <= 0 || p <= 0 {
+		return 0
+	}
+	if p >= 1 {
+		p = 0.999
+	}
+	m := float64(k) * p / (1 - p)
+	r := int(m)
+	if float64(r) < m {
+		r++ // ceil
+	}
+	return r
 }
 
 // binomTailGreater returns P[X > r] for X ~ Binomial(n, p), computed iteratively
@@ -700,4 +737,82 @@ func genBaseOf(id uint32, genSize int) uint32 {
 	}
 	g := uint32(genSize)
 	return id / g * g
+}
+
+// maxAdaptiveGenWidth caps the adaptive generation width. 64 is where the per-generation
+// proactive margin is well amortized (the bench shows overhead roughly halving 16→64)
+// while a generation still fills and recovers comfortably inside a contribution budget.
+const maxAdaptiveGenWidth = 64
+
+// adaptiveMaxFillMicros is the gen-fill latency tax the width gate tolerates: a generation may be
+// widened only while it still fills within this. The cref bench shows a ~13 ms fill (a 64-wide gen
+// at 50 Mbps) is invisible to delivery latency, while a ~134 ms fill (the same at 5 Mbps) regresses
+// p50 4-5× — so 15 ms widens fully at ≳45 Mbps and holds the width near GenSize below ~10 Mbps.
+const adaptiveMaxFillMicros = 15_000
+
+// fillCappedWidth returns w reduced so a generation of that width fills within
+// adaptiveMaxFillMicros at the given bitrate (bits/sec), but never below GenSize. With no bitrate
+// hint (≤0) it returns w unchanged — the fill gate is off.
+func (c Config) fillCappedWidth(w int) int {
+	if c.NominalBitrateBps <= 0 {
+		return w
+	}
+	// symbols that fit in the fill budget = fillMicros / (symbolBits·1e6/bitrate)
+	// = fillMicros · bitrate / (symbolBits · 1e6); integer, no overflow at realistic values.
+	symbolBits := int64(c.SymbolSize) * 8
+	if symbolBits <= 0 {
+		return w
+	}
+	fillWidth := int(adaptiveMaxFillMicros * c.NominalBitrateBps / (symbolBits * 1_000_000))
+	if fillWidth < c.GenSize {
+		fillWidth = c.GenSize
+	}
+	if w > fillWidth {
+		return fillWidth
+	}
+	return w
+}
+
+// genWidth returns the effective generation width — the fixed stride BOTH ends use to
+// address generations. With AdaptiveGenSize off it is exactly GenSize (no behaviour
+// change). With it on (and a NominalRTTMicros hint) it ramps from GenSize toward
+// maxAdaptiveGenWidth as the deadline budget clears a reactive round (RTT + feedback):
+// a wider generation amortizes the proactive variance/burst margin over more symbols, but
+// only where the budget can still absorb a burst's residual — proactively, or by one
+// reactive round. Below a reactive round (budget < RTT, the all-proactive regime) it stays
+// at GenSize, since a deadline-evicted wide generation loses more symbols at once with no
+// reactive recovery (measured: ~2% delivery loss at width 64, budget < RTT). The ramp is
+// gradual so an optimistic RTT hint degrades the width gracefully rather than off a cliff.
+//
+// A NominalBitrateBps hint additionally caps the width by GENERATION FILL TIME (fillCappedWidth):
+// a wide generation only pays off when it fills fast, so at a high bitrate it widens fully and at a
+// low bitrate it stays near GenSize — the overhead win where it is free, a no-op where it would cost
+// latency (the cref bench shows p50 regressing 4-5× from a slow fill at 5 Mbps).
+func (c Config) genWidth() int {
+	base := c.GenSize
+	if base < 1 {
+		base = 1
+	}
+	if !c.AdaptiveGenSize || c.NominalRTTMicros <= 0 || base >= maxAdaptiveGenWidth {
+		return base
+	}
+	round := c.NominalRTTMicros + feedbackIntervalMicros // one reactive round
+	headroom := c.BufferMicros - round                   // budget beyond the first round
+	if headroom <= 0 {
+		return base // budget below a reactive round: stay narrow
+	}
+	// frac measures the spare budget in units of a reactive round: a second round of
+	// headroom (budget ≈ 2·round) earns the full width.
+	frac := float64(headroom) / float64(round)
+	if frac > 1 {
+		frac = 1
+	}
+	w := base + int(frac*float64(maxAdaptiveGenWidth-base)+0.5)
+	if w < base {
+		w = base
+	}
+	if w > maxAdaptiveGenWidth {
+		w = maxAdaptiveGenWidth
+	}
+	return c.fillCappedWidth(w) // a slow-filling (low-bitrate) wide gen hurts latency: cap it
 }

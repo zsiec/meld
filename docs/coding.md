@@ -107,6 +107,46 @@ feedback-free push to many receivers.
 large (`k ≫ 1000`) feedback-free fountain at a relaxed deadline — is one Meld's chunked
 architecture never forms.
 
+### Redundancy-sizing gate: AHECM overhead-optimizer → DECLINED
+
+This gate is on the **sizing** axis (how much repair), not the code family. The
+shipped controller sizes proactive repair to a decode-failure **target** δ (tightened
+per class for UEP), carries the GE burst tail (`repairForGE`), and reduces overhead
+two ways: **widening the generation** when the budget allows (`AdaptiveGenSize`, gated
+by RTT headroom *and* a bitrate fill-time cap so a wide generation never raises
+low-bitrate latency) and **offloading the variance margin** to the reactive tier by a
+fixed, burst-guarded fraction (`ProactiveDecay`, on by default).
+
+*The alternative:* AHECM (Tsai et al., *Multimedia Systems* 2011) instead sizes
+proactive repair to **minimize expected coded overhead** (proactive + retransmission
+bytes, Eqs 15-18) subject to recovery within the deadline's reactive rounds (Eq 4/7):
+`(n,k,R) = arg min(overhead)` (Eq 19). Since that total is monotone in the proactive
+count, it is the *smallest* proactive count whose residual after the reactive rounds
+still meets δ — the overhead-optimal proactive/reactive split, vs the heuristics'
+fixed discount.
+
+*The gate:* a throwaway sizer arm — built, raced on cref (real librist/libsrt-class
+glass-to-glass timing) against the shipped levers across bitrate × RTT × loss, then
+removed (as the code-family oracles above were), with the method and numbers kept here.
+
+*Result:* **dominated.** At the 50 Mbps contribution operating point `AdaptiveGenSize`
+wins every cell — in most, AHECM is worse on *both* overhead and p99; where it does
+reach lower overhead it pays a ~3× p99 blowup (e.g. p99 32 → 89 ms at RTT40/2%). All
+arms held 100% delivery. **Cause:** AHECM's objective minimizes *bytes* and has **no
+latency term**, so it offloads aggressively to reactive — but at ~30 generations/RTT
+reactive is not cheaper (it re-sends what proactive shed) while costing a reactive RTT
+on every offloaded generation, so p99 explodes. The width lever cuts the same overhead
+with *zero* reactive round. The architecture also forbids the full optimizer: the
+generation stride must be identical on both ends from packet 0 (sans-I/O), so block
+size is config-time-static, not a freely-optimized variable.
+
+*When this would change:* a regime where reactive *is* materially cheaper than
+proactive (very low bitrate / few generations per RTT) with ample p99 headroom — the
+corner where Meld's gentler `ProactiveDecay` already captures most of the win. The
+ship bar was beating the width + margin levers at the deployment operating point;
+missed. One borrowable idea not adopted: AHECM's ERE metric (Eq 23, recovered ÷
+redundant) as a bench column for redundancy→recovery efficiency.
+
 ---
 
 ## 3. Class → code assignment (one engine)
@@ -123,6 +163,71 @@ architecture never forms.
 repair *rate* per class from the descriptor's `priority_class` and `deadline`; unequal
 protection (not a different code family) is what steers a fixed budget up the
 dependency spine.
+
+---
+
+## 3b. Overhead efficiency: the two shipping levers
+
+On the operating point that matters (a single contribution stream) the binding cost is
+not throughput, CPU, or latency — all healthy — it is **repair overhead**. Two levers
+cut it, each gated to its safe regime so it never trades away completeness:
+
+- **`ProactiveDecay`** (sender-side, **on by default**): the proactive code rate carries
+  the mean expected loss plus a reactive-scaled fraction of the variance margin, and the
+  reactive tier cleans up the generations that drew above-mean loss. A burst guard
+  (`roundsEff = rounds·burstQ8One/burstQ8`) self-reverts it to full protection on a
+  bursty channel, so it sheds only the i.i.d. variance tail. It is self-adapting (reads
+  the measured loss/burst), needs no configuration, and is an exact no-op where reactive
+  cannot land (RTT ≥ budget) — which is why it is safe to default on.
+
+- **`AdaptiveGenSize`** (**opt-in, but the recommended setting for a known fixed-rate
+  path**): widens the generation 16 → 64 when the budget clears a reactive round,
+  amortizing the proactive margin over more symbols. Gated two ways so it never costs
+  latency: it stays narrow below a reactive round (budget < RTT), and a **fill-time gate**
+  (`NominalBitrateBps`) caps the width so a generation always fills within ~15 ms — full
+  width at high bitrate, near `GenSize` at low bitrate.
+
+**The evidence (a real-timing sweep, vs librist/libsrt at matched 4×RTT buffers):** across
+bitrate {5, 25, 50 Mbps} × RTT {20, 100, 300 ms} × loss {2, 10 %} × {iid, bursty}, meld
+delivers in ~one propagation time — **8–21× lower p50** than the C stacks at low/mid RTT,
+2–4× at high-RTT/bursty — at 100 % delivery. `AdaptiveGenSize` lowers overhead in every
+cell (often a halving, e.g. 50 Mbps/100 ms/10 %: 90 % → 57 %) **and is the only config that
+stays complete in the worst corner** — 50 Mbps, bursty 10 % loss, high RTT — where the
+fixed `GenSize`-16 default drops to 96–98 %; the wider window holds ~100 % there at ~3×
+lower p50 and lower overhead. So it is not merely safe to enable: it is the configuration
+that makes the transport general-purpose.
+
+**`AutoGenSize` — zero-config, the recommended way to get this.** `AdaptiveGenSize` needs two
+*static, shared* hints (`NominalRTTMicros`, `NominalBitrateBps`) set the same on both ends,
+because the original feedback path computed the generation stride by fixed-stride arithmetic on
+each end — a mismatch corrupts delivery, so a library default could not be made safe.
+**`AutoGenSize` removes the burden entirely.** It rests on one change: the generation structure is
+now **sender-authoritative**. The sender already stamps each symbol with its generation base
+(`WindowBase`) and width (`N`); the receiver now *follows those stamps* for everything (it absorbs
+into the stamped generation, and its deficit-feedback walk advances by the actual per-generation
+width — `base += width` — rather than a shared constant). So the sender may pick *any* width, vary
+it per generation, and the receiver tracks it with **no matching config**.
+
+On top of that, the sender derives the width from its **own measurements** — RTT (from feedback)
+and the per-generation fill rate (wall-clock span ÷ symbols, robust to bursty frame writes) — with
+the same budget/RTT ramp and ~15 ms fill cap as the static form, but no hints. It bootstraps to
+`GenSize` until both are measured, so the stream starts narrow-and-safe and widens once it has
+*measured* that widening is safe; if the bitrate or RTT drifts mid-stream, the next generation
+re-sizes. A real-timing bench confirms zero-config `AutoGenSize` reaches the **same overhead and
+delivery** as the hand-tuned hint-based arm, and survives a mid-stream 10×-bitrate change a static
+width cannot. It is **sender-side only** (the receiver needs nothing; setting it there is a no-op).
+
+**`AutoGenSize` is ON BY DEFAULT.** Unlike `AdaptiveGenSize`, the structural blockers to defaulting
+it are gone (it is inert-proof, needs no hints, and a mismatch is impossible since the receiver
+follows stamps), and a real-timing regression sweep across bitrate × RTT × loss × {iid, burst}
+shows it a **Pareto win over the fixed `GenSize`**: never worse on delivery or p99 in any cell,
+overhead cut 15–40 points at 25–50 Mbps and neutral at low bitrate, and it *fixes* the fixed-width
+delivery holes (e.g. 50 Mbps / bursty 10 % / 300 ms RTT: 95 % → 99 % delivery at roughly half the
+p99). It no-ops where it cannot help, so it meets the same bar `ProactiveDecay` cleared. Set
+`AutoGenSize = false` to pin a fixed `GenSize`.
+
+`AdaptiveGenSize` (static hints) remains for explicit control; `Config.Check` (surfaced by
+`NewSender`/`NewReceiver`) warns when it is enabled without its hints and points to `AutoGenSize`.
 
 ---
 
@@ -146,5 +251,6 @@ the field. The multi-code future was a hedge; the gates retired it.
 RLC FEC), RFC 9407 (Tetrys on-the-fly coding), RFC 5053 (Raptor/R10), RFC 6330
 (RaptorQ), streaming/convolutional erasure codes (Martinian–Sundberg, Khisti, Fong,
 Tong et al.), Tambur (Rudow et al., NSDI'23; MS patent US 11,489,620 B1), Steinwurf
-Kodo (RLNC + recoding). Cite the spec/behavior in code, never a library file path (the
-ristgo rule).
+Kodo (RLNC + recoding), AHECM (Tsai et al., *Multimedia Systems* 2011 — adaptive
+hybrid FEC/ARQ overhead minimization, the redundancy-sizing gate). Cite the
+spec/behavior in code, never a library file path (the ristgo rule).

@@ -379,17 +379,7 @@ func (r *Receiver) pump(now clock.Timestamp) {
 			continue
 		}
 		gd, gdKnown := r.deadlineOf(id)
-		// Burst-elastic deadline: a still-missing (not-ready) symbol is held ElasticMicros past its
-		// nominal deadline so reactive repair gets the extra rounds. Ready symbols are unaffected —
-		// they deliver immediately below, well before the extended deadline — so the latency falls
-		// only on the deficit symbols a burst actually hit.
 		refDL := r.refDL
-		if r.cfg.ElasticMicros > 0 {
-			if gdKnown {
-				gd = gd.Add(r.cfg.ElasticMicros)
-			}
-			refDL = refDL.Add(r.cfg.ElasticMicros)
-		}
 		payload, ready := r.ready[id]
 		switch {
 		case ready && (!gdKnown || !now.After(gd)):
@@ -627,30 +617,24 @@ func (r *Receiver) maybeFeedback(now clock.Timestamp) {
 	}
 	r.fedOnce = true
 	r.lastFB = now
-	// Report the rank deficit of each of the next MaxFeedbackGens generations from
-	// the cursor, so the sender repairs all of them in parallel.
-	cursorGen := r.genBaseOf(r.cursor)
+	// Report the rank deficit of each generation from the cursor, walking the ACTUAL
+	// generation boundaries (base += width) the sender stamped on every symbol — not a fixed
+	// stride — so the two ends need not be configured with the same generation width. The
+	// sender's reactive walk mirrors this exactly.
 	var defs [wire.MaxFeedbackGens]uint8
-	for i := range defs {
-		base := cursorGen + uint32(i*r.cfg.GenSize)
-		if g := r.gens[base]; g != nil {
+	if base, ok := r.genBaseContaining(r.cursor); ok {
+		for i := range defs {
+			g := r.gens[base]
+			if g == nil {
+				break // structural gap (an entirely-lost generation); serviced once it is skipped
+			}
 			if d := g.dec.Deficit(g.n); d > 0 {
 				if d > 255 {
 					d = 255
 				}
 				defs[i] = uint8(d)
 			}
-		} else if r.cfg.Mode == ModeCockroach && base+uint32(r.cfg.GenSize) <= r.highestSeen {
-			// Cockroach: a generation that lies entirely below the highest seen id yet has NO decoder
-			// lost 100% of its symbols (a total outage erased the whole generation). The sender cannot
-			// infer this from a missing feedback entry, so report a full-generation deficit to drive
-			// rateless repair that rebuilds it from scratch — the key to riding out a total outage.
-			// The first repair to arrive creates the decoder; subsequent repair fills it to rank.
-			d := r.cfg.GenSize
-			if d > 255 {
-				d = 255
-			}
-			defs[i] = uint8(d)
+			base += uint32(g.n)
 		}
 	}
 	var ceFrac uint16
@@ -855,10 +839,18 @@ func (r *Receiver) lossEstimate() float64 {
 	return p
 }
 
-// genBaseOf returns the generation base for a source id. Generation bases are
-// aligned to GenSize for the steady stream (the sender only closes a partial
-// generation at end of stream), so this is exact arithmetic.
-func (r *Receiver) genBaseOf(id uint32) uint32 { return genBaseOf(id, r.cfg.GenSize) }
+// genBaseContaining returns the base of the received generation whose id range covers id, and
+// true — or false if no received generation does (an entirely-lost generation, or id past the
+// frontier). It replaces fixed-stride genBaseOf so the generation width need not be a shared
+// constant: the receiver follows the per-generation width the sender stamps on every symbol.
+func (r *Receiver) genBaseContaining(id uint32) (uint32, bool) {
+	for base, g := range r.gens {
+		if base <= id && id < base+uint32(g.n) {
+			return base, true
+		}
+	}
+	return 0, false
+}
 
 // updateRef refines the per-symbol deadline fit from one stamped (id, deadline):
 // it anchors on the highest id seen and tracks the inter-symbol interval by EWMA, so

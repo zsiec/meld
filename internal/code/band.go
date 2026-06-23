@@ -354,7 +354,6 @@ func (d *BandDecoder) pad(data []byte) []byte {
 	return p
 }
 
-
 // eqSubRow does eq -= f*row (row.start >= eq.start), growing eq to cover the row.
 func eqSubRow(eq *beq, row *brow, f byte) {
 	off := int(row.start - eq.start)

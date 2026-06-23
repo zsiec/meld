@@ -50,6 +50,10 @@ type Sender struct {
 	burstQ8     int                   // estimated mean loss-run length, Q8 (from feedback; 256 = i.i.d.)
 	cleanRun    int                   // consecutive feedback reports observing zero loss (floor-decay confidence)
 	lastWrite   clock.Timestamp       // time of the last Write (for the idle flush)
+	genOpenTime clock.Timestamp       // when the live generation opened (AutoGenSize fill-rate measurement)
+	interMicros int64                 // EWMA of the per-symbol fill time, µs (AutoGenSize fill gate)
+	curGenWidth int                   // width fixed when the live generation opened (stamped on every symbol)
+	rttSampled  bool                  // a real RTT sample has arrived (AutoGenSize stays narrow until then)
 	now         clock.Timestamp       // most recent entry-point time (for the rate ceiling)
 	bucket      tokenBucket           // aggregate emit-rate ceiling (N1), driven by cc when present
 	cc          *congestionController // delay-based budget (N3); nil ⇒ static MaxBitrate ceiling
@@ -150,6 +154,10 @@ func (s *Sender) WriteFrame(now clock.Timestamp, data []byte, fd FrameDesc) {
 
 func (s *Sender) writeSystematic(now clock.Timestamp, data []byte, priority uint8, fd *FrameDesc) {
 	s.now, s.lastWrite = now, now
+	if s.inGen == 0 {
+		s.genOpenTime = now             // for the AutoGenSize fill-rate measurement (span ÷ symbols at close)
+		s.curGenWidth = s.genWidthNow() // fix the width for this whole generation (consistent N stamp + close)
+	}
 	// Per-symbol deadline: each chunk is due BufferMicros after its OWN write, not the
 	// generation's first write. A shared generation deadline expires all GenSize
 	// symbols at once, so a cursor stalled on one unrecoverable symbol drops every
@@ -170,7 +178,7 @@ func (s *Sender) writeSystematic(now clock.Timestamp, data []byte, priority uint
 		Kind:       wire.Systematic,
 		WindowBase: s.live.Base(),
 		SrcIndex:   id,
-		N:          uint16(s.cfg.GenSize),
+		N:          uint16(s.curGenWidth),
 		Priority:   priority,
 		Deadline:   int64(dl),
 		Payload:    src,
@@ -210,7 +218,7 @@ func (s *Sender) writeSystematic(now clock.Timestamp, data []byte, priority uint
 	s.emit(sym)
 	s.stats.Source++
 	s.inGen++
-	if s.inGen >= s.cfg.GenSize {
+	if s.inGen >= s.curGenWidth {
 		s.closeGen(now)
 	}
 }
@@ -231,17 +239,25 @@ func (s *Sender) closeGen(now clock.Timestamp) {
 	if n == 0 {
 		return
 	}
+	if s.cfg.AutoGenSize && s.genOpenTime != 0 {
+		// Measure the ACTUAL per-symbol fill time over this whole generation (wall-clock span ÷
+		// symbols) — robust to bursty writes (a frame's chunks arrive together), where per-write gaps
+		// would mislead the fill gate. EWMA weight 1/4 so it tracks a bitrate change within a few gens.
+		if perSym := now.Sub(s.genOpenTime) / int64(n); perSym > 0 {
+			if s.interMicros == 0 {
+				s.interMicros = perSym
+			} else {
+				s.interMicros += (perSym - s.interMicros) / 4
+			}
+		}
+	}
 	base := s.live.Base()
 	pri := s.genMaxPri
 	var key uint16
 	for r := s.repairCountFor(n); int(key) < r; key++ {
 		s.emitRepair(s.live, key, n, pri, false)
 	}
-	// Reactive repair persists to the RETENTION bound (nominal deadline + ElasticMicros), not the
-	// nominal deadline — the receiver retains an un-decoded generation that long, so the sender must
-	// keep repairing it that long too. In ModeLatency with ElasticMicros=0 this is the nominal
-	// deadline (unchanged); under the elastic deadline or cockroach mode it is the deep bound.
-	s.retained[base] = &retGen{enc: s.live, n: n, proactive: int(key), deadline: s.genDL.Add(s.cfg.ElasticMicros), nextKey: key, closeAt: now, pri: pri}
+	s.retained[base] = &retGen{enc: s.live, n: n, proactive: int(key), deadline: s.genDL, nextKey: key, closeAt: now, pri: pri}
 	s.live = code.NewEncoderAt(s.cfg.SymbolSize, base+uint32(n))
 	s.live.SetPool(s.pool)
 	s.inGen = 0
@@ -302,43 +318,90 @@ func (s *Sender) FeedFeedback(now clock.Timestamp, fb wire.Feedback) {
 			delete(s.retained, base)
 		}
 	}
-	// Reactive repair for EVERY deficient generation the feedback names, in
-	// parallel — generation i is at cursorGen + i*GenSize — so a backlog of
-	// deficient generations recovers concurrently instead of one-at-a-time behind
-	// the delivery cursor (the coded analog of an ARQ NACK covering all gaps).
-	cursorGen := genBaseOf(fb.DecodedLowEdge, s.cfg.GenSize)
-	for i, d := range fb.Deficits {
-		if d == 0 {
-			continue
+	// Reactive repair for EVERY deficient generation the feedback names, in parallel — so a
+	// backlog recovers concurrently instead of one-at-a-time behind the delivery cursor (the
+	// coded analog of an ARQ NACK covering all gaps). The deficits are positional against the
+	// ACTUAL generation boundaries from the cursor (base += width), not a fixed stride, so the
+	// two ends need not share a constant generation width — the sender walks its own retained
+	// boundaries, which the receiver mirrors from the width stamped on every symbol.
+	base, ok := s.genBaseContaining(fb.DecodedLowEdge)
+	for i := 0; ok && i < len(fb.Deficits); i++ {
+		g := s.retained[base]
+		if g == nil {
+			break // structural gap (an entirely-lost generation); matches the receiver's walk
 		}
-		if g := s.retained[cursorGen+uint32(i*s.cfg.GenSize)]; g != nil {
-			s.reactiveRepair(now, g, int(d))
+		if fb.Deficits[i] > 0 {
+			s.reactiveRepair(now, g, int(fb.Deficits[i]))
 		}
+		base += uint32(g.n)
 	}
 }
 
-// repairFactor is the per-deficit reactive sizing multiple for the active mode. ModeLatency uses the
-// tight maxRepairFactor flood guard (avoids the low-RTT overhead inversion); ModeCockroach lifts it
-// so a single batch can clear a deficit in ~one round even under extreme loss — to land `deficit`
-// symbols over an erasure rate p the sender must emit ~deficit/(1-p), which at p=0.85 is ~6.7×,
-// beyond the 3× latency guard. It bounds both the per-round batch (symbolsForDeficit) and the
-// per-generation total (reactiveCap).
-func (s *Sender) repairFactor() int {
-	if s.cfg.Mode == ModeCockroach {
-		return cockroachRepairFactor
+// genBaseContaining returns the base of the retained generation whose id range covers id, and
+// true — or false if no retained generation does (e.g. id is in the still-live generation). It
+// replaces fixed-stride genBaseOf so the generation width need not be a shared constant: the
+// sender walks its own (possibly varying) generation boundaries.
+func (s *Sender) genBaseContaining(id uint32) (uint32, bool) {
+	for base, g := range s.retained {
+		if base <= id && id < base+uint32(g.n) {
+			return base, true
+		}
 	}
-	return maxRepairFactor
+	return 0, false
 }
 
-// reactiveCap returns the maximum total reactive repair (symbols) a single generation may be served,
-// bounding the keyspace a persistently-deficient generation can demand. ModeCockroach lifts it to a
-// rateless backstop (clamped under the uint16 repair keyspace) so recovery persists for the full
-// retention window instead of being abandoned after a few rounds.
-func (s *Sender) reactiveCap(n int) int {
-	if c := s.repairFactor() * n; c < maxRepairKeys {
-		return c
+// genWidthNow returns the width to OPEN the next generation with — fixed for that whole
+// generation and stamped on every one of its symbols, which the receiver follows (so the two ends
+// never need a shared width). With AutoGenSize it is derived from the sender's own measurements;
+// otherwise it is the static Config width (a fixed GenSize, or AdaptiveGenSize's hint-derived width).
+func (s *Sender) genWidthNow() int {
+	if s.cfg.AutoGenSize {
+		return s.measuredGenWidth()
 	}
-	return maxRepairKeys
+	return s.cfg.genWidth()
+}
+
+// measuredGenWidth is the AutoGenSize width: the same budget/RTT ramp and fill-time cap as
+// Config.genWidth, but driven by the sender's MEASURED RTT (rttMicros) and write cadence
+// (interMicros) instead of the static NominalRTTMicros/NominalBitrateBps hints — so an operator
+// sets nothing and the width tracks the path and the encoder, re-sizing if either drifts (a
+// mid-stream bitrate change moves interMicros, the next generation re-sizes). It bootstraps to
+// GenSize until BOTH a write-cadence sample and a real RTT sample exist, so the stream is born
+// narrow-and-safe and only widens once it has measured the conditions that make widening safe.
+func (s *Sender) measuredGenWidth() int {
+	base := s.cfg.GenSize
+	if base < 1 {
+		base = 1
+	}
+	if base >= maxAdaptiveGenWidth || s.interMicros <= 0 || !s.rttSampled {
+		return base // bootstrap / not yet measured ⇒ stay narrow
+	}
+	round := s.rttMicros + feedbackIntervalMicros
+	headroom := s.cfg.BufferMicros - round
+	if headroom <= 0 {
+		return base // budget below a reactive round ⇒ a wide generation would lose more on a deadline miss
+	}
+	frac := float64(headroom) / float64(round)
+	if frac > 1 {
+		frac = 1
+	}
+	ceiling := maxAdaptiveGenWidth
+	// Fill-time gate from the MEASURED cadence: keep generation fill (width × interMicros) within
+	// adaptiveMaxFillMicros, so a slow-filling wide generation never adds head-of-line latency.
+	if fillCap := int(adaptiveMaxFillMicros / s.interMicros); fillCap < ceiling {
+		ceiling = fillCap
+	}
+	if ceiling <= base {
+		return base
+	}
+	w := base + int(frac*float64(ceiling-base)+0.5)
+	if w < base {
+		w = base
+	}
+	if w > ceiling {
+		w = ceiling
+	}
+	return w
 }
 
 // reactiveRepair tops up the repair for one deficient generation, persisting until the
@@ -349,12 +412,11 @@ func (s *Sender) reactiveRepair(now clock.Timestamp, g *retGen, deficit int) {
 	if now.After(g.deadline) {
 		return // too late to matter
 	}
-	// Cap total reactive repair per generation. In ModeLatency: ~maxRepairFactor·n — once a
-	// generation has been served this much and is STILL deficient, the channel is erasing faster
-	// than repair can fix within the budget, so stop flooding (its holes are skipped at the
-	// deadline). In ModeCockroach the cap is far higher (rateless within retention); the retention
-	// deadline above and the convergence gate below do the real limiting.
-	if int(g.nextKey)-g.proactive >= s.reactiveCap(g.n) {
+	// Cap total reactive repair per generation: once a generation has been served ~maxRepairFactor·n
+	// and is STILL deficient, the channel is erasing faster than repair can fix within the budget, so
+	// stop flooding it (its remaining holes are skipped at the deadline). Bounds the per-generation
+	// repair keyspace and the work a persistently-unrecoverable generation can demand.
+	if int(g.nextKey)-g.proactive >= maxRepairFactor*g.n {
 		return
 	}
 	// Expire in-flight reactive repair presumed LOST: a batch sent longer ago than one reflection
@@ -379,14 +441,7 @@ func (s *Sender) reactiveRepair(now clock.Timestamp, g *retGen, deficit int) {
 				g.inflight = 0
 			}
 		}
-		// ModeLatency defers on ANY drop (a dropping deficit is converging; reacting floods — the
-		// low-RTT overhead inversion). ModeCockroach defers ONLY the first (inflated) feedback after a
-		// generation closes, then keeps pushing even while the deficit drops slowly: under extreme
-		// loss the systematic trickles in over many rounds, so waiting for the deficit to fully stall
-		// would burn the retention window. The in-flight discount below still prevents flooding.
-		if s.cfg.Mode != ModeCockroach || prev == 0 {
-			return
-		}
+		return
 	}
 	// Per-generation loss estimate (lag-free): of the n + proactive symbols sent, being
 	// `deficit` short of rank n means ≈ (proactive + deficit) were lost; over GF(256)
@@ -398,32 +453,11 @@ func (s *Sender) reactiveRepair(now clock.Timestamp, g *retGen, deficit int) {
 			p = pGen
 		}
 	}
-	if s.cfg.Mode == ModeCockroach && p > cockroachMaxReactiveP {
-		// A total outage erases ~a full estimator window, spiking the loss estimate toward 1.0 — at
-		// which symbolsForDeficit saturates to the per-generation cap in ONE round, blowing reactiveCap
-		// and abandoning a still-recoverable generation. Cap the sizing erasure rate so a freshly
-		// detached generation gets a proportionate batch with room to retry as the (now clean) link
-		// reflects. Genuine sustained loss sits below this, so it is unaffected.
-		p = cockroachMaxReactiveP
-	}
-	// Per-generation magnitude gate (ModeCockroach). The proactive repair is emitted at generation
-	// CLOSE and lands ~one round trip later, so while it is in flight the reported deficit reflects
-	// only the lossy systematic and OVERSTATES the true shortfall by the proactive's expected arrivals.
-	// Credit those, so reactive fires only on the residual the proactive will NOT cover — a burst that
-	// concentrated losses beyond what was provisioned. This replaces the channel-wide grace: it is
-	// per generation, so a CLEAN generation within a bursty channel (deficit ≤ proactive coverage)
-	// stays suppressed (no spurious flood) while a genuine burst generation reacts promptly, on its
-	// shortfall alone. Outside the window the proactive has reflected into the deficit, so the credit
-	// is 0 and this is a no-op.
-	proactiveCredit := 0
-	if s.cfg.Mode == ModeCockroach && now.Sub(g.closeAt) < s.rttMicros+feedbackIntervalMicros {
-		proactiveCredit = int(float64(g.proactive) * (1 - p))
-	}
 	// Discount the repair already in flight by its expected arrivals (HARQ incremental
-	// redundancy): top up only the residual the in-flight batch (proactive + reactive) will not cover.
-	effective := deficit - proactiveCredit - int(float64(g.inflight)*(1-p))
+	// redundancy): top up only the residual the in-flight batch will not cover.
+	effective := deficit - int(float64(g.inflight)*(1-p))
 	if effective <= 0 {
-		return // the in-flight repair should clear the deficit; wait for it to reflect
+		return // the in-flight batch should clear the deficit; wait for it to reflect
 	}
 	if g.lastRx != 0 && now.Sub(g.lastRx) < minReactiveIntervalMicros {
 		return // pacing floor: do not emit on every feedback packet in a burst
@@ -435,7 +469,7 @@ func (s *Sender) reactiveRepair(now clock.Timestamp, g *retGen, deficit int) {
 	// Without this the reactive tier was flat across tiers, diluting unequal protection — the
 	// budget that should climb the dependency spine was spread evenly on every deficit.
 	delta := targetFailureForPriority(g.pri, s.cfg.targetFailure())
-	extra := symbolsForDeficit(effective, p, delta, s.repairFactor())
+	extra := symbolsForDeficit(effective, p, delta, maxRepairFactor)
 	for i := 0; i < extra; i++ {
 		s.emitRepair(g.enc, g.nextKey, g.n, g.pri, true)
 		g.nextKey++
@@ -462,9 +496,9 @@ func (s *Sender) repairCountFor(n int) int {
 		// per-slot erasure-count histogram embeds the cross-path correlation, so a
 		// correlated channel provisions more than an i.i.d.-union sizer; at zero
 		// correlation it reduces to the binomial.
-		r = repairForJointTailN(n, s.slotDistribution(), delta, s.repairFactor())
+		r = repairForJointTailN(n, s.slotDistribution(), delta, maxRepairFactor)
 	} else {
-		r = repairForTarget(n, s.pEst, delta, s.repairFactor())
+		r = repairForTarget(n, s.pEst, delta, maxRepairFactor)
 	}
 	// Burst-aware set-point: size for the Gilbert-Elliott tail when the channel is
 	// bursty, taking the larger so an i.i.d. channel is never under the base sizer and a
@@ -481,8 +515,37 @@ func (s *Sender) repairCountFor(n int) int {
 	// ≥ budget); shrink it toward the i.i.d. set-point as more reactive rounds fit. This is the
 	// proactive analog of "common case eager, tail lazy": it cuts the bursty-LAN overhead that
 	// blanket GE sizing spends on every generation while reactive sits idle.
-	if ge := repairForGE(n, s.burstMarginalPPM(), s.burstQ8, delta, s.repairFactor()); ge > r {
-		r += (ge - r) / (s.reactiveRounds() + 1)
+	ge := repairForGE(n, s.burstMarginalPPM(), s.burstQ8, delta, maxRepairFactor)
+	rounds := s.reactiveRounds()
+	// The two margins above the mean expected loss are offloaded to the reactive tier
+	// independently, because they are safe to offload under DIFFERENT conditions:
+	//
+	//   • BURST margin (GE term above the i.i.d. set-point): carried at a 1/(rounds+1) fraction
+	//     whenever reactive can land — the long-standing default. Reactive cleans up the rare
+	//     generations a burst actually hits; the proactive layer need not pay the worst-case
+	//     concentration on EVERY generation.
+	//   • VARIANCE margin (i.i.d. set-point above the mean): offloaded only with ProactiveDecay,
+	//     and only on a MEMORYLESS channel (burst guard: roundsEff → 0 as the mean run length grows,
+	//     because a concentrated run needs this margin proactively — reactive cannot recover it in
+	//     time). Single-path only (multipath keeps the joint-tail set-point).
+	//
+	// Keeping them separate is what the cref bench forced: folding both into one discount made the
+	// burst guard drop the burst-margin discount too, so a bursty channel paid MORE overhead than
+	// the default — strictly worse. They must be discounted on their own clocks.
+	burstMargin := ge - r // ge is max(binomial, GE); r is the i.i.d./joint set-point
+	if burstMargin < 0 {
+		burstMargin = 0
+	}
+	r += burstMargin / (rounds + 1)
+	if s.cfg.ProactiveDecay && s.sched == nil {
+		mean := meanRepairCount(n, s.pEst)
+		roundsEff := rounds * burstQ8One / s.burstQ8 // 0 on a bursty channel ⇒ no variance shed
+		varMargin := r - burstMargin/(rounds+1) - mean
+		if varMargin > 0 && roundsEff > 0 {
+			// Replace the full variance margin with its reactive-scaled fraction; the (already
+			// discounted) burst margin and the mean are carried unchanged.
+			r = mean + varMargin/(roundsEff+1) + burstMargin/(rounds+1)
+		}
 	}
 	if floor := s.effectiveFloor(n); r < floor {
 		r = floor
@@ -518,7 +581,7 @@ func (s *Sender) reactiveRounds() int {
 	// must never over-credit reactive availability, or the burst margin is discounted on a link
 	// where reactive cannot actually land in time (under-protection at high RTT).
 	cycle := 2*s.rttMicros + feedbackIntervalMicros
-	budget := s.cfg.BufferMicros + s.cfg.ElasticMicros // elastic deadline lets reactive land later
+	budget := s.cfg.BufferMicros
 	if cycle <= 0 || budget <= 0 {
 		return 0
 	}
@@ -584,15 +647,19 @@ func (s *Sender) updateRTT(now clock.Timestamp, fb wire.Feedback) {
 	if fb.HighestSeen == 0 {
 		return
 	}
-	base := genBaseOf(fb.HighestSeen-1, s.cfg.GenSize)
+	base, ok := s.genBaseContaining(fb.HighestSeen - 1)
+	if !ok {
+		return // the seen generation is still live (not yet closed) — no sample
+	}
 	g := s.retained[base]
 	if g == nil {
-		return // the seen generation is still live (not yet closed) — no sample
+		return
 	}
 	sample := now.Sub(g.closeAt)
 	if sample <= 0 {
 		return
 	}
+	s.rttSampled = true                                  // a real RTT sample exists (AutoGenSize may now widen)
 	s.rttMicros = s.rttMicros - s.rttMicros/8 + sample/8 // EWMA, weight 1/8
 	if s.cc != nil {
 		// Raw RTT sample drives the delay-based budget (N3); the receiver-reported
