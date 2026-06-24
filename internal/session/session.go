@@ -57,6 +57,7 @@ type coreSender interface {
 
 type coreReceiver interface {
 	FeedSymbol(now clock.Timestamp, datagram []byte)
+	FeedSymbolECN(now clock.Timestamp, datagram []byte, ecn flow.ECN)
 	Tick(now clock.Timestamp)
 	PollDeliver() (uint32, []byte, bool)
 	PollSend() ([]byte, bool)
@@ -133,6 +134,7 @@ func newSenderCfg(sub Substrate, cfg flow.Config, clk clock.Clock, sec *Security
 		sub: sub, clk: clk, flow: newCoreSender(cfg), done: make(chan struct{}),
 		sealState: newSealState(sec, cfg.SymbolSize, cfg.Flow),
 	}
+	_ = setECN(sub) // mark outgoing data ECT(1) (L4S) so an AQM can CE-mark rather than drop
 	if cfg.ProbeMTU {
 		// Per-path DPLPMTUD: discover the path MTU and detect black holes. Set the socket's
 		// Don't-Fragment bit (best-effort) so probes test the path unfragmented.
@@ -545,6 +547,7 @@ func newReceiver(sub Substrate, cfg flow.Config, clk clock.Clock, sec *SecurityC
 		done:      make(chan struct{}),
 		openState: os,
 	}
+	_ = setECN(sub) // enable per-datagram TOS reception so the CE codepoint reaches FeedSymbolECN
 	go r.recvLoop()
 	go r.tickLoop()
 	return r, nil
@@ -620,8 +623,9 @@ func (r *Receiver) Close() error {
 
 func (r *Receiver) recvLoop() {
 	buf := make([]byte, 2048)
+	oob := make([]byte, 128) // per-datagram TOS/traffic-class control message (the ECN codepoint)
 	for {
-		n, addr, err := r.sub.ReadFrom(buf)
+		n, addr, ecn, err := readECN(r.sub, buf, oob)
 		if err != nil {
 			return
 		}
@@ -667,7 +671,7 @@ func (r *Receiver) recvLoop() {
 				r.sub.WriteTo(ack, addr)
 			}
 		case wire.IsSymbol(t):
-			r.feedSymbol(buf[:n], addr)
+			r.feedSymbol(buf[:n], addr, ecn)
 		}
 	}
 }
@@ -719,7 +723,7 @@ func (r *Receiver) handleHandshakeInit(datagram []byte, addr net.Addr) {
 // feedSymbol feeds one inbound symbol to the core and emits/acks the result. On an
 // encrypted flow it drops symbols until the handshake has established the opener; it also
 // promotes a pending re-handshake the instant a symbol authenticates under its keys.
-func (r *Receiver) feedSymbol(datagram []byte, addr net.Addr) {
+func (r *Receiver) feedSymbol(datagram []byte, addr net.Addr, ecn flow.ECN) {
 	r.mu.Lock()
 	if r.sec != nil && !r.established {
 		r.mu.Unlock()
@@ -751,7 +755,7 @@ func (r *Receiver) feedSymbol(datagram []byte, addr net.Addr) {
 			return
 		}
 	}
-	r.flow.FeedSymbol(r.coreNow(), datagram) // sender-frame time
+	r.flow.FeedSymbolECN(r.coreNow(), datagram, ecn) // sender-frame time; ecn is the CE signal for the CC
 	out := r.openAll(drainDeliver(r.flow))
 	// Adopt the source as the feedback endpoint. A cleartext flow has no auth to gate on. An
 	// encrypted flow at BOOTSTRAP (no peer learned yet) binds on the first authentic delivery:

@@ -329,6 +329,13 @@ func NewSlidingReceiver(cfg Config) *SlidingReceiver {
 	}
 }
 
+// FeedSymbolECN absorbs one inbound symbol with its IP ECN codepoint. The sliding profile
+// has no delay/ECN-reactive congestion controller (it paces to the static MaxBitrate), so the
+// codepoint is accepted for a uniform host interface and ignored; FeedSymbol is the live path.
+func (r *SlidingReceiver) FeedSymbolECN(now clock.Timestamp, datagram []byte, _ ECN) {
+	r.FeedSymbol(now, datagram)
+}
+
 // FeedSymbol decodes and absorbs one inbound symbol datagram, delivering ready
 // symbols in order.
 func (r *SlidingReceiver) FeedSymbol(now clock.Timestamp, datagram []byte) {

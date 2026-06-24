@@ -57,6 +57,9 @@ func NewMultipathSender(remotes []string, cfg flow.Config, sec *SecurityConfig) 
 		}
 		subs = append(subs, sub)
 	}
+	for _, sub := range subs {
+		_ = setECN(sub) // mark each path's outgoing data ECT(1) (L4S)
+	}
 	s := &MultipathSender{
 		subs: subs, clk: clock.NewRealClock(), flow: newCoreSender(cfg), done: make(chan struct{}),
 		sealState: newSealState(sec, cfg.SymbolSize, cfg.Flow),
@@ -394,6 +397,9 @@ func newMultipathReceiver(subs []Substrate, cfg flow.Config, clk clock.Clock, dr
 		dropHook:  dropHook,
 		openState: os,
 	}
+	for _, sub := range subs {
+		_ = setECN(sub) // enable per-datagram TOS reception so CE marks reach FeedSymbolECN
+	}
 	for i := range subs {
 		go r.recvLoop(i)
 	}
@@ -476,8 +482,9 @@ func (r *MultipathReceiver) Close() error {
 func (r *MultipathReceiver) recvLoop(path int) {
 	sub := r.subs[path]
 	buf := make([]byte, 2048)
+	oob := make([]byte, 128) // per-datagram TOS/traffic-class control message (the ECN codepoint)
 	for {
-		n, addr, err := sub.ReadFrom(buf)
+		n, addr, ecn, err := readECN(sub, buf, oob)
 		if err != nil {
 			return
 		}
@@ -506,7 +513,7 @@ func (r *MultipathReceiver) recvLoop(path int) {
 				}
 				continue
 			}
-			r.feedSymbol(buf[:n], addr, path)
+			r.feedSymbol(buf[:n], addr, path, ecn)
 		}
 	}
 }
@@ -558,7 +565,7 @@ func (r *MultipathReceiver) handleHandshakeInit(datagram []byte, addr net.Addr, 
 // feedSymbol feeds one inbound symbol to the shared core and emits/acks the result. On an
 // encrypted flow it drops symbols until established, and promotes a pending re-handshake the
 // instant a symbol authenticates under its keys.
-func (r *MultipathReceiver) feedSymbol(datagram []byte, addr net.Addr, path int) {
+func (r *MultipathReceiver) feedSymbol(datagram []byte, addr net.Addr, path int, ecn flow.ECN) {
 	r.mu.Lock()
 	if r.sec != nil && !r.established {
 		r.mu.Unlock()
@@ -585,7 +592,7 @@ func (r *MultipathReceiver) feedSymbol(datagram []byte, addr net.Addr, path int)
 			return
 		}
 	}
-	r.flow.FeedSymbol(r.coreNow(), datagram) // PathID is in the symbol; sender-frame time
+	r.flow.FeedSymbolECN(r.coreNow(), datagram, ecn) // PathID is in the symbol; sender-frame time; ecn → CC
 	out := r.openAll(drainDeliver(r.flow))
 	// Adopt the source as THIS path's feedback endpoint (see the single-path note in session.go):
 	// a cleartext flow binds unconditionally; an encrypted flow binds at BOOTSTRAP (no peer on
