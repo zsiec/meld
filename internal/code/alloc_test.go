@@ -113,15 +113,19 @@ func TestBandDecoderAllocScaling(t *testing.T) {
 			hi = v
 		}
 	}
-	// Per-event allocation ceiling (pad + coeffs + recovered copy ≈ 3): catches a new per-symbol
-	// allocation on the warm path.
+	// Per-event allocation ceiling (pad + coeffs + recovered copy ≈ 3, plus the loss-proportional
+	// late-repair work below): catches a new unbounded per-symbol allocation on the warm path.
 	if hi > 5.0 {
 		t.Fatalf("band decode allocates %.2f/event (gate: <= 5) — a new warm-path allocation", hi)
 	}
-	// Flatness: per-event cost must not grow with loss (the elimination must not allocate more
-	// per symbol as erasures rise).
-	if lo > 0 && hi > 2.0*lo {
-		t.Fatalf("band decode per-event allocation scales with loss: %.2f vs %.2f (%.1fx)", hi, lo, hi/lo)
+	// Per-event cost rises with loss because the band now reduces and uses repairs that start
+	// below the cursor but still cover it (late-repair recovery of a stuck gap) — work that is
+	// loss-proportional BY DESIGN, not flat. At 0% loss no gap forms, so every such repair is
+	// already wholly below the cursor and cheaply rejected; as erasures rise more of them do real
+	// decode work. The absolute ceiling above is the guard against a runaway per-symbol cost; here
+	// only assert the growth stays bounded (a plateau), not that it is flat.
+	if lo > 0 && hi > 3.0*lo {
+		t.Fatalf("band decode per-event allocation grows %.1fx with loss (%.2f vs %.2f) — runaway, not bounded late-repair work", hi/lo, hi, lo)
 	}
 }
 

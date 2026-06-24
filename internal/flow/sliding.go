@@ -460,9 +460,14 @@ func (r *SlidingReceiver) drainDeliver(now clock.Timestamp) {
 		if !ok {
 			return
 		}
-		// Late-drop by the id's OWN stamped deadline (symDL) when it was directly received,
-		// falling back to the extrapolation only for a recovered id that never arrived directly.
-		if dl, ok := r.deadlineOf(rec.ID); ok && now.After(dl) {
+		// Late-drop only a DIRECTLY-RECEIVED symbol whose OWN stamped deadline (symDL) passed
+		// while it waited behind an earlier gap. A RECOVERED id has no stamp — only the noisy
+		// uniform-spacing extrapolation, whose error grows with the distance from the reference id
+		// — so late-dropping it on that estimate evicts symbols the decoder surfaced within their
+		// true deadline (the residual sliding premature-drop gap). pump already advances the cursor
+		// past a genuinely-overdue gap before it is ever recovered, bounding recovered-id lateness,
+		// so deliver what the decoder surfaces here rather than re-judging it against the fit.
+		if dl, ok := r.symDL[rec.ID]; ok && now.After(dl) {
 			r.lateDrops++
 			delete(r.directRecv, rec.ID)
 			delete(r.symDL, rec.ID)

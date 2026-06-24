@@ -29,10 +29,11 @@ type BandDecoder struct {
 	cursor  uint32 // next source id to deliver (window base)
 	highest uint32 // one past the highest source id any symbol has covered
 
-	rows  map[uint32]*brow  // pivot id -> RREF row (coeffs relative to row.start == pivot)
-	known map[uint32][]byte // solved source id -> data (above cursor, awaiting in-order delivery)
-	out   []Recovered
-	lost  uint64
+	rows   map[uint32]*brow  // pivot id -> RREF row (coeffs relative to row.start == pivot)
+	known  map[uint32][]byte // solved source id -> data (above cursor, awaiting in-order delivery)
+	recent map[uint32][]byte // last <=b DELIVERED source values, [cursor-b, cursor); lets a repair
+	out    []Recovered       // that starts below the cursor but still covers it be reduced and used
+	lost   uint64
 }
 
 // brow is one equation in band-form RREF: coeffs[i] is the coefficient of source id
@@ -66,6 +67,7 @@ func NewBandDecoder(symSize, b, maxWin int) *BandDecoder {
 		maxWin:  maxWin,
 		rows:    make(map[uint32]*brow),
 		known:   make(map[uint32][]byte),
+		recent:  make(map[uint32][]byte),
 	}
 }
 
@@ -154,17 +156,41 @@ func (d *BandDecoder) eliminateKnown(id uint32) {
 }
 
 // AddRepair feeds a repair over the window [base, base+n) with coefficients
-// GenCoeffs(repairKey, n). A repair whose window has slid below the cursor or is
-// wider than the band is ignored.
+// GenCoeffs(repairKey, n). A repair wider than the band, or one whose whole window has slid
+// below the cursor, is ignored. A repair that STARTS below the cursor but still covers it is
+// usable: the sender's window lags the receiver's delivery cursor by the feedback delay, so it
+// keeps emitting repairs whose base trails the cursor; dropping them outright loses the only
+// coding that protects a stuck gap at the cursor. The already-delivered columns below the cursor
+// are folded out using the retained recent values (a below-cursor column that was LOST, hence
+// absent from recent, leaves an unrecoverable unknown, so the repair is unusable), and the
+// residual over [cursor, base+n) is reduced into the live band as usual.
 func (d *BandDecoder) AddRepair(base uint32, n int, repairKey uint16, payload []byte) {
-	if n <= 0 || n > d.b || base < d.cursor {
+	if n <= 0 || n > d.b {
 		return
 	}
-	d.grow(base + uint32(n) - 1)
+	d.grow(base + uint32(n) - 1) // settle the cursor (a window overflow may advance it) before clipping
+	if base+uint32(n) <= d.cursor {
+		return // the whole window is below the cursor — nothing live to contribute
+	}
+	coeffs := GenCoeffs(repairKey, n)
+	pay := d.pad(payload)
+	start := base
 	if base < d.cursor {
-		return
+		for c := base; c < d.cursor; c++ {
+			cc := coeffs[c-base]
+			if cc == 0 {
+				continue
+			}
+			v, ok := d.recent[c]
+			if !ok {
+				return // spans a below-cursor column that was lost — cannot use
+			}
+			gf.MulAdd(pay, v, cc) // fold the known delivered value out of the equation
+		}
+		coeffs = coeffs[d.cursor-base:]
+		start = d.cursor
 	}
-	d.reduce(&beq{start: base, coeffs: GenCoeffs(repairKey, n), pay: d.pad(payload)})
+	d.reduce(&beq{start: start, coeffs: coeffs, pay: pay})
 	d.deliverReady()
 }
 
@@ -178,8 +204,9 @@ func (d *BandDecoder) Skip() bool {
 	if _, ok := d.known[d.cursor]; ok {
 		return false
 	}
-	d.dropColumn(d.cursor) // drop rows polluted by the lost (unknown) column
+	d.dropColumn(d.cursor) // surgically remove the lost unknown, preserving neighbor recoverability
 	d.lost++
+	d.retire(d.cursor, nil, false)
 	d.cursor++
 	d.deliverReady()
 	return true
@@ -205,10 +232,12 @@ func (d *BandDecoder) grow(id uint32) {
 		if data, ok := d.known[d.cursor]; ok {
 			d.out = append(d.out, Recovered{ID: d.cursor, Data: data})
 			delete(d.known, d.cursor)
+			d.retire(d.cursor, data, true)
 			d.cursor++
 		} else {
 			d.dropColumn(d.cursor)
 			d.lost++
+			d.retire(d.cursor, nil, false)
 			d.cursor++
 		}
 	}
@@ -314,8 +343,20 @@ func (d *BandDecoder) harvest(work []uint32) {
 	}
 }
 
-// dropColumn removes the (unknown, lost) column id from the system: any row whose
-// span includes id with a nonzero there is polluted by the lost unknown and dropped.
+// dropColumn removes the lost (unrecoverable) source unknown at column id from the band
+// while preserving the recoverability of its neighbors. The naive form — deleting every row
+// that references id — discards equations that ALSO constrain still-recoverable columns, so
+// one genuine loss cascades into dropping neighbors the surviving rank still supports (the
+// sliding-path premature-drop gap). Instead, eliminate id as a free unknown by one step of
+// Gaussian elimination: among the <=b rows spanning id, the one with the LARGEST start (its
+// pivot is at or after every other's, satisfying rowSubRow's start ordering) absorbs id —
+// subtract it from each other spanning row to zero that row's id coefficient, then discard
+// only the absorber. Exactly one degree of freedom is spent (id itself); every other row
+// survives, id-free, still pivoting its own column. The absorber's only nonzeros besides its
+// own pivot are at FREE columns (any pivot column above it was already back-substituted out
+// of it), so the subtraction never pollutes another pivot column — the RREF invariant holds
+// without re-reduction. For a pivot column id this reduces to deleting its single pivot row,
+// since RREF leaves id referenced only there.
 func (d *BandDecoder) dropColumn(id uint32) {
 	lo := uint32(0)
 	if id > uint32(d.b) {
@@ -344,7 +385,22 @@ func (d *BandDecoder) deliverReady() {
 		}
 		d.out = append(d.out, Recovered{ID: d.cursor, Data: data})
 		delete(d.known, d.cursor)
+		d.retire(d.cursor, data, true)
 		d.cursor++
+	}
+}
+
+// retire records that source id (== the pre-increment cursor) is leaving the live window. A
+// DELIVERED value is kept in recent so a later repair that starts below the cursor can fold it
+// out and still contribute its residual; a LOST id is left absent, and that absence marks it
+// unrecoverable to such a repair. The entry that falls a full band behind is pruned, bounding
+// recent to the last <=b delivered values — exactly the reach of any band-width repair.
+func (d *BandDecoder) retire(id uint32, data []byte, delivered bool) {
+	if delivered {
+		d.recent[id] = data
+	}
+	if id >= uint32(d.b) {
+		delete(d.recent, id-uint32(d.b))
 	}
 }
 
