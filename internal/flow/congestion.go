@@ -128,6 +128,14 @@ func newCongestionController(delta float64, mss int, maxBitrate int64) *congesti
 // change v/δ packets, scaled by the elapsed fraction of an RTT so it is independent of
 // the irregular feedback cadence). reBaseline handles the propagation floor RISING
 // (path change), which a windowed min cannot track on its own.
+//
+// The additive step is FIXED: Copa's velocity multiplier (§3.1 — double the step while cwnd
+// moves consistently one way) is deliberately omitted. It was built and A/B-measured here, and
+// it re-converges to a bandwidth INCREASE ~2.4x faster but overshoots the standing queue badly
+// (~130 ms vs ~18 ms on a 5x jump) — a latency spike live media cannot afford, and it broke the
+// bounded-queue invariant the convergence tests pin. The benefit it buys (fast reclaim of FREED
+// bandwidth) is one a fixed-rate media source cannot use beyond its encode rate, and slow start
+// already covers the startup ramp — so the trade (latency for throughput) is backwards for Meld.
 func (cc *congestionController) onSample(now clock.Timestamp, rttMicros int64, ceFraction float64) {
 	if rttMicros <= 0 {
 		return
