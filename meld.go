@@ -138,6 +138,14 @@ type Config struct {
 	// by default: it drops doomed-but-recoverable bytes to deliver whole DECODABLE frames
 	// faster, so only flows that consume whole pictures want it.
 	EvictBrokenFrames bool
+	// FrameAtomic delivers each WriteFrame access unit ALL-OR-NOTHING: the app gets a whole
+	// frame once it is fully recoverable in time, or a clean gap (no fragment) if any chunk is
+	// lost, its reference sub-tree is dead, or its deadline passes — so the decoder conceals a
+	// missing frame (freeze) instead of rendering a corrupt one. The perceptual form of
+	// EvictBrokenFrames; supersedes it when set. Requires WriteFrame; a no-op for byte streams.
+	// ON by default (DefaultConfig) for media — a partial picture is perceptually worse than a
+	// dropped one. Set false to deliver source bytes as they recover (partial frames possible).
+	FrameAtomic bool
 	// RepairWithinBudget caps proactive repair to the rate budget (media + repair ≤ budget),
 	// so a tight latency budget sheds protection gracefully instead of the host pacer queueing
 	// the overage as delay on media past the deadline. ON by default (DefaultConfig); sender-side
@@ -221,6 +229,7 @@ func DefaultConfig() Config {
 		ProactiveDecay:     c.ProactiveDecay,     // on by default (flow.DefaultConfig)
 		AutoGenSize:        c.AutoGenSize,        // on by default (flow.DefaultConfig): zero-config adaptive width
 		RepairWithinBudget: c.RepairWithinBudget, // on by default (flow.DefaultConfig): repair within the rate budget
+		FrameAtomic:        c.FrameAtomic,        // on by default (flow.DefaultConfig): all-or-nothing picture delivery
 	}
 }
 
@@ -243,6 +252,7 @@ func (c Config) toFlow() flow.Config {
 		Pace:               c.Pace,
 		MaxBitrate:         c.MaxBitrate,
 		EvictBrokenFrames:  c.EvictBrokenFrames,
+		FrameAtomic:        c.FrameAtomic,
 		RepairWithinBudget: c.RepairWithinBudget,
 	}
 }

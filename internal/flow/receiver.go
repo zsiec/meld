@@ -377,6 +377,16 @@ func (r *Receiver) absorb(rec []code.Recovered, repaired bool) {
 func (r *Receiver) pump(now clock.Timestamp) {
 	for r.cursor < r.highestSeen {
 		id := r.cursor
+		// Frame-atomic delivery: when the cursor sits at a known access unit's first id, deliver
+		// or drop the WHOLE frame as a unit so the app never sees a partial (corrupt) picture.
+		if r.cfg.FrameAtomic {
+			if start, length, ok := r.frameStartAt(id); ok {
+				if !r.pumpFrame(now, start, length) {
+					return // the frame is still recoverable and in time — wait for it
+				}
+				continue
+			}
+		}
 		// Media-aware early eviction: an id whose frame can never decode (its own loss, or
 		// a dead reference sub-tree) is dropped now rather than waiting out its deadline, so
 		// the next decodable frame delivers sooner and the cursor — the sender's
@@ -434,6 +444,74 @@ func (r *Receiver) evictAt(id uint32, ready bool) {
 	delete(r.symDL, id)
 	r.cursor++
 	r.stats.Evicted++
+}
+
+// frameStartAt reports whether id is the FIRST id of a known access unit (one with a
+// directly-received descriptor), returning its chunk count — the gate for frame-atomic delivery.
+func (r *Receiver) frameStartAt(id uint32) (uint32, uint16, bool) {
+	if r.frames == nil {
+		return 0, 0, false
+	}
+	if fi := r.frames[id]; fi != nil && fi.length > 0 {
+		return id, fi.length, true
+	}
+	return 0, 0, false
+}
+
+// pumpFrame resolves a whole access unit [start, start+length) atomically: it delivers every
+// chunk together once they are ALL recoverable in time, or drops every chunk together (a clean
+// gap, never a fragment) once the frame is doomed or its deadline passes incomplete. Returns
+// false to wait — the frame is still recoverable and in time — and true once it is resolved.
+func (r *Receiver) pumpFrame(now clock.Timestamp, start uint32, length uint16) bool {
+	end := start + uint32(length)
+	if r.frameDoomed(start) { // own id lost, or a dead reference sub-tree
+		r.dropFrame(start, end)
+		return true
+	}
+	d, dKnown := r.deadlineOf(start) // the frame's display deadline (its first chunk's stamp)
+	overdue := (dKnown && now.After(d)) || (r.haveRef && r.refID >= start && now.After(r.refDL))
+	complete := true
+	for id := start; id < end; id++ {
+		if _, ok := r.ready[id]; !ok {
+			complete = false
+			break
+		}
+	}
+	switch {
+	case complete && !overdue:
+		for id := start; id < end; id++ {
+			r.attributeFrame(id, false)
+			r.deliverQ = append(r.deliverQ, deliveredSym{id, r.ready[id]})
+			delete(r.ready, id)
+			delete(r.symDL, id)
+		}
+		r.cursor = end
+		r.stats.Delivered += uint64(length)
+		return true
+	case overdue:
+		r.dropFrame(start, end) // incomplete (or recovered too late) at the deadline — drop clean
+		return true
+	default:
+		return false // still incomplete but in time — wait
+	}
+}
+
+// dropFrame discards a whole access unit as a clean gap: its already-recovered chunks are evicted
+// (a deliberate media-aware drop, not delivered as a fragment) and its missing chunks are losses.
+// None is delivered, so the frame is undecodable and its dependents cascade (attributeFrame).
+func (r *Receiver) dropFrame(start, end uint32) {
+	for id := start; id < end; id++ {
+		ready := r.hasReady(id)
+		r.attributeFrame(id, true)
+		delete(r.ready, id)
+		delete(r.symDL, id)
+		if ready {
+			r.stats.Evicted++ // a recoverable chunk dropped to keep the picture atomic
+		} else {
+			r.stats.Lost++ // a genuinely missing chunk
+		}
+	}
+	r.cursor = end
 }
 
 // noteFrame records an access unit's descriptor from a directly-received systematic,

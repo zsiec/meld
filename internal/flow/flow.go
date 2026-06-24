@@ -199,6 +199,16 @@ type Config struct {
 	// is dropped) for picture-completeness (every DECODABLE frame is still delivered
 	// whole, in order, never late), so only media flows that consume whole frames want it.
 	EvictBrokenFrames bool
+	// FrameAtomic makes delivery picture-atomic: an access unit's source ids are released to
+	// the application ALL TOGETHER once the whole frame is recoverable in time, or dropped ALL
+	// TOGETHER (including its already-recovered chunks) if any chunk is unrecoverable, its
+	// reference sub-tree is dead, or its deadline passes incomplete. So the decoder is NEVER
+	// handed a PARTIAL access unit — it gets a clean whole frame or a clean gap to conceal
+	// (freeze / motion-compensated extrapolation), which the human visual system tolerates far
+	// better than the spatial artifacts (and predictor poisoning) of a half-decoded frame. The
+	// perceptual form of EvictBrokenFrames, superseding it when set. Requires frame descriptors
+	// (Sender.WriteFrame); a no-op for plain byte streams. ON by default for media flows.
+	FrameAtomic bool
 	// RepairWithinBudget caps proactive repair so the total emitted rate (media + repair)
 	// stays within the sender's rate budget (RFC 9265 "repair within the budget, never on
 	// top"): the sizer sheds protection gracefully when the budget is tight rather than
@@ -280,6 +290,9 @@ func DefaultConfig() Config {
 		// gracefully instead of the host pacer delaying media (fixes the budget<2xRTT delivery
 		// collapse — bench: 4% → ~99%); inert where the budget is ample (byte-identical), never hurts.
 		RepairWithinBudget: true,
+		// on by default: deliver each access unit all-or-nothing so the decoder never renders a
+		// partial picture (a no-op for byte streams, which carry no frame descriptors).
+		FrameAtomic: true,
 	}
 }
 
