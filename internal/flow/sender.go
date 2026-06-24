@@ -31,6 +31,7 @@ type retGen struct {
 	inflightAt  clock.Timestamp // when the in-flight reactive repair was last sent
 	lastDeficit int             // the deficit the previous feedback reported (to credit demonstrably-landed repair)
 	pri         uint8           // the generation's protection tier (max over its units; for repair stamping)
+	minTID      uint8           // shallowest TemporalID in the generation (temporal-depth UEP; 255 = none)
 }
 
 // Sender is the coded transmit half of a flow. It emits systematic symbols as
@@ -59,6 +60,7 @@ type Sender struct {
 	bucket      tokenBucket           // aggregate emit-rate ceiling (N1), driven by cc when present
 	shedBucket  tokenBucket           // write-side budget for ShedTopLayerOverBudget (tracks the written media rate)
 	maxTID      uint8                 // highest TemporalID seen — the top layer the proactive shed drops
+	genMinTID   uint8                 // shallowest TemporalID in the live generation (temporal-depth UEP; sentinel 255 = none)
 	cc          *congestionController // delay-based budget (N3); nil ⇒ static MaxBitrate ceiling
 	sched       *pathScheduler        // N-path placement (N5); nil ⇒ single path
 	pathLossPpm []int                 // per-path marginal erasure rates (ppm), from feedback (N5)
@@ -104,6 +106,7 @@ func NewSender(cfg Config) *Sender {
 		burstQ8:    burstQ8One,
 		bucket:     newTokenBucket(cfg.maxBitrate()),
 		shedBucket: newTokenBucket(cfg.maxBitrate()),
+		genMinTID:  noTemporalID, // sentinel: no frame descriptor seen yet (min-tracking start)
 	}
 	s.live.SetPool(pool)
 	if cfg.CongestionControl {
@@ -201,6 +204,9 @@ func (s *Sender) writeSystematic(now clock.Timestamp, data []byte, priority uint
 	if priority > s.genMaxPri {
 		s.genMaxPri = priority // the generation is protected as hard as its most-critical unit
 	}
+	if fd != nil && fd.TemporalID < s.genMinTID {
+		s.genMinTID = fd.TemporalID // shallowest layer drives the temporal-depth UEP floor (effectiveProtectionTier)
+	}
 	id := s.live.Add(data)
 	src, _ := s.live.Source(id)
 	sym := wire.Symbol{
@@ -287,11 +293,12 @@ func (s *Sender) closeGen(now clock.Timestamp) {
 	for r := s.repairCountFor(n); int(key) < r; key++ {
 		s.emitRepair(s.live, key, n, pri, false)
 	}
-	s.retained[base] = &retGen{enc: s.live, n: n, proactive: int(key), deadline: s.genDL, nextKey: key, closeAt: now, pri: pri}
+	s.retained[base] = &retGen{enc: s.live, n: n, proactive: int(key), deadline: s.genDL, nextKey: key, closeAt: now, pri: pri, minTID: s.genMinTID}
 	s.live = code.NewEncoderAt(s.cfg.SymbolSize, base+uint32(n))
 	s.live.SetPool(s.pool)
 	s.inGen = 0
-	s.genMaxPri = 0 // reset for the next generation
+	s.genMaxPri = 0            // reset for the next generation
+	s.genMinTID = noTemporalID // reset the temporal-depth floor (sentinel: no frame seen)
 }
 
 // FeedFeedback absorbs a receiver feedback report: it retires generations the
@@ -498,7 +505,7 @@ func (s *Sender) reactiveRepair(now clock.Timestamp, g *retGen, deficit int) {
 	// decode-failure target (more repair per unit of deficit), a disposable leaf a looser one.
 	// Without this the reactive tier was flat across tiers, diluting unequal protection — the
 	// budget that should climb the dependency spine was spread evenly on every deficit.
-	delta := targetFailureForPriority(g.pri, s.cfg.targetFailure())
+	delta := targetFailureForTier(effectiveProtectionTier(g.pri, g.minTID), s.cfg.targetFailure())
 	extra := symbolsForDeficit(effective, p, delta, maxRepairFactor)
 	for i := 0; i < extra; i++ {
 		s.emitRepair(g.enc, g.nextKey, g.n, g.pri, true)
@@ -518,7 +525,7 @@ func (s *Sender) repairCountFor(n int) int {
 	// baseline tightened/loosened by its protection tier — parameter sets and RAPs get an
 	// exponentially smaller δ (more repair), disposable leaves a larger one (less), so a
 	// fixed budget is steered up the dependency spine.
-	delta := targetFailureForPriority(s.genMaxPri, s.cfg.targetFailure())
+	delta := targetFailureForTier(effectiveProtectionTier(s.genMaxPri, s.genMinTID), s.cfg.targetFailure())
 	var r int
 	if s.sched != nil {
 		// Multipath: size the TOTAL repair against the JOINT erasure tail across all paths

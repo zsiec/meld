@@ -333,18 +333,24 @@ func (c Config) targetFailure() float64 {
 // on the generic priority byte.
 const uepCenterTier = 2
 
-// targetFailureForPriority returns the per-generation decode-failure target for a
-// protection tier: the configured baseline scaled by 10^(uepCenterTier − tier), so each
-// tier above the reference provisions ~10× lower failure (more repair) and each below
-// ~10× higher (less). This is the whole unequal-protection policy — a pure function of
-// the generic priority byte the shaper assigns; the core never sees the codec. Clamped
-// to a sane probability range so an extreme tier cannot underflow or exceed certainty.
-func targetFailureForPriority(pri uint8, base float64) float64 {
+// noTemporalID is the sentinel for "no temporal layer seen in this generation" — a byte stream or a
+// generation written before any frame descriptor. It must sit ABOVE any real TemporalID so min-
+// tracking (genMinTID) starts unbounded, and effectiveProtectionTier excludes it explicitly so the
+// sentinel is never mistaken for a very deep top layer (which would catastrophically loosen repair).
+const noTemporalID = uint8(255)
+
+// targetFailureForTier returns the per-generation decode-failure target for a SIGNED protection
+// tier: the configured baseline scaled by 10^(uepCenterTier − tier), so each tier above the
+// reference provisions ~10× lower failure (more repair) and each below ~10× higher (less). The
+// tier is signed so temporal depth can push a pure top-layer generation BELOW the discrete
+// disposable floor (tier < 0) — the descendant-fan-out gradient of effectiveProtectionTier.
+// Clamped to a sane probability range so an extreme tier cannot underflow or exceed certainty.
+func targetFailureForTier(tier int, base float64) float64 {
 	d := base
-	for exp := uepCenterTier - int(pri); exp > 0; exp-- {
+	for exp := uepCenterTier - tier; exp > 0; exp-- {
 		d *= 10
 	}
-	for exp := uepCenterTier - int(pri); exp < 0; exp++ {
+	for exp := uepCenterTier - tier; exp < 0; exp++ {
 		d *= 0.1
 	}
 	if d < 1e-9 {
@@ -354,6 +360,33 @@ func targetFailureForPriority(pri uint8, base float64) float64 {
 		d = 0.5
 	}
 	return d
+}
+
+// targetFailureForPriority returns the per-generation decode-failure target for a discrete
+// protection tier — the generic priority byte the shaper assigns. It is the unsigned entry point
+// to targetFailureForTier and is the whole unequal-protection policy at tier granularity; the core
+// never sees the codec.
+func targetFailureForPriority(pri uint8, base float64) float64 {
+	return targetFailureForTier(int(pri), base)
+}
+
+// effectiveProtectionTier folds temporal depth into a generation's protection tier. By the GOP
+// reference structure, a frame deeper in the temporal hierarchy is decoded FROM by fewer downstream
+// frames — its descendant fan-out shrinks with depth — so the deeper a PURE top-layer generation
+// sits, the less a decode failure propagates and the less repair it warrants. Each temporal level
+// past the reference layer (uepCenterTier) loosens the target one decade beyond the flat disposable
+// tier, extending the discrete UEP into a per-depth gradient: the forward-looking proxy for
+// descendant count (lower TID ⇒ more descendants ⇒ more protection). It bites ONLY generations
+// whose SHALLOWEST frame is itself above the reference layer (minTID > uepCenterTier) AND whose tier
+// is below it (pri < uepCenterTier): any generation carrying a reference/base frame keeps its tier,
+// and a generation with no temporal signal (minTID == noTemporalID — a byte stream or a pre-frame
+// sizer probe) keeps its discrete tier, never mistaking the sentinel for a very deep top layer.
+func effectiveProtectionTier(pri, minTID uint8) int {
+	tier := int(pri)
+	if pri < uepCenterTier && minTID != noTemporalID && int(minTID) > uepCenterTier {
+		tier -= int(minTID) - uepCenterTier
+	}
+	return tier
 }
 
 // feedbackIntervalMicros is how often the receiver emits a cumulative feedback
