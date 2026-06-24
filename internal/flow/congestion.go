@@ -3,14 +3,28 @@ package flow
 import "github.com/zsiec/meld/internal/clock"
 
 // This file is N3's delay-based congestion controller — a Copa-style rate controller
-// (Arun & Balakrishnan, NSDI'18) adapted to Meld's per-feedback RTT samples. It is
-// LOSS-AGNOSTIC by design: FEC masks loss, so loss is not a usable congestion signal
-// (RFC 9265); the standing-queue delay is the signal coding cannot hide. The
-// controller owns the total send-rate budget; the redundancy sizer then allocates
-// repair WITHIN that budget (CC sets the budget, FEC fits inside — never repair on
-// top). Pure arithmetic, time as explicit timestamps. The arithmetic is float (a rate
-// controller, not an oracle-scored value); its outputs need only converge, not be
-// bit-identical, unlike the fixed-point burst sizer.
+// (Arun & Balakrishnan, NSDI'18) adapted to Meld's per-feedback RTT samples, with the
+// L4S/DCTCP ECN response layered on. The controller owns the total send-rate budget; the
+// redundancy sizer then allocates repair WITHIN that budget (CC sets the budget, FEC fits
+// inside — never repair on top). Pure arithmetic, time as explicit timestamps. The
+// arithmetic is float (a rate controller, not an oracle-scored value); its outputs need
+// only converge, not be bit-identical, unlike the fixed-point burst sizer.
+//
+// It reacts to congestion via DELAY + ECN, never LOSS — deliberately, and satisfying RFC
+// 9265 (FEC and congestion control): the standing-queue delay and CE marks are exactly the
+// signals coding cannot mask, and §5.3 endorses a delay/ECN controller as sufficient. Loss
+// is NOT a CC input even though the receiver reports the pre-recovery wire loss
+// (Feedback.CongestionLoss, which the redundancy SIZER consumes) — because loss is AMBIGUOUS:
+// a policer's congestion and a wireless link's corruption are indistinguishable here (both
+// show a silent queue + silent ECN + drops). This was measured, not just asserted: a loss
+// backstop — gated to fire only when delay AND ECN are both silent, and only on rate↔loss-
+// CORRELATED loss (a policer, where loss falls as the rate falls; not corruption, where it
+// stays flat) — was built and validated on impair + the txbench cref glass-to-glass bench. It
+// still regressed bursty wireless (a common case: the rate cut the probe needs to detect the
+// correlation itself costs delivery), for only the narrow hard-policer benefit that the
+// operator-set MaxBitrate ceiling and application ABR already bound — so it was removed. The
+// pre-recovery wire-loss counter stays (it sizes FEC and answers the "no CC" objection); it
+// just never throttles the rate. See PLAN.md §3.8.
 
 // Congestion-control tuning. δ is the throughput/latency knob: rate ≈ 1/(δ·d_q), so a
 // smaller δ tolerates a larger standing queue for more throughput (live video favors
