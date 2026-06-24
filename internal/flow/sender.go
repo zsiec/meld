@@ -239,7 +239,7 @@ func (s *Sender) closeGen(now clock.Timestamp) {
 	if n == 0 {
 		return
 	}
-	if s.cfg.AutoGenSize && s.genOpenTime != 0 {
+	if (s.cfg.AutoGenSize || s.cfg.RepairWithinBudget) && s.genOpenTime != 0 {
 		// Measure the ACTUAL per-symbol fill time over this whole generation (wall-clock span ÷
 		// symbols) — robust to bursty writes (a frame's chunks arrive together), where per-write gaps
 		// would mislead the fill gate. EWMA weight 1/4 so it tracks a bitrate change within a few gens.
@@ -550,7 +550,44 @@ func (s *Sender) repairCountFor(n int) int {
 	if floor := s.effectiveFloor(n); r < floor {
 		r = floor
 	}
+	// Fix A (RepairWithinBudget, RFC 9265): never provision repair the rate budget cannot
+	// afford on top of the media — total offered (media + repair) must stay within the
+	// budget, or the host pacer queues the overage as delay on MEDIA and the tight deadline
+	// evicts it (the budget-below-RTT collapse). Cap to the budget's repair headroom; this
+	// sheds protection gracefully (graceful under-protection) rather than overflowing.
+	if s.cfg.RepairWithinBudget {
+		if lim := s.maxRepairWithinBudget(n); r > lim {
+			r = lim
+		}
+	}
 	return r
+}
+
+// maxRepairWithinBudget returns the largest proactive repair count for a generation of n
+// source symbols that keeps the total emitted rate (media + repair) within the rate budget:
+// repairBps = rateBps − mediaBps, repair-per-source = repairBps/mediaBps, scaled by n. mediaBps
+// comes from the measured per-symbol cadence (interMicros). With no cadence/budget signal yet
+// it imposes no extra cap (maxRepairFactor still bounds r); when the budget barely covers the
+// media it sheds ALL proactive repair (media is never dropped — it takes the non-droppable
+// path) — the graceful-degradation floor.
+func (s *Sender) maxRepairWithinBudget(n int) int {
+	rateBps := s.bucket.bytesPerSec * 8
+	if rateBps <= 0 || s.interMicros <= 0 {
+		return n * maxRepairFactor
+	}
+	mediaBps := int64(s.cfg.SymbolSize) * 8 * 1_000_000 / s.interMicros
+	if mediaBps <= 0 {
+		return n * maxRepairFactor
+	}
+	repairBps := rateBps - mediaBps
+	if repairBps <= 0 {
+		return 0
+	}
+	lim := int(int64(n) * repairBps / mediaBps)
+	if lim < 0 {
+		return 0
+	}
+	return lim
 }
 
 // effectiveFloor returns the proactive repair floor, decayed to zero ONLY when the link is both

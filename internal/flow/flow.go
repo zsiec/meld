@@ -199,6 +199,14 @@ type Config struct {
 	// is dropped) for picture-completeness (every DECODABLE frame is still delivered
 	// whole, in order, never late), so only media flows that consume whole frames want it.
 	EvictBrokenFrames bool
+	// RepairWithinBudget caps proactive repair so the total emitted rate (media + repair)
+	// stays within the sender's rate budget (RFC 9265 "repair within the budget, never on
+	// top"): the sizer sheds protection gracefully when the budget is tight rather than
+	// over-provisioning, which the host pacer would otherwise absorb as delay on MEDIA past
+	// the deadline (the budget-below-RTT delivery collapse). ON by default (DefaultConfig) —
+	// inert where the budget is ample and a graceful-degradation win where it binds, never hurts.
+	// Sender-side policy (the two ends need not match). Set false for the unbounded-repair behavior.
+	RepairWithinBudget bool
 }
 
 // maxPaths bounds the multipath arity (matching wire.feedbackMaxPaths): the per-path
@@ -268,6 +276,10 @@ func DefaultConfig() Config {
 		Pace:           true,    // host pacer on: smooth to the budget, backpressure the source
 		ProactiveDecay: true,    // on by default: burst-guarded variance-margin offload (cuts overhead, self-reverts on bursts)
 		AutoGenSize:    true,    // on by default: zero-config self-measuring generation width (Pareto win over fixed GenSize across a real-timing sweep; no-op where it can't help, fixes the fixed-width burst/high-RTT delivery holes)
+		// on by default: cap proactive repair to the rate budget so a tight budget sheds protection
+		// gracefully instead of the host pacer delaying media (fixes the budget<2xRTT delivery
+		// collapse — bench: 4% → ~99%); inert where the budget is ample (byte-identical), never hurts.
+		RepairWithinBudget: true,
 	}
 }
 

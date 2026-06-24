@@ -138,6 +138,11 @@ type Config struct {
 	// by default: it drops doomed-but-recoverable bytes to deliver whole DECODABLE frames
 	// faster, so only flows that consume whole pictures want it.
 	EvictBrokenFrames bool
+	// RepairWithinBudget caps proactive repair to the rate budget (media + repair ≤ budget),
+	// so a tight latency budget sheds protection gracefully instead of the host pacer queueing
+	// the overage as delay on media past the deadline. ON by default (DefaultConfig); sender-side
+	// (no both-ends agreement needed). Set false for the unbounded-repair behavior.
+	RepairWithinBudget bool
 	// Passphrase enables encryption (docs/encryption.md): when non-empty, the Sender and
 	// Receiver run an X25519 + ML-KEM-768 hybrid post-quantum handshake before any media
 	// and AEAD-seal every chunk (encrypt-then-code, forward-secret, authenticated). Both
@@ -207,36 +212,38 @@ func (c Config) MaxChunk() int {
 func DefaultConfig() Config {
 	c := flow.DefaultConfig()
 	return Config{
-		SymbolSize:     c.SymbolSize,
-		GenSize:        c.GenSize,
-		Redundancy:     c.Redundancy,
-		TargetFailure:  c.TargetFailure,
-		BufferMicros:   c.BufferMicros,
-		Pace:           c.Pace,           // on by default (flow.DefaultConfig)
-		ProactiveDecay: c.ProactiveDecay, // on by default (flow.DefaultConfig)
-		AutoGenSize:    c.AutoGenSize,    // on by default (flow.DefaultConfig): zero-config adaptive width
+		SymbolSize:         c.SymbolSize,
+		GenSize:            c.GenSize,
+		Redundancy:         c.Redundancy,
+		TargetFailure:      c.TargetFailure,
+		BufferMicros:       c.BufferMicros,
+		Pace:               c.Pace,               // on by default (flow.DefaultConfig)
+		ProactiveDecay:     c.ProactiveDecay,     // on by default (flow.DefaultConfig)
+		AutoGenSize:        c.AutoGenSize,        // on by default (flow.DefaultConfig): zero-config adaptive width
+		RepairWithinBudget: c.RepairWithinBudget, // on by default (flow.DefaultConfig): repair within the rate budget
 	}
 }
 
 func (c Config) toFlow() flow.Config {
 	return flow.Config{
-		Flow:              c.Flow,
-		SymbolSize:        c.SymbolSize,
-		GenSize:           c.GenSize,
-		AdaptiveGenSize:   c.AdaptiveGenSize,
-		AutoGenSize:       c.AutoGenSize,
-		NominalRTTMicros:  c.NominalRTTMicros,
-		NominalBitrateBps: c.NominalBitrateBps,
-		ProactiveDecay:    c.ProactiveDecay,
-		Redundancy:        c.Redundancy,
-		TargetFailure:     c.TargetFailure,
-		BufferMicros:      c.BufferMicros,
-		Sliding:           c.Sliding,
-		CodingWindow:      c.CodingWindow,
-		CongestionControl: c.CongestionControl,
-		Pace:              c.Pace,
-		MaxBitrate:        c.MaxBitrate,
-		EvictBrokenFrames: c.EvictBrokenFrames,
+		Flow:               c.Flow,
+		SymbolSize:         c.SymbolSize,
+		GenSize:            c.GenSize,
+		AdaptiveGenSize:    c.AdaptiveGenSize,
+		AutoGenSize:        c.AutoGenSize,
+		NominalRTTMicros:   c.NominalRTTMicros,
+		NominalBitrateBps:  c.NominalBitrateBps,
+		ProactiveDecay:     c.ProactiveDecay,
+		Redundancy:         c.Redundancy,
+		TargetFailure:      c.TargetFailure,
+		BufferMicros:       c.BufferMicros,
+		Sliding:            c.Sliding,
+		CodingWindow:       c.CodingWindow,
+		CongestionControl:  c.CongestionControl,
+		Pace:               c.Pace,
+		MaxBitrate:         c.MaxBitrate,
+		EvictBrokenFrames:  c.EvictBrokenFrames,
+		RepairWithinBudget: c.RepairWithinBudget,
 	}
 }
 
