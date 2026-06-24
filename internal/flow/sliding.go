@@ -336,6 +336,13 @@ func (r *SlidingReceiver) FeedSymbol(now clock.Timestamp, datagram []byte) {
 	if err != nil || sym.Flow != r.cfg.Flow {
 		return
 	}
+	if len(sym.Payload) != r.cfg.SymbolSize {
+		// A coded symbol is exactly SymbolSize on the wire; a different length means the peer's
+		// SymbolSize disagrees with ours (it is configured per-end, not negotiated). Reject it
+		// rather than truncate/zero-pad it into the band and corrupt recovery (the genBaseOf class).
+		r.stats.Rejected++
+		return
+	}
 	dl := clampDeadline(now, clock.Timestamp(sym.Deadline), r.cfg.BufferMicros)
 	switch sym.Kind {
 	case wire.Systematic:

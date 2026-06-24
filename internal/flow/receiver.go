@@ -317,6 +317,13 @@ func (r *Receiver) MeanBurstQ8() uint32 { return r.meanBurstQ8 }
 // nothing and is always admitted. Honest symbols (N ≤ GenSize, window near the
 // cursor) always pass; the caps bite only on forged input.
 func (r *Receiver) admit(sym wire.Symbol, n int, base uint32) bool {
+	if len(sym.Payload) != r.cfg.SymbolSize {
+		// Every coded symbol (systematic or repair) is exactly SymbolSize on the wire; a different
+		// length means the peer's SymbolSize disagrees with ours — and SymbolSize is configured
+		// independently on each end, not negotiated. Reject it rather than zero-pad/truncate it
+		// into the GF math, which would silently corrupt the recovered bytes (the genBaseOf class).
+		return false
+	}
 	if n < 1 || n > r.cfg.maxGenSymbols() {
 		return false
 	}
