@@ -289,7 +289,14 @@ type SlidingReceiver struct {
 	sendQ      [][]byte
 	stats      ReceiverStats
 
-	// Deadline extrapolation (symbols carry source_time + buffer).
+	// Per-symbol deadline. Each directly-received id carries its own stamped deadline (write
+	// time + budget); the receiver delivers/evicts by THAT, so an access unit written as one
+	// burst — a whole video frame at one instant, sharing one deadline — is not gated by the
+	// uniform-spacing fit it violates (the clean-link premature-drop cliff). Pruned as the
+	// cursor advances past each id.
+	symDL map[uint32]clock.Timestamp
+	// Deadline extrapolation, used ONLY for never-directly-received (recovered/missing) ids:
+	// fit deadline(id) = refDL + (id-refID)*intervalUs from stamped (id, deadline) pairs.
 	haveRef    bool
 	refID      uint32
 	refDL      clock.Timestamp
@@ -316,6 +323,7 @@ func NewSlidingReceiver(cfg Config) *SlidingReceiver {
 		cfg:         cfg,
 		dec:         code.NewBandDecoder(cfg.SymbolSize, cfg.codingWindow(), slidingMaxWin),
 		directRecv:  make(map[uint32]bool),
+		symDL:       make(map[uint32]clock.Timestamp),
 		intervalUs:  1,
 		meanBurstQ8: burstQ8One,
 	}
@@ -345,6 +353,7 @@ func (r *SlidingReceiver) FeedSymbol(now clock.Timestamp, datagram []byte) {
 			r.stats.Duplicates++
 		} else {
 			r.directRecv[id] = true
+			r.symDL[id] = dl // gate this id by its own true deadline, not the uniform-spacing fit
 		}
 		r.updateRef(id, dl)
 		r.dec.AddSystematic(id, sym.Payload)
@@ -426,14 +435,22 @@ func (r *SlidingReceiver) pump(now clock.Timestamp) {
 		if c >= r.dec.Highest() {
 			return
 		}
-		dl, ok := r.deadline(c)
-		if !ok || !now.After(dl) {
-			return
+		// c is a gap: never directly received (a directly-received systematic decodes on
+		// arrival and is drained above), not yet recovered. Skip it once its own deadline has
+		// passed, OR — the monotonic backstop ported from the generation receiver — once an id
+		// AT OR ABOVE the cursor is itself overdue (refID >= c && now > refDL): deadlines are
+		// non-decreasing in id, so the highest stamped id's deadline bounds c's, and a gap whose
+		// fit is unprimed or too tight is still not evicted before a provably-overdue neighbor.
+		gd, gdKnown := r.deadlineOf(c)
+		overdue := (gdKnown && now.After(gd)) || (r.haveRef && r.refID >= c && now.After(r.refDL))
+		if !overdue {
+			return // wait: c is not yet past due and nothing above it is either
 		}
 		if !r.dec.Skip() {
 			return
 		}
 		delete(r.directRecv, c)
+		delete(r.symDL, c)
 	}
 }
 
@@ -443,9 +460,12 @@ func (r *SlidingReceiver) drainDeliver(now clock.Timestamp) {
 		if !ok {
 			return
 		}
-		if dl, ok := r.deadline(rec.ID); ok && now.After(dl) {
+		// Late-drop by the id's OWN stamped deadline (symDL) when it was directly received,
+		// falling back to the extrapolation only for a recovered id that never arrived directly.
+		if dl, ok := r.deadlineOf(rec.ID); ok && now.After(dl) {
 			r.lateDrops++
 			delete(r.directRecv, rec.ID)
+			delete(r.symDL, rec.ID)
 			continue
 		}
 		r.deliverQ = append(r.deliverQ, deliveredSym{rec.ID, append([]byte(nil), rec.Data...)})
@@ -454,7 +474,18 @@ func (r *SlidingReceiver) drainDeliver(now clock.Timestamp) {
 			r.stats.Recovered++
 		}
 		delete(r.directRecv, rec.ID)
+		delete(r.symDL, rec.ID)
 	}
+}
+
+// deadlineOf returns id's delivery deadline: the symbol's own stamp when it was directly
+// received, else the uniform-spacing extrapolation (the only estimate available for an id
+// that was recovered or never arrived). The bool is false when neither is known yet.
+func (r *SlidingReceiver) deadlineOf(id uint32) (clock.Timestamp, bool) {
+	if dl, ok := r.symDL[id]; ok {
+		return dl, true
+	}
+	return r.deadline(id)
 }
 
 func (r *SlidingReceiver) maybeFeedback(now clock.Timestamp) {

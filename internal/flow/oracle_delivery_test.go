@@ -320,7 +320,14 @@ func TestOracleSlidingPrematureDrop(t *testing.T) {
 		}
 	}
 	t.Logf("sliding premature-drop worst case = %d (the 100%%-until-impossible gap)", worst)
-	t.Skip("KNOWN GAP: sliding receiver lacks the clean-link deadline-stamp fix and a recoverable-neighbor-safe skip; unskip when ported")
+	// The clean-link deadline-stamp fix is now ported to SlidingReceiver (symDL + the monotonic
+	// refDL backstop), which cut the burst-write premature drops — directly-received symbols are
+	// no longer evicted on the too-tight uniform-spacing fit. The RESIDUAL is in the band decoder:
+	// BandDecoder.Skip → dropColumn evicts repair equations that also cover recoverable neighbors
+	// (and the band folds equations on arrival, so there is nothing un-folded to re-pivot the
+	// neighbor from), so skipping a genuinely-lost id cascades into dropping ids the ideal global
+	// decoder still recovers in time. Needs a recoverable-neighbor-safe skip in internal/code/band.go.
+	t.Skip("KNOWN GAP: band decoder's dropColumn evicts repairs covering recoverable neighbors; deadline-stamp is ported, neighbor-safe skip is not")
 	if worst > 0 {
 		t.Fatalf("sliding path dropped %d recoverable-in-time symbols", worst)
 	}
