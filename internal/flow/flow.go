@@ -209,6 +209,18 @@ type Config struct {
 	// perceptual form of EvictBrokenFrames, superseding it when set. Requires frame descriptors
 	// (Sender.WriteFrame); a no-op for plain byte streams. ON by default for media flows.
 	FrameAtomic bool
+	// ShedTopLayerOverBudget makes the SENDER proactively shed the top temporal layer under
+	// budget pressure: when the offered media rate exceeds the rate budget, the highest-TID
+	// DISCARDABLE access units (the leaf, non-reference frames — "every other frame" in a dyadic
+	// hierarchy) are dropped at the encoder rather than emitted, so a real-time source's base
+	// layer stays low-latency instead of queueing behind frames the budget can't carry. A clean
+	// transport-level temporal downscale: discardable frames have no dependents, so dropping them
+	// breaks nothing and leaves a contiguous id space (the receiver sees a smooth lower-fps stream,
+	// not loss). Self-limiting — shedding lowers the written rate until it fits, then stops.
+	// Requires WriteFrame with TemporalID/Discardable; OFF by default (a deliberate ABR-style
+	// policy). The reactive path (FrameAtomic + unequal protection) already sheds a doomed top
+	// layer cleanly under LOSS; this adds the PROACTIVE drop under rate pressure.
+	ShedTopLayerOverBudget bool
 	// RepairWithinBudget caps proactive repair so the total emitted rate (media + repair)
 	// stays within the sender's rate budget (RFC 9265 "repair within the budget, never on
 	// top"): the sizer sheds protection gracefully when the budget is tight rather than

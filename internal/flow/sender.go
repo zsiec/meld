@@ -12,6 +12,7 @@ type SenderStats struct {
 	Repair         uint64 // repair symbols emitted (fixed proactive)
 	ReactiveRepair uint64 // repair symbols emitted in response to a feedback deficit
 	Throttled      uint64 // repair symbols dropped by the rate ceiling (N1 token bucket)
+	Shed           uint64 // top-temporal-layer source chunks dropped at the encoder (ShedTopLayerOverBudget)
 }
 
 // retGen is a closed generation the sender retains so it can answer a feedback
@@ -56,6 +57,8 @@ type Sender struct {
 	rttSampled  bool                  // a real RTT sample has arrived (AutoGenSize stays narrow until then)
 	now         clock.Timestamp       // most recent entry-point time (for the rate ceiling)
 	bucket      tokenBucket           // aggregate emit-rate ceiling (N1), driven by cc when present
+	shedBucket  tokenBucket           // write-side budget for ShedTopLayerOverBudget (tracks the written media rate)
+	maxTID      uint8                 // highest TemporalID seen — the top layer the proactive shed drops
 	cc          *congestionController // delay-based budget (N3); nil ⇒ static MaxBitrate ceiling
 	sched       *pathScheduler        // N-path placement (N5); nil ⇒ single path
 	pathLossPpm []int                 // per-path marginal erasure rates (ppm), from feedback (N5)
@@ -93,13 +96,14 @@ func (s *Sender) pruneFrameStarts(cur uint32) {
 func NewSender(cfg Config) *Sender {
 	pool := code.NewPool(cfg.SymbolSize)
 	s := &Sender{
-		cfg:       cfg,
-		pool:      pool,
-		live:      code.NewEncoderAt(cfg.SymbolSize, 0),
-		retained:  make(map[uint32]*retGen),
-		rttMicros: defaultRTTMicros,
-		burstQ8:   burstQ8One,
-		bucket:    newTokenBucket(cfg.maxBitrate()),
+		cfg:        cfg,
+		pool:       pool,
+		live:       code.NewEncoderAt(cfg.SymbolSize, 0),
+		retained:   make(map[uint32]*retGen),
+		rttMicros:  defaultRTTMicros,
+		burstQ8:    burstQ8One,
+		bucket:     newTokenBucket(cfg.maxBitrate()),
+		shedBucket: newTokenBucket(cfg.maxBitrate()),
 	}
 	s.live.SetPool(pool)
 	if cfg.CongestionControl {
@@ -130,6 +134,7 @@ type FrameDesc struct {
 	FrameID     uint32   // the access unit this chunk belongs to (the shaper's unit id)
 	RefFrameIDs []uint32 // dependency access units (a B-frame's two anchors, a P-frame's one)
 	Chunks      uint16   // the access unit's total chunk count (so the receiver knows its id range)
+	TemporalID  uint8    // temporal-scalability layer (0 = base; higher = finer/leaf frames)
 	RAP         bool     // random-access point (keyframe)
 	Discardable bool     // nothing references this unit
 }
@@ -149,7 +154,32 @@ func (s *Sender) WriteUnit(now clock.Timestamp, data []byte, priority uint8) {
 // for every chunk of an access unit (all share the same FrameDesc); the per-symbol sizing
 // still keys only on Priority.
 func (s *Sender) WriteFrame(now clock.Timestamp, data []byte, fd FrameDesc) {
+	if s.cfg.ShedTopLayerOverBudget && s.shedTopLayer(now, len(data), fd) {
+		s.stats.Shed++
+		return // the budget cannot carry this leaf frame: shed it (clean transport temporal downscale)
+	}
 	s.writeSystematic(now, data, fd.Priority, &fd)
+}
+
+// shedTopLayer reports whether this access unit should be dropped at the encoder to keep the
+// written media rate within budget. It tracks the highest TemporalID seen as the current top
+// layer and meters the written media against a budget-rate bucket; a Discardable top-layer chunk
+// that would push the written rate over budget is shed (no dependents ⇒ safe, no id gap), while
+// base and lower-layer chunks are non-droppable and always consume the budget. Self-limiting:
+// shedding lowers the written rate until it fits, then the bucket has room and shedding stops.
+func (s *Sender) shedTopLayer(now clock.Timestamp, n int, fd FrameDesc) bool {
+	if fd.TemporalID > s.maxTID {
+		s.maxTID = fd.TemporalID
+	}
+	s.shedBucket.setRate(s.bucket.bytesPerSec) // follow the live CC/MaxBitrate budget
+	if fd.Discardable && fd.TemporalID >= s.maxTID {
+		if s.shedBucket.allow(now, n, true) {
+			return false // budget has room — keep the leaf frame (tokens consumed)
+		}
+		return true // over budget — shed the top temporal layer
+	}
+	s.shedBucket.allow(now, n, false) // base / lower layer: non-droppable, always counts against the budget
+	return false
 }
 
 func (s *Sender) writeSystematic(now clock.Timestamp, data []byte, priority uint8, fd *FrameDesc) {

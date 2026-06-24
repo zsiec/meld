@@ -146,6 +146,13 @@ type Config struct {
 	// ON by default (DefaultConfig) for media — a partial picture is perceptually worse than a
 	// dropped one. Set false to deliver source bytes as they recover (partial frames possible).
 	FrameAtomic bool
+	// ShedTopLayerOverBudget makes the sender proactively drop the top temporal layer (the
+	// highest-TemporalID, Discardable, non-reference WriteFrame units) when the source bitrate
+	// exceeds the rate budget — a clean transport-level temporal downscale ("drop every other
+	// frame") that keeps the base layer low-latency instead of queueing. Discardable frames have
+	// no dependents, so the receiver sees a smooth lower-fps stream, not loss. OFF by default (a
+	// deliberate ABR-style policy); the perceptual reactive shed (FrameAtomic) is already on.
+	ShedTopLayerOverBudget bool
 	// RepairWithinBudget caps proactive repair to the rate budget (media + repair ≤ budget),
 	// so a tight latency budget sheds protection gracefully instead of the host pacer queueing
 	// the overage as delay on media past the deadline. ON by default (DefaultConfig); sender-side
@@ -235,25 +242,26 @@ func DefaultConfig() Config {
 
 func (c Config) toFlow() flow.Config {
 	return flow.Config{
-		Flow:               c.Flow,
-		SymbolSize:         c.SymbolSize,
-		GenSize:            c.GenSize,
-		AdaptiveGenSize:    c.AdaptiveGenSize,
-		AutoGenSize:        c.AutoGenSize,
-		NominalRTTMicros:   c.NominalRTTMicros,
-		NominalBitrateBps:  c.NominalBitrateBps,
-		ProactiveDecay:     c.ProactiveDecay,
-		Redundancy:         c.Redundancy,
-		TargetFailure:      c.TargetFailure,
-		BufferMicros:       c.BufferMicros,
-		Sliding:            c.Sliding,
-		CodingWindow:       c.CodingWindow,
-		CongestionControl:  c.CongestionControl,
-		Pace:               c.Pace,
-		MaxBitrate:         c.MaxBitrate,
-		EvictBrokenFrames:  c.EvictBrokenFrames,
-		FrameAtomic:        c.FrameAtomic,
-		RepairWithinBudget: c.RepairWithinBudget,
+		Flow:                   c.Flow,
+		SymbolSize:             c.SymbolSize,
+		GenSize:                c.GenSize,
+		AdaptiveGenSize:        c.AdaptiveGenSize,
+		AutoGenSize:            c.AutoGenSize,
+		NominalRTTMicros:       c.NominalRTTMicros,
+		NominalBitrateBps:      c.NominalBitrateBps,
+		ProactiveDecay:         c.ProactiveDecay,
+		Redundancy:             c.Redundancy,
+		TargetFailure:          c.TargetFailure,
+		BufferMicros:           c.BufferMicros,
+		Sliding:                c.Sliding,
+		CodingWindow:           c.CodingWindow,
+		CongestionControl:      c.CongestionControl,
+		Pace:                   c.Pace,
+		MaxBitrate:             c.MaxBitrate,
+		EvictBrokenFrames:      c.EvictBrokenFrames,
+		FrameAtomic:            c.FrameAtomic,
+		ShedTopLayerOverBudget: c.ShedTopLayerOverBudget,
+		RepairWithinBudget:     c.RepairWithinBudget,
 	}
 }
 
@@ -276,6 +284,7 @@ type FrameDesc struct {
 	FrameID     uint32
 	RefFrameIDs []uint32
 	Chunks      uint16
+	TemporalID  uint8 // temporal-scalability layer (0 = base; higher = leaf frames shed first)
 	RAP         bool
 	Discardable bool
 }
@@ -283,7 +292,7 @@ type FrameDesc struct {
 func (d FrameDesc) toFlow() flow.FrameDesc {
 	return flow.FrameDesc{
 		Priority: d.Priority, FrameID: d.FrameID, RefFrameIDs: d.RefFrameIDs,
-		Chunks: d.Chunks, RAP: d.RAP, Discardable: d.Discardable,
+		Chunks: d.Chunks, TemporalID: d.TemporalID, RAP: d.RAP, Discardable: d.Discardable,
 	}
 }
 
