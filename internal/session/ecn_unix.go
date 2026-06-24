@@ -51,26 +51,25 @@ func setupECN(fd int) error {
 // parseRecvECN extracts the ECN codepoint (the low two bits of the IP differentiated-services
 // field) from whatever TOS / traffic-class control messages recvmsg delivered. Linux delivers
 // the IPv4 TOS as an IP_TOS cmsg, Darwin as IP_RECVTOS; IPv6 arrives as IPV6_TCLASS on both. A
-// missing or short control message means NotECT.
+// missing or short control message means NotECT. Walks the buffer one message at a time so the
+// per-datagram recv path stays allocation-free (ParseSocketControlMessage would allocate a slice).
 func parseRecvECN(oob []byte) flow.ECN {
-	if len(oob) == 0 {
-		return flow.NotECT
-	}
-	msgs, err := unix.ParseSocketControlMessage(oob)
-	if err != nil {
-		return flow.NotECT
-	}
-	for _, m := range msgs {
+	for len(oob) > 0 {
+		hdr, data, remainder, err := unix.ParseOneSocketControlMessage(oob)
+		if err != nil {
+			break
+		}
 		switch {
-		case m.Header.Level == unix.IPPROTO_IP && (m.Header.Type == unix.IP_TOS || m.Header.Type == unix.IP_RECVTOS):
-			if len(m.Data) >= 1 {
-				return flow.ECN(m.Data[0] & 0x03)
+		case hdr.Level == unix.IPPROTO_IP && (hdr.Type == unix.IP_TOS || hdr.Type == unix.IP_RECVTOS):
+			if len(data) >= 1 {
+				return flow.ECN(data[0] & 0x03)
 			}
-		case m.Header.Level == unix.IPPROTO_IPV6 && m.Header.Type == unix.IPV6_TCLASS:
-			if len(m.Data) >= 1 {
-				return flow.ECN(m.Data[0] & 0x03) // traffic-class int; the low byte holds the DS field
+		case hdr.Level == unix.IPPROTO_IPV6 && hdr.Type == unix.IPV6_TCLASS:
+			if len(data) >= 1 {
+				return flow.ECN(data[0] & 0x03) // traffic-class int; the low byte holds the DS field
 			}
 		}
+		oob = remainder
 	}
 	return flow.NotECT
 }

@@ -70,6 +70,36 @@ func TestECNSetAndRead(t *testing.T) {
 	}
 }
 
+// TestParseRecvECNNoAlloc gates the warm recv path: extracting the ECN codepoint from the TOS
+// control message must not allocate (the recv loop runs it per datagram). It walks the buffer
+// with ParseOneSocketControlMessage rather than ParseSocketControlMessage for exactly this.
+func TestParseRecvECNNoAlloc(t *testing.T) {
+	rx, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer rx.Close()
+	if err := setECN(rx); err != nil {
+		t.Fatalf("setECN: %v", err)
+	}
+	tx, err := net.DialUDP("udp", nil, rx.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer tx.Close()
+	_, _ = tx.Write([]byte("x"))
+	buf, oob := make([]byte, 64), make([]byte, 128)
+	_ = rx.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, oobn, _, _, err := rx.ReadMsgUDP(buf, oob)
+	if err != nil || oobn == 0 {
+		t.Skip("platform delivered no TOS control message")
+	}
+	cm := append([]byte(nil), oob[:oobn]...)
+	if got := testing.AllocsPerRun(1000, func() { _ = parseRecvECN(cm) }); got != 0 {
+		t.Fatalf("parseRecvECN allocates %.0f/call on the warm recv path (want 0)", got)
+	}
+}
+
 // setSockTOS forces the IPv4 TOS byte on a connected UDP socket (a stand-in for an on-path AQM
 // re-marking the datagram), so the test can drive a specific received codepoint.
 func setSockTOS(t *testing.T, c *net.UDPConn, tos int) {
