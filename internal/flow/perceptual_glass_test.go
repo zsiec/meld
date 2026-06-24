@@ -198,3 +198,87 @@ func TestGlassFrameAtomicNoCorruption(t *testing.T) {
 		t.Fatal("no non-empty decodable streams were ffprobe-confirmed — loosen the loss/budget")
 	}
 }
+
+// TestGlassTemporalLayered exercises the media-awareness pipeline on REAL temporal-layer-tagged
+// HEVC — bbb_temporal.h265, encoded with x265 --temporal-layers 4 so the bitstream actually carries
+// nuh_temporal_id 0..3 (the stock clips are all tid 0, so this is the only real vehicle for the
+// temporal mechanisms). It pins three true, load-bearing facts: the shaper reads a genuine 4-layer
+// hierarchy; the dependency model stays ffprobe-EXACT on temporal-layered media (no-loss decode);
+// and the frame-atomic whole-or-nothing guarantee (#15) holds on this clip too — zero corrupt AUs,
+// ffprobe-confirmed decodable counts.
+//
+// What it does NOT assert, honestly: that temporal-depth UEP (#17) or the temporal shed (#16) BEAT
+// flat protection here. Measured on this clip, #17's increment over plain UEP is within noise
+// (decodable keyframe rate uep+tid ~= uep ~= flat), and the sender shed (#16) cannot even deplete
+// its token bucket on a clip this small (it is rate-validated in shed_test.go instead). The bench is
+// the arbiter: on a decodable-frame metric the temporal-protection refinements are marginal, which
+// matches the design read that #17 only bites deep (tid>=3) hierarchies. #15, by contrast, is a
+// clear real-media win (see TestGlassFrameAtomicNoCorruption).
+func TestGlassTemporalLayered(t *testing.T) {
+	data, err := os.ReadFile("../shape/testdata/bbb_temporal.h265")
+	if err != nil {
+		t.Skip("no temporal-layered HEVC sample")
+	}
+	shaped := shape.NewHEVCShaper().Shape(data)
+	units := make([]shape.Unit, len(shaped))
+	for i, sh := range shaped {
+		units[i] = sh.Unit
+	}
+
+	// A genuine multi-temporal-layer stream: every layer 0..3 must be present, or the clip is not
+	// exercising the temporal path at all.
+	tids := map[uint8]bool{}
+	for _, u := range units {
+		if u.Picture {
+			tids[u.TemporalID] = true
+		}
+	}
+	for tid := uint8(0); tid <= 3; tid++ {
+		if !tids[tid] {
+			t.Fatalf("clip is not multi-layer: temporal layer %d absent (saw %v)", tid, tids)
+		}
+	}
+
+	haveFF := false
+	if _, err := exec.LookPath("ffprobe"); err == nil {
+		haveFF = true
+	}
+
+	// The dependency model is EXACT on temporal-layered HEVC: with no loss the real decoder produces
+	// precisely the predicted slices.
+	if haveFF {
+		full := map[uint32]bool{}
+		for _, u := range units {
+			full[u.ID] = true
+		}
+		h, slices := reassemble(shaped, units, full)
+		if got := ffprobeFrames(t, h); got != slices {
+			t.Fatalf("no-loss: ffprobe decoded %d frames, model predicted %d on temporal-layered media", got, slices)
+		}
+	}
+
+	// Under loss, frame-atomic delivery never hands the decoder a partial AU on this clip either, and
+	// ffprobe confirms the decodable set the model predicts.
+	cfg := Config{Flow: 1, SymbolSize: 128, GenSize: 16, Redundancy: 0.15, BufferMicros: 100_000, FrameAtomic: true}
+	const lossP = 0.30
+	var corrupt, confirmed, decoded int
+	for seed := uint64(1); seed <= 6; seed++ {
+		deliv, c := glassPerceptual(t, cfg, shaped, lossP, seed*0x9E3779B1)
+		corrupt += c
+		h, pics := reassemble(shaped, units, deliv)
+		decoded += pics
+		if haveFF && pics > 0 {
+			if got := ffprobeFrames(t, h); got != pics {
+				t.Fatalf("seed %d: ffprobe decoded %d frames, model predicted %d", seed, got, pics)
+			}
+			confirmed++
+		}
+	}
+	t.Logf("temporal-layered: TID layers=%v | frame-atomic corrupt=%d decodable=%d (%d ffprobe-confirmed)", tids, corrupt, decoded, confirmed)
+	if corrupt != 0 {
+		t.Fatalf("frame-atomic delivered %d partial AUs on temporal-layered media — the guarantee broke", corrupt)
+	}
+	if haveFF && confirmed == 0 {
+		t.Fatal("no non-empty decodable streams were ffprobe-confirmed — loosen the loss/budget")
+	}
+}
