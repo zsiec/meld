@@ -144,12 +144,13 @@ type Receiver struct {
 	// into coEst, whose per-path marginals (→ PathLoss) and per-slot erasure-count histogram
 	// (→ SlotDist) are reported so the sender's joint-tail sizer sees the cross-path
 	// correlation an i.i.d.-union sizer misses. Disabled (nothing reported) on a single path.
-	mpEnabled bool
-	paths     int
-	coEst     *coLossEstimator
-	mpSlot    uint32 // the slot index (id / paths) currently accumulating
-	mpLost    []bool // per-path lost flags for mpSlot (len paths)
-	mpHave    int    // path-positions filled in mpSlot
+	mpEnabled  bool
+	paths      int
+	coEst      *coLossEstimator
+	mpSlot     uint32 // the slot index (id / paths) currently accumulating
+	mpLost     []bool // per-path lost flags for mpSlot (len paths)
+	mpHave     int    // path-positions filled in mpSlot
+	mpMismatch int    // arrived stamps disagreeing with the id-mod-paths model (path-layout cross-check)
 
 	// Frame-level loss propagation (WP6). Systematic symbols carry an access-unit
 	// descriptor (FrameStart = the frame's first source id + the dominant reference's
@@ -232,7 +233,7 @@ func (r *Receiver) FeedSymbolECN(now clock.Timestamp, datagram []byte, ecn ECN) 
 	// before the cursor/deadline gates. Each id's systematic arrives once, so this
 	// counts each network delivery once.
 	if sym.Kind == wire.Systematic {
-		r.observeLoss(sym.SrcIndex)
+		r.observeLoss(sym.SrcIndex, sym.PathID)
 		if sym.HasFrameDesc {
 			r.noteFrame(sym)
 		}
@@ -688,8 +689,9 @@ func ppmToP65535(ppm int) uint16 {
 // systematic source id: over a window of source ids the fraction NOT directly
 // received is the channel loss (coding recovery is excluded — this measures what
 // the network dropped, the signal the sender's controller sizes redundancy from).
-func (r *Receiver) observeLoss(id uint32) {
-	r.walkGap(id) // pre-recovery loss count + burst run-lengths (N1/N2), before the windowed rate
+// pathID is the symbol's host-stamped path, used to validate multipath co-loss alignment.
+func (r *Receiver) observeLoss(id uint32, pathID uint8) {
+	r.walkGap(id, pathID) // pre-recovery loss count + burst run-lengths (N1/N2), before the windowed rate
 	if !r.lossStarted {
 		r.lossStarted, r.lossBase, r.lossHighest, r.lossRecv = true, id, id, 1
 		return
@@ -736,7 +738,8 @@ func (r *Receiver) observeLoss(id uint32) {
 // that length. It accumulates the pre-recovery loss count (N1, never decremented on
 // decode) and smooths the mean loss-run length in Q8 (N2). Late/reorder arrivals
 // (id < expectNext) are already accounted and ignored.
-func (r *Receiver) walkGap(id uint32) {
+func (r *Receiver) walkGap(id uint32, pathID uint8) {
+	r.mpCheckPath(id, pathID) // the arrived stamp validates the loss-attribution model (genBaseOf class)
 	if !r.haveExpect {
 		r.haveExpect, r.expectNext = true, id+1
 		r.mpFact(id, true)
@@ -775,6 +778,38 @@ func (r *Receiver) walkGap(id uint32) {
 // cannot loop unboundedly; the dropped middle of a long outage is all-paths-lost
 // (maximal correlation) anyway, so under-sampling it errs toward MORE provisioning.
 const coLossMaxReplay = 256
+
+// mpMaxPathMismatch is how many arrived stamps may disagree with the id-mod-paths placement
+// model before co-loss estimation gives up. A real path-count/layout mismatch disagrees on
+// (nearly) every id, so it trips within the first handful — long before the estimator primes
+// (coLossWindow slots) — while a few isolated disagreements (a corrupted or spoofed PathID:
+// it rides the cleartext header, outside the AEAD AAD) are tolerated rather than permanently
+// killing co-loss for the flow.
+const mpMaxPathMismatch = 4
+
+// mpCheckPath validates the co-loss estimator's deterministic placement model against the
+// sender's PathID stamp on an arrived systematic. The estimator must attribute LOSSES — which
+// carry no stamp, the symbol never arrived — to a path, so it reconstructs the sender's
+// round-robin as id mod paths and the slot as id / paths. That reconstruction is correct only
+// while both ends agree on the path count and the sender places id k on path k mod paths;
+// Config.Paths is configured independently on each end (not negotiated), so a mismatch would
+// silently misalign every slot and feed the sender's joint-tail sizer garbage per-path stats —
+// worse than no multipath awareness. The PathID stamp is the ground truth the wire already
+// carries (ST 2022-7 style), so cross-check it and, once disagreements pass mpMaxPathMismatch,
+// disable co-loss reporting and fall back to the i.i.d.-union sizer. The union decoder still
+// delivers (it is path-agnostic), so this costs only the correlation refinement, not data.
+func (r *Receiver) mpCheckPath(id uint32, pathID uint8) {
+	if !r.mpEnabled {
+		return
+	}
+	if uint32(pathID) == id%uint32(r.paths) {
+		return
+	}
+	r.mpMismatch++
+	if r.mpMismatch >= mpMaxPathMismatch {
+		r.mpEnabled = false // the two ends disagree on the path layout; stop reporting misaligned stats
+	}
+}
 
 // mpFact folds one in-order per-id wire fact (arrived or lost) into the aligned-slot
 // co-loss estimator: id rides path id mod paths and slot id / paths (the sender's

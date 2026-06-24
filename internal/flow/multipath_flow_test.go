@@ -177,6 +177,97 @@ func TestMultipathCoLossClosesLoop(t *testing.T) {
 		epa, epb, epBoth, epa*epb/1_000_000, sBoth)
 }
 
+// TestMultipathSystematicPathStamp pins the sender-side invariant the receiver's co-loss
+// estimator mirrors: systematic id k is stamped onto path k mod paths. The estimator must
+// attribute LOSSES (no stamp) to a path by reconstructing this round-robin, so if the sender
+// ever placed systematics differently, the receiver's reconstruction — and its cross-path
+// stats — would silently misalign. Verified end to end over the real emit/wire path.
+func TestMultipathSystematicPathStamp(t *testing.T) {
+	const paths = 4
+	cfg := Config{Flow: 1, SymbolSize: testSym, GenSize: testGen, Redundancy: 0, BufferMicros: testBuf, Paths: paths}
+	s := NewSender(cfg)
+	now := clock.Timestamp(0)
+	rng := rand.New(rand.NewSource(11))
+	seen := 0
+	check := func() {
+		for {
+			d, ok := s.PollSend()
+			if !ok {
+				break
+			}
+			sym, err := wire.DecodeSymbol(d)
+			if err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if sym.Kind != wire.Systematic {
+				continue
+			}
+			if int(sym.PathID) != int(sym.SrcIndex)%paths {
+				t.Fatalf("systematic id %d stamped PathID %d, want %d (id mod paths)", sym.SrcIndex, sym.PathID, sym.SrcIndex%paths)
+			}
+			seen++
+		}
+	}
+	for i := 0; i < 40; i++ {
+		s.Write(now, makeChunk(rng, uint32(i)))
+		check()
+		now = now.Add(testTick)
+		s.Tick(now)
+	}
+	s.Flush(now)
+	check()
+	if seen == 0 {
+		t.Fatal("no systematic symbols emitted")
+	}
+	t.Logf("validated %d systematic PathID stamps == id mod %d", seen, paths)
+}
+
+// TestMultipathPathStampValidatesCoLoss proves the receiver cross-checks the sender's
+// authoritative PathID stamp against its own id-mod-paths placement model: matching stamps
+// keep co-loss estimation on, but a stamp that disagrees — the symptom of two ends configured
+// with different Config.Paths (it is not negotiated) — disables co-loss reporting so the sender
+// falls back to the i.i.d.-union sizer instead of being fed misaligned per-path stats.
+func TestMultipathPathStampValidatesCoLoss(t *testing.T) {
+	// Matching round-robin stamps (path == id mod paths) leave the estimator enabled.
+	r := NewReceiver(mpConfig(testBuf))
+	if !r.mpEnabled {
+		t.Fatal("co-loss should start enabled for Paths=2")
+	}
+	for id := uint32(0); id < 8; id++ {
+		r.observeLoss(id, uint8(id%2))
+	}
+	if !r.mpEnabled {
+		t.Fatal("PathID stamps matching id mod paths must not disable co-loss")
+	}
+
+	// A real path-count mismatch: the sender round-robins over 4 paths (stamping id mod 4)
+	// while this receiver is configured for 2. Their models disagree on every id where
+	// id mod 4 differs from id mod 2, which trips the cross-check and disables co-loss.
+	r2 := NewReceiver(mpConfig(testBuf)) // receiver Paths == 2
+	const senderPaths = 4
+	disabledAt := -1
+	for id := uint32(0); id < 16 && r2.mpEnabled; id++ {
+		r2.observeLoss(id, uint8(id%senderPaths))
+		if !r2.mpEnabled {
+			disabledAt = int(id)
+		}
+	}
+	if r2.mpEnabled {
+		t.Fatal("a sender/receiver path-count mismatch must disable co-loss (fail safe)")
+	}
+	t.Logf("co-loss disabled after the mismatch at id %d", disabledAt)
+
+	// A single isolated bad stamp (corrupted/spoofed cleartext PathID) is tolerated, not fatal.
+	r3 := NewReceiver(mpConfig(testBuf))
+	r3.observeLoss(0, 0) // consistent
+	r3.observeLoss(1, 0) // one mismatch: 1 mod 2 == 1, stamped 0
+	r3.observeLoss(2, 0) // consistent
+	r3.observeLoss(3, 1) // consistent
+	if !r3.mpEnabled {
+		t.Fatal("a single isolated stamp mismatch must not disable co-loss (tolerance)")
+	}
+}
+
 // runMPProactive streams n chunks through a 2-path Sender/Receiver over ch with NO
 // feedback loop, so PROACTIVE sizing alone determines recovery. The sender's per-path
 // rate inputs are pre-seeded by seedRates (joint vs independence). Returns delivered/

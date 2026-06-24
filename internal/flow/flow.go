@@ -180,7 +180,11 @@ type Config struct {
 	// the better-delivering paths, and the receiver decodes from the union, so lossy paths
 	// add diversity rather than the N× cost of duplication. The receiver measures the
 	// per-slot erasure-count histogram across the paths so the sizer provisions for their
-	// cross-path correlation. Clamped to maxPaths.
+	// cross-path correlation. Clamped to maxPaths. Both ends must configure the SAME Paths:
+	// the receiver attributes each id to a path by id mod Paths (a lost symbol carries no
+	// path stamp to read), so a mismatch would misalign the co-loss stats; the receiver
+	// cross-checks arrived symbols' PathID and disables co-loss reporting on a mismatch
+	// (the union decoder still delivers; only the correlation refinement is lost).
 	Paths int
 	// EvictBrokenFrames turns on media-aware early eviction (WP6): when a frame the
 	// receiver tracks is known UNDECODABLE — one of its own source ids was lost, or a
