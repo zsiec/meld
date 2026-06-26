@@ -2,6 +2,7 @@ package flow
 
 import (
 	"encoding/binary"
+	"math/rand"
 	"sort"
 
 	"github.com/zsiec/meld/internal/clock"
@@ -34,6 +35,18 @@ type simLink struct {
 	sliding      bool                   // use the band-form sliding coder instead of the generation coder
 	jitterMicros int64                  // max extra per-datagram delay (deterministic per symbol) — induces reorder
 	burst        int                    // source chunks written at one instant per srcMicros tick (0 ⇒ 1); models a media access unit (a whole video frame) written in one go, so a generation fills over a span of wall time rather than uniformly
+	// paceBytesPerSec serializes the forward path at a wire rate (0 ⇒ unlimited, the original
+	// behavior): each datagram occupies the wire for len/rate, so a repair burst emitted at a
+	// generation close DELAYS the media queued behind it. This is the host-pacer / bottleneck physics
+	// the original sim omitted — the omission that made proactive-shifting changes look free.
+	paceBytesPerSec int64
+	// timingJitterMicros + timingSeed add STOCHASTIC per-datagram forward delay (0 ⇒ none). The
+	// original deterministic sim resolves "did the reactive round land before the deadline?" as a fixed
+	// binary; real timing resolves it as a coin flip (scheduling/GC variance). Seeding lets one config
+	// be sampled over many timing draws to recover the real-timing DISTRIBUTION instead of a single
+	// point — the variance the deterministic sim cannot show.
+	timingJitterMicros int64
+	timingSeed         int64
 }
 
 // simResult is the observed outcome of a simLink run.
@@ -48,6 +61,8 @@ type simResult struct {
 	lateDeliv     bool
 	corrupt       bool    // a delivered payload did not match its source id (false recovery)
 	latencyMicros []int64 // per-delivered-symbol latency (now - write time), for p50/p99
+	finalPEst     float64 // the sender's loss estimate at end of run (feedback-driven; for diagnostics)
+	finalBurstQ8  int     // the sender's burstiness estimate at end of run (Q8; 256 == i.i.d.)
 }
 
 // pctlMicros returns the p-th percentile (0..1) of the latency samples in microseconds, or 0 if empty.
@@ -101,6 +116,11 @@ func (sl simLink) run() simResult {
 	nextWrite := clock.Timestamp(0)
 	written := 0
 	endBy := clock.Timestamp(0)
+	var wireFreeAt clock.Timestamp // forward-path serialization cursor (pacer)
+	var tjit *rand.Rand
+	if sl.timingSeed != 0 {
+		tjit = rand.New(rand.NewSource(sl.timingSeed))
+	}
 
 	deliverDue := func(q *[]inflight, to func(d []byte)) {
 		keep := (*q)[:0]
@@ -129,7 +149,20 @@ func (sl simLink) run() simResult {
 				// rng (keeps the run reproducible). Reorder is a first-class invariant input.
 				extra = int64(coinU(0x31773, uint32(sym.Kind), sym.SrcIndex, sym.WindowBase, uint32(sym.RepairKey)) * float64(sl.jitterMicros))
 			}
-			s2r = append(s2r, inflight{now.Add(sl.owdMicros + extra), d})
+			if tjit != nil && sl.timingJitterMicros > 0 {
+				extra += tjit.Int63n(sl.timingJitterMicros + 1) // stochastic scheduling/GC variance
+			}
+			// Pacer: the datagram departs when the wire frees (max of now and the serialization cursor),
+			// occupies it for len/rate, and arrives owd+jitter later — so a repair burst pushes the
+			// media behind it later in time (head-of-line blocking the unpaced sim could not see).
+			dep := now
+			if sl.paceBytesPerSec > 0 {
+				if wireFreeAt.After(dep) {
+					dep = wireFreeAt
+				}
+				wireFreeAt = dep.Add(int64(len(d)) * 1_000_000 / sl.paceBytesPerSec)
+			}
+			s2r = append(s2r, inflight{dep.Add(sl.owdMicros + extra), d})
 		}
 	}
 	pumpReceiver := func() {
@@ -211,5 +244,8 @@ func (sl simLink) run() simResult {
 	}
 	res.stats = r.Stats()
 	res.sstats = s.Stats()
+	if gs, ok := s.(*Sender); ok {
+		res.finalPEst, res.finalBurstQ8 = gs.pEst, gs.burstQ8
+	}
 	return res
 }

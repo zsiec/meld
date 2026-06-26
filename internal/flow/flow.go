@@ -93,6 +93,28 @@ type Config struct {
 	// keeps the joint-tail set-point). Set false to carry the full proactive set-point (lowest tail
 	// latency, highest overhead). Trades a touch of latency on the offloaded generations.
 	ProactiveDecay bool
+	// ReorderHoldoffMicros is a RECEIVER-side reorder window for the channel-loss estimate: a source
+	// id missing from the in-order sequence is only counted as lost (feeding the loss-rate and burst
+	// estimators that size proactive repair) once it has been missing this long — not the instant a
+	// higher id arrives. Under real-timing reorder/jitter a higher id routinely arrives before the
+	// lower ones (which are merely late, not lost), and the estimators over-count it as loss: a
+	// jittered bench and cref both show ~220% proactive overhead at 1% loss where ~17% suffices,
+	// because the receiver reports a fictitious ~50% loss + high burstiness. Holding the loss verdict
+	// one reorder window lets the late symbols arrive and be counted received; genuine loss survives
+	// the wait. Trades a slice of loss-onset responsiveness (the estimate lags a genuine onset by the
+	// window) for the overhead. 0 ⇒ off (the instant-verdict behavior). Single-path only for now
+	// (multipath co-loss keeps the instant model). Receiver-side; the two ends may differ.
+	// Overridden by AutoReorderHoldoff when that is set.
+	ReorderHoldoffMicros int64
+	// AutoReorderHoldoff sizes the reorder window from the MEASURED reorder spread instead of a fixed
+	// ReorderHoldoffMicros, so it is zero-config and self-disabling: the receiver tracks how long
+	// reordered-late ids actually take to arrive (a held gap that fills is a reorder sample; an id
+	// arriving after it was already declared lost grows the window) and holds new gaps that long, plus
+	// a margin, capped by the deadline budget. On a link with NO reorder the gaps come from genuine
+	// loss, never fill, and grow nothing — the window stays ~0 and loss is detected instantly (no onset
+	// lag); under reorder it grows to cover the spread and collapses the proactive over-send. Single-
+	// path only for now. Receiver-side. Off by default.
+	AutoReorderHoldoff bool
 	// Redundancy is the FLOOR proactive code rate (repair per source symbol): the
 	// minimum protection even at ~0 estimated loss, covering the lag before the
 	// loss estimate catches a sudden onset. The redundancy controller raises the
@@ -305,6 +327,10 @@ func DefaultConfig() Config {
 		// on by default: deliver each access unit all-or-nothing so the decoder never renders a
 		// partial picture (a no-op for byte streams, which carry no frame descriptors).
 		FrameAtomic: true,
+		// on by default: size the loss-estimate reorder window from measured reorder. Self-disabling
+		// where there is no reorder (a cref no-regression sweep across loss 1/3/8% holds delivery and
+		// cuts proactive overhead severalfold under real-timing reorder); single-path only for now.
+		AutoReorderHoldoff: true,
 	}
 }
 

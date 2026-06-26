@@ -216,6 +216,41 @@ func TestFlowReactiveRepair(t *testing.T) {
 	}
 }
 
+// TestFlowReactiveRepairEntirelyLostGeneration drops every first-flight symbol for the
+// first generation, including its proactive repair. The receiver therefore has no decoder
+// state at the delivery cursor even after it sees later generations. Feedback must still
+// surface that structural gap so the sender can answer with coded repair.
+func TestFlowReactiveRepairEntirelyLostGeneration(t *testing.T) {
+	cfg := testConfig()
+	const n = 64
+	proactive := uint16(cfg.repairFloor(cfg.GenSize))
+	drop := func(sym wire.Symbol) bool {
+		if sym.WindowBase != 0 {
+			return false
+		}
+		switch sym.Kind {
+		case wire.Systematic:
+			return sym.SrcIndex < uint32(cfg.GenSize)
+		case wire.Repair:
+			return sym.RepairKey < proactive
+		default:
+			return false
+		}
+	}
+	res := runFlow(t, cfg, n, 77, drop)
+	assertOrdered(t, res.delivered)
+	if res.lateDeliv {
+		t.Fatal("delivery past deadline")
+	}
+	if len(res.delivered) != n {
+		t.Fatalf("entirely-lost generation was not recovered: delivered %d/%d (lost=%d recovered=%d reactive=%d)",
+			len(res.delivered), n, res.stats.Lost, res.stats.Recovered, res.sstats.ReactiveRepair)
+	}
+	if res.sstats.ReactiveRepair == 0 {
+		t.Fatal("expected reactive repair for the structural generation gap")
+	}
+}
+
 // TestFlowUnrecoverableDeadline drops systematic past the budget AND all repair, so
 // the holes can never be recovered: they must be skipped at the deadline, with the
 // four invariants intact and full loss accounting.

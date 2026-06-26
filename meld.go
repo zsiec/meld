@@ -81,6 +81,17 @@ type Config struct {
 	// at higher overhead. Single-path only (multipath keeps the joint-tail set-point); sender-side
 	// policy (the two ends may differ).
 	ProactiveDecay bool
+	// ReorderHoldoffMicros is a receiver-side reorder window for the channel-loss estimate: a source id
+	// missing from the in-order sequence is counted as lost (feeding the loss/burst estimators that size
+	// proactive repair) only once it has been missing this long, not the instant a higher id arrives.
+	// Under real-timing reorder a higher id routinely arrives before the lower ones (merely late, not
+	// lost) and the estimators over-count loss, over-sizing proactive repair severalfold. 0 ⇒ off.
+	// Single-path only for now. Receiver-side; the two ends may differ. Overridden by AutoReorderHoldoff.
+	ReorderHoldoffMicros int64
+	// AutoReorderHoldoff sizes the reorder window from the MEASURED reorder spread (zero-config, and
+	// self-disabling where there is no reorder) instead of a fixed ReorderHoldoffMicros. Single-path
+	// only for now. Receiver-side. Off by default.
+	AutoReorderHoldoff bool
 	// Redundancy is the FLOOR proactive code rate (repair per source symbol); the
 	// controller raises the rate above it as the measured loss requires.
 	Redundancy float64
@@ -237,6 +248,7 @@ func DefaultConfig() Config {
 		AutoGenSize:        c.AutoGenSize,        // on by default (flow.DefaultConfig): zero-config adaptive width
 		RepairWithinBudget: c.RepairWithinBudget, // on by default (flow.DefaultConfig): repair within the rate budget
 		FrameAtomic:        c.FrameAtomic,        // on by default (flow.DefaultConfig): all-or-nothing picture delivery
+		AutoReorderHoldoff: c.AutoReorderHoldoff, // on by default (flow.DefaultConfig): self-tuning loss-estimate reorder window
 	}
 }
 
@@ -250,6 +262,8 @@ func (c Config) toFlow() flow.Config {
 		NominalRTTMicros:       c.NominalRTTMicros,
 		NominalBitrateBps:      c.NominalBitrateBps,
 		ProactiveDecay:         c.ProactiveDecay,
+		ReorderHoldoffMicros:   c.ReorderHoldoffMicros,
+		AutoReorderHoldoff:     c.AutoReorderHoldoff,
 		Redundancy:             c.Redundancy,
 		TargetFailure:          c.TargetFailure,
 		BufferMicros:           c.BufferMicros,
@@ -363,6 +377,13 @@ func (c Config) Check() []string {
 	return w
 }
 
+// Substrate is the datagram transport meld runs over: ReadFrom/WriteTo/LocalAddr/Close (the
+// datagram subset of net.PacketConn). A UDP socket satisfies it, and so does any host-provided
+// pipe — a WebTransport session, a WASM bridge to the browser's transport, an in-process pair.
+// Implement it to run the coder over a transport meld does not own (and whose pacing/congestion
+// control the host, not meld, governs).
+type Substrate = session.Substrate
+
 // Sender transmits a coded media flow to a remote Receiver.
 type Sender struct{ s *session.Sender }
 
@@ -372,6 +393,20 @@ func NewSender(remote string, cfg Config) (*Sender, error) {
 		log.Println(warn)
 	}
 	s, err := session.NewSender(remote, cfg.toFlow(), cfg.toSecurity())
+	if err != nil {
+		return nil, err
+	}
+	return &Sender{s}, nil
+}
+
+// NewSenderOver starts a coded sender over a caller-provided Substrate instead of dialing an
+// address — the seam for running meld over WebTransport, a WASM bridge, or any datagram transport.
+// The host owns the substrate's pacing and congestion response; meld owns the coding.
+func NewSenderOver(sub Substrate, cfg Config) (*Sender, error) {
+	for _, warn := range cfg.Check() {
+		log.Println(warn)
+	}
+	s, err := session.NewSenderOver(sub, cfg.toFlow(), cfg.toSecurity())
 	if err != nil {
 		return nil, err
 	}
@@ -418,6 +453,19 @@ func NewReceiver(bind string, cfg Config) (*Receiver, error) {
 		log.Println(warn)
 	}
 	r, err := session.NewReceiver(bind, cfg.toFlow(), cfg.toSecurity())
+	if err != nil {
+		return nil, err
+	}
+	return &Receiver{r}, nil
+}
+
+// NewReceiverOver starts a coded receiver over a caller-provided Substrate instead of binding an
+// address — the receive-side seam for WebTransport, a WASM browser bridge, or any datagram transport.
+func NewReceiverOver(sub Substrate, cfg Config) (*Receiver, error) {
+	for _, warn := range cfg.Check() {
+		log.Println(warn)
+	}
+	r, err := session.NewReceiverOver(sub, cfg.toFlow(), cfg.toSecurity())
 	if err != nil {
 		return nil, err
 	}

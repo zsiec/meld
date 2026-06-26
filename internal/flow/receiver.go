@@ -95,6 +95,13 @@ type Receiver struct {
 	sendQ       [][]byte
 	stats       ReceiverStats
 
+	// A structural gap is a generation at the delivery cursor for which no symbol has
+	// arrived, so there is no decoder state to report a rank deficit from. Hold the verdict
+	// briefly so a whole generation that is only reordered-late is not mistaken for loss.
+	structGapActive bool
+	structGapCursor uint32
+	structGapAt     clock.Timestamp
+
 	// ECN / L4S congestion signal (N3): over each feedback interval, the CE-marked
 	// fraction of ADMITTED symbols, echoed to the sender's congestion controller so it
 	// reacts to the marks an L4S AQM sets before a standing queue forms. ecnSeen counts
@@ -137,6 +144,18 @@ type Receiver struct {
 	expectNext  uint32 // next source id expected in order
 	clSinceFB   uint32 // pre-recovery loss since the last feedback (→ CongestionLoss)
 	meanBurstQ8 uint32 // smoothed mean loss-run length, Q8 (256 == i.i.d.; → Burstiness)
+
+	// Reorder window for the loss estimate (ReorderHoldoffMicros): a small resequencer in front of
+	// observeLoss that settles a source id received-or-lost only after lower ids have had a holdoff to
+	// arrive, so a reordered-late id is counted RECEIVED (not a fictitious loss that over-sizes repair).
+	// reseqSeen holds arrived ids in (reseqNext, reseqHigh]; reseqGapAt is when reseqNext first became a
+	// gap (a higher id arrived while it was missing). Single-path only.
+	reseqStarted  bool
+	reseqNext     uint32
+	reseqHigh     uint32
+	reseqGapAt    clock.Timestamp
+	reseqSeen     map[uint32]uint8 // arrived-out-of-order ids → their stamped pathID (for multipath co-loss)
+	reorderHoldUs int64            // AutoReorderHoldoff: tracked reorder spread (max-hold of fill delays, grown by late arrivals, decayed)
 
 	// Multipath co-loss estimation (N5). When the sender spreads across N paths, systematic
 	// id k rides path k mod N, so each block of N consecutive ids forms one aligned slot. The
@@ -233,7 +252,11 @@ func (r *Receiver) FeedSymbolECN(now clock.Timestamp, datagram []byte, ecn ECN) 
 	// before the cursor/deadline gates. Each id's systematic arrives once, so this
 	// counts each network delivery once.
 	if sym.Kind == wire.Systematic {
-		r.observeLoss(sym.SrcIndex, sym.PathID)
+		if r.reorderEnabled() {
+			r.reseqFeed(now, sym.SrcIndex, sym.PathID)
+		} else {
+			r.observeLoss(sym.SrcIndex, sym.PathID)
+		}
 		if sym.HasFrameDesc {
 			r.noteFrame(sym)
 		}
@@ -274,6 +297,9 @@ func (r *Receiver) FeedSymbolECN(now clock.Timestamp, datagram []byte, ecn ECN) 
 // Tick advances receiver time, enforcing deadline eviction and emitting periodic
 // feedback even when no symbol arrives.
 func (r *Receiver) Tick(now clock.Timestamp) {
+	if r.reorderEnabled() {
+		r.reseqDrain(now) // settle losses whose holdoff expired without a new arrival
+	}
 	r.pump(now)
 	r.maybeFeedback(now)
 }
@@ -458,6 +484,23 @@ func (r *Receiver) frameStartAt(id uint32) (uint32, uint16, bool) {
 	return 0, 0, false
 }
 
+// frameDeadline returns the access unit's display deadline taken from an ARRIVED chunk's EXACT
+// stamp (every chunk of a burst-written frame shares one deadline) and whether any chunk has
+// supplied one. It deliberately never EXTRAPOLATES: the uniform per-id fit is invalid for bursty
+// streams, so a not-yet-arrived chunk gets the frame's real deadline from a sibling, not a
+// reorder-skewed estimate. Returns false only if no chunk of the frame has arrived (then the
+// caller falls back to the refDL backstop).
+func (r *Receiver) frameDeadline(start, end uint32) (clock.Timestamp, bool) {
+	var dl clock.Timestamp
+	found := false
+	for id := start; id < end; id++ {
+		if s, ok := r.symDL[id]; ok && (!found || s < dl) {
+			dl, found = s, true
+		}
+	}
+	return dl, found
+}
+
 // pumpFrame resolves a whole access unit [start, start+length) atomically: it delivers every
 // chunk together once they are ALL recoverable in time, or drops every chunk together (a clean
 // gap, never a fragment) once the frame is doomed or its deadline passes incomplete. Returns
@@ -468,7 +511,14 @@ func (r *Receiver) pumpFrame(now clock.Timestamp, start uint32, length uint16) b
 		r.dropFrame(start, end)
 		return true
 	}
-	d, dKnown := r.deadlineOf(start) // the frame's display deadline (its first chunk's stamp)
+	// The frame's display deadline is taken from an ARRIVED chunk's EXACT stamp: every chunk of an
+	// access unit is written as one burst (one instant), so they share one deadline. Never extrapolate
+	// it — the uniform per-id fit (deadlineOf's fallback) is invalid for burst-written frames, where a
+	// reorder-skewed refID would place a not-yet-arrived chunk's deadline in the past and drop a frame
+	// whose chunks are merely reordered-late. At least one chunk always carries the descriptor that put
+	// us here, so a stamp is present; if somehow none is, dKnown is false and only the refDL backstop
+	// (the provably-past gate) can mark the frame overdue.
+	d, dKnown := r.frameDeadline(start, end)
 	overdue := (dKnown && now.After(d)) || (r.haveRef && r.refID >= start && now.After(r.refDL))
 	complete := true
 	for id := start; id < end; id++ {
@@ -588,6 +638,15 @@ func (r *Receiver) resolveFrame(start uint32) {
 			break
 		}
 		if ref := r.frames[refStart]; ref != nil {
+			// A dependency must be finalized before its dependent. References are EARLIER frames
+			// the cursor has already passed, so resolving one now is safe and gives its TRUE
+			// decodability. Without this, reorder/eviction can finalize a dependent before its
+			// reference resolves, read the reference as not-yet-resolved (which is NOT the same as
+			// undecodable), and wrongly doom the dependent and everything that transitively
+			// references it — a whole-tail cascade from one out-of-order resolution.
+			if !ref.resolved {
+				r.resolveFrame(refStart)
+			}
 			dec = ref.resolved && ref.decodable
 		} else {
 			dec = r.idDelivered[refStart]
@@ -697,6 +756,36 @@ func (r *Receiver) reap() {
 	}
 }
 
+const structuralGapDeficit = 0xFF
+
+func (r *Receiver) structuralGapReady(now clock.Timestamp) bool {
+	if !r.structGapActive || r.structGapCursor != r.cursor {
+		r.structGapActive = true
+		r.structGapCursor = r.cursor
+		r.structGapAt = now
+		return false
+	}
+	return now.Sub(r.structGapAt) >= r.structuralGapHoldoff()
+}
+
+func (r *Receiver) clearStructuralGap() {
+	r.structGapActive = false
+}
+
+func (r *Receiver) structuralGapHoldoff() int64 {
+	h := r.reorderMarginUs()
+	if floor := r.cfg.BufferMicros / 4; floor > h {
+		h = floor
+	}
+	if h <= 0 {
+		h = feedbackIntervalMicros
+	}
+	if cap := r.cfg.BufferMicros / 2; cap > 0 && h > cap {
+		h = cap
+	}
+	return h
+}
+
 func (r *Receiver) maybeFeedback(now clock.Timestamp) {
 	if r.fedOnce && now.Sub(r.lastFB) < feedbackIntervalMicros {
 		return
@@ -709,6 +798,7 @@ func (r *Receiver) maybeFeedback(now clock.Timestamp) {
 	// sender's reactive walk mirrors this exactly.
 	var defs [wire.MaxFeedbackGens]uint8
 	if base, ok := r.genBaseContaining(r.cursor); ok {
+		r.clearStructuralGap()
 		for i := range defs {
 			g := r.gens[base]
 			if g == nil {
@@ -722,6 +812,16 @@ func (r *Receiver) maybeFeedback(now clock.Timestamp) {
 			}
 			base += uint32(g.n)
 		}
+	} else if r.cursor < r.highestSeen {
+		if r.structuralGapReady(now) {
+			// The cursor is blocked on a generation for which no symbol arrived, so the receiver
+			// has no decoder state and cannot compute a rank deficit. Report a saturated deficit
+			// for the cursor generation; the sender walks its retained boundaries and clamps this
+			// to that generation's width.
+			defs[0] = structuralGapDeficit
+		}
+	} else {
+		r.clearStructuralGap()
 	}
 	var ceFrac uint16
 	if r.ecnSeen > 0 {
@@ -768,6 +868,116 @@ func ppmToP65535(ppm int) uint16 {
 		v = 65535
 	}
 	return uint16(v)
+}
+
+// maxReorderDepth bounds the resequencer's in-flight set: if this many ids pile up above the
+// still-missing low edge, the low edge is declared lost regardless of holdoff (a conservative
+// fallback that bounds memory and forces progress on a pathological reorder/loss burst).
+const maxReorderDepth = 1024
+
+// reorderMarginUs is how long a NOT-yet-arrived id whose deadline is only EXTRAPOLATED (no received
+// stamp) is given before the deadline path evicts it — the measured reorder spread, so a reordered-late
+// id is not dropped on a deadline computed (under reorder) from a skewed refID before it can arrive. A
+// genuinely lost id is still evicted one margin later; an id with its OWN received stamp is unaffected.
+func (r *Receiver) reorderMarginUs() int64 {
+	m := r.reorderHoldUs
+	if r.cfg.ReorderHoldoffMicros > m {
+		m = r.cfg.ReorderHoldoffMicros
+	}
+	return m
+}
+
+// reorderEnabled reports whether the loss-estimate reorder window is active. Works on single-path and
+// multipath: each held id is replayed to observeLoss in order with its OWN stamped pathID, so the
+// multipath co-loss estimator sees the same arrived/lost facts it would without the window — only
+// with reordered-late ids correctly counted received rather than as fictitious per-path loss.
+func (r *Receiver) reorderEnabled() bool {
+	return r.cfg.ReorderHoldoffMicros > 0 || r.cfg.AutoReorderHoldoff
+}
+
+// holdoffMicros is the effective reorder window: the fixed config value, or — under
+// AutoReorderHoldoff — the measured reorder spread plus a quarter margin, capped at half the deadline
+// budget (holding longer than the budget would let the symbol miss its deadline regardless).
+func (r *Receiver) holdoffMicros() int64 {
+	if r.cfg.ReorderHoldoffMicros > 0 {
+		return r.cfg.ReorderHoldoffMicros
+	}
+	h := r.reorderHoldUs + r.reorderHoldUs/4
+	if cap := r.cfg.BufferMicros / 2; cap > 0 && h > cap {
+		h = cap
+	}
+	return h
+}
+
+// reseqFeed routes a first-arrival systematic id through the reorder window before the loss
+// estimators. It records the arrival, then drains every id whose verdict has now settled — RECEIVED
+// (it arrived) or LOST (still missing past the holdoff) — feeding observeLoss the received ids in
+// strict increasing order, so the gaps observeLoss infers between them are genuine losses, not reorder.
+func (r *Receiver) reseqFeed(now clock.Timestamp, id uint32, pathID uint8) {
+	if !r.reseqStarted {
+		r.reseqStarted, r.reseqNext, r.reseqHigh = true, id, id
+		r.reseqSeen = make(map[uint32]uint8)
+		r.observeLoss(id, pathID) // the first id is in order by definition
+		r.reseqNext = id + 1
+		return
+	}
+	if id < r.reseqNext {
+		// Arrived after it was already declared lost ⇒ the window was too short for this reorder. Grow
+		// it (a kickstart from zero plus a quarter), capped, so the next such reorder is held long enough.
+		if r.cfg.AutoReorderHoldoff && r.cfg.ReorderHoldoffMicros == 0 {
+			r.reorderHoldUs += r.reorderHoldUs/4 + 2_000
+			if cap := r.cfg.BufferMicros / 2; cap > 0 && r.reorderHoldUs > cap {
+				r.reorderHoldUs = cap
+			}
+		}
+		return // already settled — ignore for the loss estimate
+	}
+	r.reseqSeen[id] = pathID // remember the stamped path so the in-order replay carries the right one
+	if id > r.reseqHigh {
+		r.reseqHigh = id
+	}
+	r.reseqDrain(now)
+}
+
+// reseqDrain settles ids from reseqNext upward: an arrived id is fed to observeLoss in order; a
+// still-missing id with a higher id present is held until the holdoff expires (or the in-flight set
+// would exceed the depth cap), then skipped — the next received id's gap counts it lost. A contiguous
+// lost run shares one gap-open time, so it drains in one holdoff. Called on arrival and on Tick (the
+// holdoff can expire with no new arrival). Each received id is replayed with its OWN stamped pathID.
+func (r *Receiver) reseqDrain(now clock.Timestamp) {
+	if !r.reseqStarted {
+		return
+	}
+	holdoff := r.holdoffMicros()
+	for {
+		if pid, ok := r.reseqSeen[r.reseqNext]; ok {
+			if r.cfg.AutoReorderHoldoff && r.reseqGapAt != 0 { // a held gap that just FILLED — a reorder sample
+				if s := now.Sub(r.reseqGapAt); s > r.reorderHoldUs {
+					r.reorderHoldUs = s // max-hold up to cover the observed spread
+				} else {
+					r.reorderHoldUs -= r.reorderHoldUs / 8 // decay toward the recent spread
+				}
+			}
+			delete(r.reseqSeen, r.reseqNext)
+			r.observeLoss(r.reseqNext, pid)
+			r.reseqNext++
+			r.reseqGapAt = 0
+			continue
+		}
+		if r.reseqHigh > r.reseqNext { // reseqNext is a gap — a higher id has arrived
+			if r.reseqGapAt == 0 {
+				r.reseqGapAt = now
+			}
+			if now.Sub(r.reseqGapAt) >= holdoff || r.reseqHigh-r.reseqNext > maxReorderDepth {
+				if r.cfg.AutoReorderHoldoff {
+					r.reorderHoldUs -= r.reorderHoldUs / 16 // a confirmed loss is not reorder — let the window relax
+				}
+				r.reseqNext++ // lost; the next received id's gap will count it (keep reseqGapAt for the run)
+				continue
+			}
+		}
+		return
+	}
 }
 
 // observeLoss updates the channel-erasure-rate estimate from a first-arrival

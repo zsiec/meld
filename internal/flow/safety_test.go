@@ -80,7 +80,7 @@ func TestTokenBucketBoundsReflection(t *testing.T) {
 	s := NewSender(cfg)
 
 	now := clock.Timestamp(0)
-	for i := 0; i < 2*cfg.GenSize; i++ { // two full generations, retained
+	for i := 0; i < wire.MaxFeedbackGens*cfg.GenSize; i++ { // one full feedback window, retained
 		s.Write(now, make([]byte, testSym))
 		now = now.Add(200)
 	}
@@ -119,6 +119,36 @@ func TestTokenBucketBoundsReflection(t *testing.T) {
 	}
 	if emitted*2 > attempts {
 		t.Fatalf("bucket clipped too little: emitted %d of %d attempted bytes", emitted, attempts)
+	}
+}
+
+func TestReactiveRepairClampsSaturatedDeficit(t *testing.T) {
+	cfg := testConfig()
+	cfg.BufferMicros = 2_000_000 // keep the generation retained
+	s := NewSender(cfg)
+
+	now := clock.Timestamp(0)
+	for i := 0; i < cfg.GenSize; i++ {
+		s.Write(now, make([]byte, testSym))
+		now = now.Add(200)
+	}
+	drainSend(s) // discard systematic + proactive repair; only count the reactive attempt below
+
+	var defs [wire.MaxFeedbackGens]uint8
+	defs[0] = 255
+	before := s.Stats()
+	s.FeedFeedback(now.Add(50_000), wire.Feedback{
+		Flow:           cfg.Flow,
+		DecodedLowEdge: 0,
+		HighestSeen:    uint32(cfg.GenSize),
+		LossRate:       65535,
+		Deficits:       defs,
+	})
+	after := s.Stats()
+	attempted := int(after.Repair + after.Throttled - before.Repair - before.Throttled)
+	limit := maxRepairFactor * cfg.GenSize
+	if attempted > limit {
+		t.Fatalf("saturated deficit attempted %d reactive repairs, want <= %d", attempted, limit)
 	}
 }
 

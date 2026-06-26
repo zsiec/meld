@@ -449,11 +449,19 @@ func (s *Sender) reactiveRepair(now clock.Timestamp, g *retGen, deficit int) {
 	if now.After(g.deadline) {
 		return // too late to matter
 	}
+	if deficit > g.n {
+		deficit = g.n
+	}
+	if deficit <= 0 {
+		return
+	}
 	// Cap total reactive repair per generation: once a generation has been served ~maxRepairFactor·n
 	// and is STILL deficient, the channel is erasing faster than repair can fix within the budget, so
 	// stop flooding it (its remaining holes are skipped at the deadline). Bounds the per-generation
 	// repair keyspace and the work a persistently-unrecoverable generation can demand.
-	if int(g.nextKey)-g.proactive >= maxRepairFactor*g.n {
+	reactiveSent := int(g.nextKey) - g.proactive
+	remaining := maxRepairFactor*g.n - reactiveSent
+	if remaining <= 0 {
 		return
 	}
 	// Expire in-flight reactive repair presumed LOST: a batch sent longer ago than one reflection
@@ -507,6 +515,9 @@ func (s *Sender) reactiveRepair(now clock.Timestamp, g *retGen, deficit int) {
 	// budget that should climb the dependency spine was spread evenly on every deficit.
 	delta := targetFailureForTier(effectiveProtectionTier(g.pri, g.minTID), s.cfg.targetFailure())
 	extra := symbolsForDeficit(effective, p, delta, maxRepairFactor)
+	if extra > remaining {
+		extra = remaining
+	}
 	for i := 0; i < extra; i++ {
 		s.emitRepair(g.enc, g.nextKey, g.n, g.pri, true)
 		g.nextKey++
