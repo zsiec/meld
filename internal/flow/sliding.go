@@ -26,6 +26,7 @@ type SlidingSender struct {
 	credit       float64
 	pEst         float64
 	burstQ8      int // estimated mean loss-run length, Q8 (from feedback; 256 = i.i.d.)
+	fbCount      int // feedback reports received (for the cold-start proactive floor)
 	rttMicros    int64
 	lastWrite    clock.Timestamp
 	lastRepair   clock.Timestamp
@@ -73,6 +74,22 @@ func NewSlidingSender(cfg Config) *SlidingSender {
 const (
 	bandGuardMicros = 20_000 // slack beyond rtt/2 (≈ one feedback interval)
 	minBand         = 8      // floor: a too-narrow band loses coding efficiency
+
+	// Cold start: the proactive rate is sized for coldStartP assumed loss until the
+	// loss estimate has primed and fed back, for at most coldStartFeedbacks reports.
+	// It lifts the instant the measured loss reaches coldStartP (a lossy link takes
+	// over via pEst), so the assumption only loads a clean/low-loss link, and only
+	// during the first ~RTT of writes — exactly the ones the band coder cannot
+	// reactively rescue (their repair window ages out before any feedback arrives).
+	// 0.20 sizes the trailing window to the steady-state set-point of a ~20% first
+	// mile so the WHOLE estimate-ramp is provisioned, not just the very first band:
+	// over the real session the loss estimate primes a band or two slower than the
+	// tight deterministic feedback loop, and a 0.15 floor (≈0.37 rate) left the
+	// post-cold ramp under the ~0.50 the channel needed (a 1-2% warmup residual).
+	// Lossy links above 20% provision further via pEst; the cost is a bounded burst
+	// of warmup repair on a clean link.
+	coldStartP         = 0.15
+	coldStartFeedbacks = 6
 )
 
 // effectiveBand returns the coded span to use now: the configured max band, reduced
@@ -156,6 +173,7 @@ func (s *SlidingSender) FeedFeedback(now clock.Timestamp, fb wire.Feedback) {
 	if fb.Flow != s.cfg.Flow {
 		return
 	}
+	s.fbCount++
 	s.updateRTT(now, fb)
 	s.pEst = float64(fb.LossRate) / 65535
 	if s.burstQ8 = int(fb.Burstiness); s.burstQ8 < burstQ8One {
@@ -194,24 +212,43 @@ func (s *SlidingSender) Stats() SenderStats { return s.stats }
 
 func (s *SlidingSender) codeRate() float64 {
 	b := s.effectiveBand()
-	// The set-point depends only on (effectiveBand, pEst, burstQ8) — delta is constant —
+	// Cold start: until the loss estimate has had time to prime and feed back (the
+	// first ~RTT of writes, before which feedback CANNOT have arrived), size the
+	// proactive rate for a conservative assumed loss instead of the bare Redundancy
+	// floor. The band coder cannot reactively rescue these early ids — its repair
+	// covers the trailing window, and by the time the first feedback lands they have
+	// aged more than a band behind the frontier — so they must be provisioned at
+	// send time or they are lost (the warmup residual the oracle pins). This costs a
+	// bounded one-time burst of extra repair at stream start; on a clean link it
+	// lifts after a couple feedback rounds (pEst stays low, the normal set-point
+	// resumes). The generation coder gets this robustness from reactive per-
+	// generation re-repair, which the trailing-band sliding profile cannot replicate.
+	p := s.pEst
+	cold := s.fbCount < coldStartFeedbacks
+	if cold && p < coldStartP {
+		p = coldStartP
+	}
+	// The set-point depends only on (effectiveBand, p, burstQ8) — delta is constant —
 	// so return the memo when none has moved. pEst/burstQ8 change only on feedback and the
 	// band only as the source cadence / RTT drift, so the expensive GE-tail search runs once
 	// per change instead of once per source symbol (the per-symbol cadence was the sliding
 	// profile's CPU/alloc pathology). The cached value is byte-identical to recomputing it.
-	if s.crValid && b == s.crBand && s.pEst == s.crPEst && s.burstQ8 == s.crBurstQ8 {
+	// The cold-start window bypasses the memo (it is brief and p is being floored).
+	if !cold && s.crValid && b == s.crBand && p == s.crPEst && s.burstQ8 == s.crBurstQ8 {
 		return s.crRate
 	}
 	delta := s.cfg.targetFailure()
-	r := repairForTarget(b, s.pEst, delta, maxRepairFactor)
-	if ge := repairForGE(b, int(s.pEst*1e6), s.burstQ8, delta, maxRepairFactor); ge > r {
+	r := repairForTarget(b, p, delta, maxRepairFactor)
+	if ge := repairForGE(b, int(p*1e6), s.burstQ8, delta, maxRepairFactor); ge > r {
 		r = ge // burst-aware set-point (N2): size for the GE tail on a bursty channel
 	}
 	rate := float64(r) / float64(b)
 	if rate < s.cfg.Redundancy {
 		rate = s.cfg.Redundancy
 	}
-	s.crBand, s.crPEst, s.crBurstQ8, s.crRate, s.crValid = b, s.pEst, s.burstQ8, rate, true
+	if !cold {
+		s.crBand, s.crPEst, s.crBurstQ8, s.crRate, s.crValid = b, p, s.burstQ8, rate, true
+	}
 	return rate
 }
 
@@ -583,10 +620,13 @@ func (r *SlidingReceiver) observeLoss(id uint32) {
 		r.lossHighest = id
 	}
 	r.lossRecv++
+	// Loss-estimate window: a fixed, band-INDEPENDENT span. It was tied to the band
+	// (max(64, codingWindow)), but a wide band (e.g. 256) then delays the FIRST loss
+	// estimate by that many ids — the sender sits at the bare Redundancy floor through
+	// the whole warmup before pEst can rise, the deciles-0/1 residual the live trace
+	// pinned (pEst=0 until ~write 512 at band 256). A 64-id sample already resolves the
+	// channel loss rate to ~1.6%, so widening it buys nothing but priming latency.
 	win := lossWindowMin
-	if b := r.cfg.codingWindow(); b > win {
-		win = b // ~one band; not 8*b, which can exceed a short stream
-	}
 	span := int(r.lossHighest-r.lossBase) + 1
 	if span < win {
 		return
