@@ -111,6 +111,13 @@ func NewSender(remote string, cfg flow.Config, sec *SecurityConfig) (*Sender, er
 	return newSender(sub, cfg, clock.NewRealClock(), sec)
 }
 
+// NewSenderOver builds a coded sender over a caller-provided Substrate instead of dialing UDP. The
+// host supplies the datagram transport — a WebTransport session, an in-WASM bridge to the browser's
+// transport, an in-process pipe — so the same coder runs anywhere a datagram pipe exists.
+func NewSenderOver(sub Substrate, cfg flow.Config, sec *SecurityConfig) (*Sender, error) {
+	return newSender(sub, cfg, clock.NewRealClock(), sec)
+}
+
 // pmtudConfigFromCfg builds the DPLPMTUD state-machine config from the public flow.Config
 // (the ceiling from MaxProbeMTU; base and timers from defaults).
 func pmtudConfigFromCfg(cfg flow.Config) pmtudConfig {
@@ -525,6 +532,13 @@ func NewReceiver(bind string, cfg flow.Config, sec *SecurityConfig) (*Receiver, 
 		return nil, err
 	}
 	return r, nil
+}
+
+// NewReceiverOver builds a coded receiver over a caller-provided Substrate instead of binding a UDP
+// socket — the receive-side counterpart of NewSenderOver, for running meld over WebTransport, a WASM
+// bridge, or any host-owned datagram transport.
+func NewReceiverOver(sub Substrate, cfg flow.Config, sec *SecurityConfig) (*Receiver, error) {
+	return newReceiver(sub, cfg, clock.NewRealClock(), sec)
 }
 
 // newReceiver builds the receive host on sub with a given clock and starts its
