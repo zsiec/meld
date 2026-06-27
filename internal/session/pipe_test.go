@@ -2,6 +2,8 @@ package session
 
 import (
 	"bytes"
+	"errors"
+	"io"
 	"net"
 	"sync"
 	"testing"
@@ -28,6 +30,17 @@ type pipeSubstrate struct {
 	peer  *pipeSubstrate
 	done  chan struct{}
 	once  sync.Once
+}
+
+type shortWriteSubstrate struct {
+	*pipeSubstrate
+}
+
+func (s shortWriteSubstrate) WriteTo(b []byte, addr net.Addr) (int, error) {
+	if len(b) == 0 {
+		return 0, nil
+	}
+	return len(b) - 1, nil
 }
 
 // newPipe returns two cross-linked endpoints of an in-memory datagram pipe.
@@ -111,5 +124,97 @@ func TestSeamOverPipe(t *testing.T) {
 	st := rx.Stats()
 	if st.Delivered < n {
 		t.Fatalf("delivered %d, want >= %d", st.Delivered, n)
+	}
+}
+
+func TestSeamOverPipeLargeSymbolNotTruncated(t *testing.T) {
+	cfg := flow.Config{Flow: 7, SymbolSize: 4096, GenSize: 1, Redundancy: 0, BufferMicros: 200_000}
+	txEnd, rxEnd := newPipe("tx", "rx", 16)
+	rx, err := newReceiver(rxEnd, cfg, clock.NewRealClock(), nil)
+	if err != nil {
+		t.Fatalf("newReceiver: %v", err)
+	}
+	defer rx.Close()
+	tx, err := newSender(txEnd, cfg, clock.NewRealClock(), nil)
+	if err != nil {
+		t.Fatalf("newSender: %v", err)
+	}
+	defer tx.Close()
+
+	want := make([]byte, cfg.SymbolSize)
+	for i := range want {
+		want[i] = byte(i)
+	}
+	if _, err := tx.Write(want); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	tx.Flush()
+
+	rx.SetReadDeadline(time.Now().Add(2 * time.Second))
+	got := make([]byte, cfg.SymbolSize)
+	n, err := rx.Read(got)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !bytes.Equal(got[:n], want) {
+		t.Fatalf("large symbol truncated or corrupted: got %d bytes", n)
+	}
+}
+
+func TestCleartextOversizedWriteRejected(t *testing.T) {
+	cfg := flow.Config{Flow: 7, SymbolSize: 64, GenSize: 4, Redundancy: 0.25, BufferMicros: 200_000}
+	txEnd, _ := newPipe("tx", "rx", 16)
+	tx, err := newSender(txEnd, cfg, clock.NewRealClock(), nil)
+	if err != nil {
+		t.Fatalf("newSender: %v", err)
+	}
+	defer tx.Close()
+
+	tooLarge := make([]byte, cfg.SymbolSize+1)
+	for name, write := range map[string]func([]byte) (int, error){
+		"Write":      tx.Write,
+		"WriteUnit":  func(p []byte) (int, error) { return tx.WriteUnit(p, 2) },
+		"WriteFrame": func(p []byte) (int, error) { return tx.WriteFrame(p, flow.FrameDesc{Priority: 2}) },
+	} {
+		n, err := write(tooLarge)
+		if !errors.Is(err, ErrChunkTooLarge) {
+			t.Fatalf("%s oversized error = %v, want ErrChunkTooLarge", name, err)
+		}
+		if n != 0 {
+			t.Fatalf("%s oversized wrote %d bytes, want 0", name, n)
+		}
+	}
+}
+
+func TestNewOverRejectsNilSubstrate(t *testing.T) {
+	cfg := flow.Config{Flow: 7, SymbolSize: 64, GenSize: 4, Redundancy: 0.25, BufferMicros: 200_000}
+	if _, err := newSender(nil, cfg, clock.NewRealClock(), nil); !errors.Is(err, ErrNilSubstrate) {
+		t.Fatalf("newSender(nil) error = %v, want ErrNilSubstrate", err)
+	}
+	if _, err := newReceiver(nil, cfg, clock.NewRealClock(), nil); !errors.Is(err, ErrNilSubstrate) {
+		t.Fatalf("newReceiver(nil) error = %v, want ErrNilSubstrate", err)
+	}
+	var typedNil *pipeSubstrate
+	if _, err := newSender(typedNil, cfg, clock.NewRealClock(), nil); !errors.Is(err, ErrNilSubstrate) {
+		t.Fatalf("newSender(typed nil) error = %v, want ErrNilSubstrate", err)
+	}
+}
+
+func TestShortWriteSubstrateFailsWrite(t *testing.T) {
+	cfg := flow.Config{Flow: 7, SymbolSize: 64, GenSize: 4, Redundancy: 0, BufferMicros: 200_000}
+	txEnd, _ := newPipe("tx", "rx", 16)
+	tx, err := newSender(shortWriteSubstrate{txEnd}, cfg, clock.NewRealClock(), nil)
+	if err != nil {
+		t.Fatalf("newSender: %v", err)
+	}
+	defer tx.Close()
+
+	payload := make([]byte, cfg.SymbolSize)
+	n, err := tx.Write(payload)
+	if !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("Write error = %v, want io.ErrShortWrite", err)
+	}
+	if n != len(payload) {
+		t.Fatalf("Write returned n=%d, want %d", n, cfg.SymbolSize)
 	}
 }

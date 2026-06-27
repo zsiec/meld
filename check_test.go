@@ -22,16 +22,17 @@ func TestConfigCheck(t *testing.T) {
 	}{
 		// AutoGenSize is on by DefaultConfig and needs no hints, so the default config is silent;
 		// the AdaptiveGenSize warnings are about the MANUAL form, so those cases turn AutoGenSize off
-		// (it takes precedence and would otherwise suppress the warning, correctly).
+		// and select the generation coder (AutoGenSize takes precedence and Sliding ignores the
+		// generation-width hints).
 		{"default (AutoGenSize on) — silent", func(c *meld.Config) {}, ""},
 		{"AdaptiveGenSize, no RTT hint", func(c *meld.Config) {
-			c.AutoGenSize, c.AdaptiveGenSize = false, true
+			c.AutoGenSize, c.Sliding, c.AdaptiveGenSize = false, false, true
 		}, "NominalRTTMicros"},
 		{"AdaptiveGenSize, RTT but no bitrate", func(c *meld.Config) {
-			c.AutoGenSize, c.AdaptiveGenSize, c.NominalRTTMicros = false, true, 40_000
+			c.AutoGenSize, c.Sliding, c.AdaptiveGenSize, c.NominalRTTMicros = false, false, true, 40_000
 		}, "NominalBitrateBps"},
 		{"AdaptiveGenSize fully configured", func(c *meld.Config) {
-			c.AutoGenSize, c.AdaptiveGenSize, c.NominalRTTMicros, c.NominalBitrateBps = false, true, 40_000, 50_000_000
+			c.AutoGenSize, c.Sliding, c.AdaptiveGenSize, c.NominalRTTMicros, c.NominalBitrateBps = false, false, true, 40_000, 50_000_000
 		}, ""},
 		{"AutoGenSize on suppresses the AdaptiveGenSize warning", func(c *meld.Config) {
 			c.AdaptiveGenSize = true // AutoGenSize already on (default) ⇒ no warning

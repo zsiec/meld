@@ -180,6 +180,33 @@ func (e *Encoder) RepairWindow(repairKey uint16, ew int) (base uint32, n int, pa
 	return e.base + uint32(start), n, payload
 }
 
+// RepairSparse builds a repair symbol over the explicitly listed source ids. ids
+// must be strictly increasing and currently retained. It is the protected-layer
+// companion to RepairWindow: the equation codes only the listed columns, so
+// unrelated symbols inside the same span do not consume rank.
+func (e *Encoder) RepairSparse(repairKey uint16, ids []uint32) (payload []byte, ok bool) {
+	if len(ids) == 0 {
+		return nil, false
+	}
+	payload = e.symBuf() // zeroed, ready to accumulate the linear combination
+	coeffs := GenCoeffs(repairKey, len(ids))
+	var prev uint32
+	for i, id := range ids {
+		if i > 0 && id <= prev {
+			e.Recycle(payload)
+			return nil, false
+		}
+		src, ok := e.Source(id)
+		if !ok {
+			e.Recycle(payload)
+			return nil, false
+		}
+		gf.MulAdd(payload, src, coeffs[i])
+		prev = id
+	}
+	return payload, true
+}
+
 // SlideTo drops every source symbol with id < newBase from the window (deadline
 // eviction). It is a no-op if newBase is at or below the current base.
 func (e *Encoder) SlideTo(newBase uint32) {

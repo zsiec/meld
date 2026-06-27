@@ -199,15 +199,15 @@ RAPs, parameter sets / sequence headers, or sticky HDR metadata.
 - **`confidence` gates aggressiveness:** signaled streams (AV1/HEVC) let the
   controller drop disposable units confidently; inferred streams (baseline AVC)
   get conservative protection.
-- **Code family is class-driven, not codec-driven** — the top class (parameter
-  sets / IDR/IRAP / JPEG XS LL) wants a near-optimal *block* engine (RaptorQ); the
-  steady classes want low-latency sliding-window coding. See [coding.md](coding.md).
-- **The media work is done**: the four shapers parse their own bitstream
-  headers (AV1/HEVC/AVC slice/OBU parsers + JPEG XS from spec — no `prism` dependency),
-  resolve dependencies exactly (see "As built" in §3), and are scored on
-  **decodable-keyframe %** glass-to-glass against ffprobe — the metric that proves
-  "protect the picture" beats "recover bytes" (`docs/bench.md`). The receiver consumes the
-  model for both a parse-free decodable-frame stat and media-aware early eviction.
+- **Code family is class-driven, not codec-driven** — the current shipped code uses one
+  systematic RLNC engine. Earlier RaptorQ/block-fountain exploration is closed in
+  [coding.md](coding.md); revisit only if a future target needs a distinct block engine.
+- **The sliding media path uses descriptors now**: the shapers parse their own
+  bitstream headers (AV1/HEVC/AVC slice/OBU parsers + first-cut JPEG XS codestream
+  framing, no `prism` dependency), resolve dependencies for the supported descriptors,
+  and are scored on **decodable-keyframe %** glass-to-glass against ffprobe. The
+  default sliding path uses descriptors for UEP, recovery-refresh metadata, and
+  parse-free frame stats. Frame-atomic delivery remains generation-only.
 
 ---
 

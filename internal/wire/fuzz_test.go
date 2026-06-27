@@ -14,6 +14,7 @@ func FuzzDecodeNoPanic(f *testing.F) {
 	f.Add([]byte{})
 	f.Add([]byte{typeSystematic})
 	f.Add(EncodeSymbol(nil, Symbol{Flow: 1, Kind: Repair, N: 4, Payload: []byte("abc")}))
+	f.Add(EncodeSymbol(nil, Symbol{Flow: 1, Kind: SparseRepair, SparseIDs: []uint32{3, 8, 13}, Payload: []byte("abc")}))
 	f.Add(EncodeFeedback(nil, Feedback{Flow: 9, Deficit: 2}))
 	f.Add(EncodeMTUProbe(nil, 0xdeadbeef, 1400))
 	f.Add(EncodeMTUProbeAck(nil, 0xdeadbeef, 1400))
@@ -62,8 +63,10 @@ func FuzzDecodeNoPanic(f *testing.F) {
 func symbolEqual(a, b Symbol) bool {
 	return a.Flow == b.Flow && a.Epoch == b.Epoch && a.PathID == b.PathID && a.Kind == b.Kind && a.WindowBase == b.WindowBase &&
 		a.SrcIndex == b.SrcIndex && a.N == b.N && a.RepairKey == b.RepairKey &&
+		u32eq(a.SparseIDs, b.SparseIDs) &&
 		a.Priority == b.Priority && a.Deadline == b.Deadline && a.SendTimestamp == b.SendTimestamp &&
 		a.HasFrameDesc == b.HasFrameDesc && a.FrameLen == b.FrameLen && a.FrameStart == b.FrameStart && u32eq(a.FrameRefs, b.FrameRefs) &&
-		a.FrameRAP == b.FrameRAP && a.FrameDiscardable == b.FrameDiscardable &&
+		a.FrameRAP == b.FrameRAP && a.FrameRecoveryRefresh == b.FrameRecoveryRefresh &&
+		a.FrameDiscardable == b.FrameDiscardable && a.FrameNonPicture == b.FrameNonPicture &&
 		bytes.Equal(a.Payload, b.Payload)
 }

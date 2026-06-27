@@ -184,6 +184,11 @@ Three NAL-to-RTP modes:
   within a picture — but only if you confirm no inter-slice dependency.
 - **Filler (12) / SEI padding** can be large and pure waste — never spend repair on
   them; drop pre-coding.
+- **SEI source shedding is constrained-only.** By default, preserve SEI because it
+  can carry captions, HDR, buffering, or recovery-point metadata. When the encoder
+  or benchmark explicitly models a constrained source, drop only SEI that is
+  positively identified as non-recovery metadata; retain recovery_point(6) and
+  retain malformed/ambiguous SEI fail-safe.
 - **`nal_ref_idc` is necessary but not sufficient.** A `NRI>0` B (hierarchical-B
   anchor) *is* a reference — dropping it kills its sub-tree. Always read NRI; never
   infer disposability from `slice_type` alone.

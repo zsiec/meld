@@ -1,6 +1,7 @@
 package session
 
 import (
+	"bytes"
 	"errors"
 	"io"
 	"net"
@@ -17,6 +18,15 @@ import (
 // ErrNoPaths is returned when a multipath host is built without any path addresses.
 var ErrNoPaths = errors.New("meld: session: need at least one path")
 
+// ErrPathCountMismatch is returned when the flow path count and socket count disagree.
+var ErrPathCountMismatch = errors.New("meld: session: multipath path count mismatch")
+
+// ErrSlidingMultipathUnsupported is returned when the band-form sliding profile is
+// requested through the multipath host. Sliding symbols do not stamp PathID today.
+var ErrSlidingMultipathUnsupported = errors.New("meld: session: sliding multipath is not implemented")
+
+const feedbackDuplicateWindowMicros = 20_000
+
 // MultipathSender is the multi-socket transmit host: it runs an N-path flow.Sender
 // (flow.Config.Paths = N) and routes each emitted symbol to the socket of the path the
 // core's scheduler stamped it for (wire.Symbol.PathID). It owns one dialed UDP socket
@@ -27,8 +37,12 @@ var ErrNoPaths = errors.New("meld: session: need at least one path")
 type MultipathSender struct {
 	subs      []Substrate // one per path, index == PathID
 	clk       clock.Clock
+	cfg       flow.Config
 	mu        sync.Mutex
 	flow      coreSender
+	pace      *hostPacer
+	mtu       []*pmtudState
+	mtuNonce  []uint32
 	done      chan struct{}
 	closeOnce sync.Once
 
@@ -36,14 +50,23 @@ type MultipathSender struct {
 	hsInit *crypto.Initiator
 	hsMsg1 []byte
 	hsDone chan struct{}
+
+	lastFeedback   []byte
+	lastFeedbackAt clock.Timestamp
 }
 
 // NewMultipathSender dials one UDP socket per remote (remotes[i] is path i) and starts
 // the transmit host. cfg.Paths must match len(remotes). A non-nil active sec runs the
 // encryption handshake (on path 0) before returning.
 func NewMultipathSender(remotes []string, cfg flow.Config, sec *SecurityConfig) (*MultipathSender, error) {
+	if cfg.Sliding {
+		return nil, ErrSlidingMultipathUnsupported
+	}
 	if len(remotes) < 1 {
 		return nil, ErrNoPaths
+	}
+	if cfg.Paths != len(remotes) {
+		return nil, ErrPathCountMismatch
 	}
 	if err := sec.validate(cfg.SymbolSize); err != nil {
 		return nil, err
@@ -57,12 +80,32 @@ func NewMultipathSender(remotes []string, cfg flow.Config, sec *SecurityConfig) 
 		}
 		subs = append(subs, sub)
 	}
-	for _, sub := range subs {
-		_ = setECN(sub) // mark each path's outgoing data ECT(1) (L4S)
+	if usesL4SMarking(cfg) {
+		for _, sub := range subs {
+			_ = setECN(sub) // mark each path's outgoing data ECT(1) (L4S)
+		}
 	}
 	s := &MultipathSender{
-		subs: subs, clk: clock.NewRealClock(), flow: newCoreSender(cfg), done: make(chan struct{}),
+		subs: subs, clk: clock.NewRealClock(), cfg: cfg, flow: newCoreSender(cfg), done: make(chan struct{}),
 		sealState: newSealState(sec, cfg.SymbolSize, cfg.Flow),
+	}
+	if cfg.ProbeMTU {
+		s.mtu = make([]*pmtudState, len(subs))
+		s.mtuNonce = make([]uint32, len(subs))
+		for i, sub := range subs {
+			s.mtu[i] = newPMTUD(pmtudConfigFromCfg(cfg))
+			_ = setDontFragment(sub)
+		}
+	}
+	if cfg.Pace {
+		s.pace = newHostPacer(s.clk, s.flow.RateBudgetBitsPerSec()/8,
+			paceBurstMicros(cfg), paceQueueLimitMicros(cfg),
+			func(d []byte) (int, error) {
+				if err := s.writeRoutedDatagram(d); err != nil {
+					return 0, err
+				}
+				return len(d), nil
+			})
 	}
 	if sec.active() {
 		s.hsDone = make(chan struct{})
@@ -128,7 +171,7 @@ func (s *MultipathSender) write(p []byte, push func(clock.Timestamp, []byte)) (i
 	push(s.clk.Now(), data)
 	out := drainSend(s.flow)
 	s.mu.Unlock()
-	return len(p), s.transmit(out)
+	return len(p), s.sendOut(out)
 }
 
 // Flush closes the open generation (end of stream) and transmits its repair.
@@ -137,7 +180,7 @@ func (s *MultipathSender) Flush() {
 	s.flow.Flush(s.clk.Now())
 	out := drainSend(s.flow)
 	s.mu.Unlock()
-	s.transmit(out)
+	_ = s.sendOut(out)
 }
 
 // Stats returns the sender's emission counters.
@@ -147,10 +190,54 @@ func (s *MultipathSender) Stats() flow.SenderStats {
 	return s.flow.Stats()
 }
 
+// EncoderControl returns Meld's current advisory encoder-control request.
+func (s *MultipathSender) EncoderControl() flow.EncoderControl {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.flow.EncoderControl()
+}
+
+// PathMTUs returns each path's discovered PLPMTU in bytes. Entries are 0 when PMTUD is off.
+func (s *MultipathSender) PathMTUs() []int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]int, len(s.subs))
+	for i, p := range s.mtu {
+		if p != nil {
+			out[i] = p.PLPMTU()
+		}
+	}
+	return out
+}
+
+// PathMTU returns the path-set minimum PLPMTU in bytes, or 0 when PMTUD is off.
+func (s *MultipathSender) PathMTU() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return pathSetMin(s.mtu)
+}
+
+// PathMTUBlackHoles returns the aggregate number of DPLPMTUD black-hole events.
+func (s *MultipathSender) PathMTUBlackHoles() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	total := 0
+	for _, p := range s.mtu {
+		if p != nil {
+			total += p.BlackHoles()
+		}
+	}
+	return total
+}
+
 // Close flushes the tail, stops the goroutines, and closes every path substrate.
 func (s *MultipathSender) Close() error {
 	s.Flush()
 	s.closeOnce.Do(func() { close(s.done) })
+	if s.pace != nil {
+		s.pace.flushClose()
+		s.pace.stop()
+	}
 	closeConns(s.subs)
 	return nil
 }
@@ -160,8 +247,26 @@ func (s *MultipathSender) Close() error {
 // whichever path is healthy carries it, and the receiver answers on the path it arrived on.
 func (s *MultipathSender) broadcast(msg []byte) {
 	for _, sub := range s.subs {
-		sub.WriteTo(msg, nil)
+		_ = writeDatagram(sub, msg, nil)
 	}
+}
+
+func (s *MultipathSender) sendOut(out [][]byte) error {
+	if s.pace != nil {
+		return s.pace.put(out)
+	}
+	return s.transmit(out)
+}
+
+func (s *MultipathSender) pathForDatagram(d []byte) int {
+	if sym, err := wire.DecodeSymbol(d); err == nil && int(sym.PathID) < len(s.subs) {
+		return int(sym.PathID)
+	}
+	return 0
+}
+
+func (s *MultipathSender) writeRoutedDatagram(d []byte) error {
+	return writeDatagram(s.subs[s.pathForDatagram(d)], d, nil)
 }
 
 // transmit routes each datagram to the substrate of its stamped path. A symbol whose
@@ -169,11 +274,7 @@ func (s *MultipathSender) broadcast(msg []byte) {
 // surprise degrades to single-path rather than dropping media.
 func (s *MultipathSender) transmit(out [][]byte) error {
 	for _, d := range out {
-		p := 0
-		if sym, err := wire.DecodeSymbol(d); err == nil && int(sym.PathID) < len(s.subs) {
-			p = int(sym.PathID)
-		}
-		if _, err := s.subs[p].WriteTo(d, nil); err != nil {
+		if err := s.writeRoutedDatagram(d); err != nil {
 			return err
 		}
 	}
@@ -185,7 +286,7 @@ func (s *MultipathSender) transmit(out [][]byte) error {
 // single-path host but per path.
 func (s *MultipathSender) recvLoop(path int) {
 	sub := s.subs[path]
-	buf := make([]byte, 2048)
+	buf := make([]byte, recvBufferSize(s.cfg))
 	for {
 		n, _, err := sub.ReadFrom(buf)
 		if err != nil {
@@ -197,7 +298,12 @@ func (s *MultipathSender) recvLoop(path int) {
 		}
 		switch {
 		case wire.IsFeedback(t):
+			now := s.clk.Now()
 			s.mu.Lock()
+			if !s.ctl.active && s.duplicateCleartextFeedback(now, buf[:n]) {
+				s.mu.Unlock()
+				continue
+			}
 			d, ok := s.ctl.open(buf[:n]) // authenticate + replay-check feedback on an encrypted flow
 			if !ok {
 				s.mu.Unlock()
@@ -208,7 +314,10 @@ func (s *MultipathSender) recvLoop(path int) {
 				s.mu.Unlock()
 				continue
 			}
-			s.flow.FeedFeedback(s.clk.Now(), fb)
+			if !s.ctl.active {
+				s.rememberCleartextFeedback(now, buf[:n])
+			}
+			s.flow.FeedFeedback(now, fb)
 			s.mu.Unlock()
 		case wire.IsHandshakeResp(t):
 			s.handleHandshakeResp(buf[:n])
@@ -230,10 +339,30 @@ func (s *MultipathSender) recvLoop(path int) {
 			echo, ok := s.ctl.seal(wire.EncodeClockEcho(nil, wire.ClockEcho{T0: p.T0, T1: recv, T2: int64(s.clk.Now())}))
 			s.mu.Unlock()
 			if ok {
-				sub.WriteTo(echo, nil)
+				_ = writeDatagram(sub, echo, nil)
 			}
+		case wire.IsMTUProbeAck(t):
+			s.mu.Lock()
+			d, ok := s.ctl.open(buf[:n])
+			if ok && path < len(s.mtu) && s.mtu[path] != nil {
+				if nonce, size, e := wire.DecodeMTUProbeAck(d); e == nil && nonce == s.mtuNonce[path] {
+					s.mtu[path].onAck(s.clk.Now(), int(size))
+				}
+			}
+			s.mu.Unlock()
 		}
 	}
+}
+
+func (s *MultipathSender) duplicateCleartextFeedback(now clock.Timestamp, d []byte) bool {
+	return s.lastFeedbackAt != 0 &&
+		now.Sub(s.lastFeedbackAt) < feedbackDuplicateWindowMicros &&
+		bytes.Equal(s.lastFeedback, d)
+}
+
+func (s *MultipathSender) rememberCleartextFeedback(now clock.Timestamp, d []byte) {
+	s.lastFeedback = append(s.lastFeedback[:0], d...)
+	s.lastFeedbackAt = now
 }
 
 // handleHandshakeResp completes the initiator handshake from message 2 and unblocks the
@@ -296,10 +425,36 @@ func (s *MultipathSender) tickLoop() {
 				s.broadcast(msg) // resend handshake message 1 on every path until established
 				continue
 			}
-			s.flow.Tick(s.clk.Now())
+			now := s.clk.Now()
+			s.flow.Tick(now)
 			out := drainSend(s.flow)
+			budget := s.flow.RateBudgetBitsPerSec()
+			type pathProbe struct {
+				path int
+				data []byte
+			}
+			var probes []pathProbe
+			for i, mtu := range s.mtu {
+				if mtu == nil {
+					continue
+				}
+				if size, send := mtu.tick(now); send {
+					s.mtuNonce[i]++
+					if p, ok := s.ctl.seal(wire.EncodeMTUProbe(nil, s.mtuNonce[i], mtuProbeBodySize(size, s.ctl))); ok {
+						probes = append(probes, pathProbe{path: i, data: p})
+					}
+				}
+			}
 			s.mu.Unlock()
-			s.transmit(out)
+			if s.pace != nil {
+				s.pace.setRate(budget / 8)
+				s.pace.offer(out)
+			} else {
+				s.transmit(out)
+			}
+			for _, p := range probes {
+				_ = writeDatagram(s.subs[p.path], p.data, nil)
+			}
 		}
 	}
 }
@@ -344,6 +499,12 @@ type MultipathReceiver struct {
 // NewMultipathReceiver binds one socket per bind address (binds[i] is path i; use ":0"
 // for an ephemeral port) and starts the receive host.
 func NewMultipathReceiver(binds []string, cfg flow.Config, sec *SecurityConfig) (*MultipathReceiver, error) {
+	if cfg.Sliding {
+		return nil, ErrSlidingMultipathUnsupported
+	}
+	if cfg.Paths != len(binds) {
+		return nil, ErrPathCountMismatch
+	}
 	subs, err := bindAll(binds)
 	if err != nil {
 		return nil, err
@@ -379,6 +540,20 @@ func bindAll(binds []string) ([]Substrate, error) {
 // test seam for injecting per-path loss; nil in production), set BEFORE the goroutines
 // start so it is never read concurrently with a write, then starts the goroutines.
 func newMultipathReceiver(subs []Substrate, cfg flow.Config, clk clock.Clock, dropHook func(int, []byte) bool, sec *SecurityConfig) (*MultipathReceiver, error) {
+	if cfg.Sliding {
+		return nil, ErrSlidingMultipathUnsupported
+	}
+	if len(subs) < 1 {
+		return nil, ErrNoPaths
+	}
+	if cfg.Paths != len(subs) {
+		return nil, ErrPathCountMismatch
+	}
+	for _, sub := range subs {
+		if err := validateSubstrate(sub); err != nil {
+			return nil, err
+		}
+	}
 	if err := sec.validate(cfg.SymbolSize); err != nil {
 		return nil, err
 	}
@@ -397,8 +572,10 @@ func newMultipathReceiver(subs []Substrate, cfg flow.Config, clk clock.Clock, dr
 		dropHook:  dropHook,
 		openState: os,
 	}
-	for _, sub := range subs {
-		_ = setECN(sub) // enable per-datagram TOS reception so CE marks reach FeedSymbolECN
+	if usesECNReceive(cfg) {
+		for _, sub := range subs {
+			_ = setECN(sub) // enable per-datagram TOS reception so CE marks reach FeedSymbolECN
+		}
 	}
 	for i := range subs {
 		go r.recvLoop(i)
@@ -481,7 +658,7 @@ func (r *MultipathReceiver) Close() error {
 
 func (r *MultipathReceiver) recvLoop(path int) {
 	sub := r.subs[path]
-	buf := make([]byte, 2048)
+	buf := make([]byte, recvBufferSize(r.cfg))
 	oob := make([]byte, 128) // per-datagram TOS/traffic-class control message (the ECN codepoint)
 	for {
 		n, addr, ecn, err := readECN(sub, buf, oob)
@@ -504,6 +681,18 @@ func (r *MultipathReceiver) recvLoop(path int) {
 			r.mu.Unlock()
 		case wire.IsHandshakeInit(t):
 			r.handleHandshakeInit(buf[:n], addr, path)
+		case wire.IsMTUProbe(t):
+			r.mu.Lock()
+			d, ok := r.ctl.open(buf[:n])
+			nonce, _, e := wire.DecodeMTUProbe(d)
+			var ack []byte
+			if ok && e == nil {
+				ack, ok = r.ctl.seal(wire.EncodeMTUProbeAck(nil, nonce, uint16(n)))
+			}
+			r.mu.Unlock()
+			if ok && e == nil {
+				_ = writeDatagram(sub, ack, addr)
+			}
 		case wire.IsSymbol(t):
 			if r.dropHook != nil && r.dropHook(path, buf[:n]) {
 				if r.sec == nil { // cleartext test seam: still learn the peer so feedback flows
@@ -558,7 +747,7 @@ func (r *MultipathReceiver) handleHandshakeInit(datagram []byte, addr net.Addr, 
 	}
 	r.mu.Unlock()
 	if res.send != nil && to != nil {
-		r.subs[path].WriteTo(res.send, to)
+		_ = writeDatagram(r.subs[path], res.send, to)
 	}
 }
 
@@ -596,15 +785,14 @@ func (r *MultipathReceiver) feedSymbol(datagram []byte, addr net.Addr, path int,
 	out := r.openAll(drainDeliver(r.flow))
 	// Adopt the source as THIS path's feedback endpoint (see the single-path note in session.go):
 	// a cleartext flow binds unconditionally; an encrypted flow binds at BOOTSTRAP (no peer on
-	// this path yet) on the first authentic delivery (len(out)>0 — so a repair-only recovery still
-	// ACKs and the flow does not wedge under systematic loss) and on a ROAM only when THIS
-	// systematic opens under the live keys, never on the global delivery signal a spoofed source
-	// could ride.
+	// this path yet) on an authenticated systematic even if delivery is still cursor-blocked, or
+	// on the first authentic delivery. On a ROAM it rebinds only when THIS systematic opens under
+	// the live keys, never on the global delivery signal a spoofed source could ride.
 	switch {
 	case r.sec == nil:
 		r.peers[path] = addr
 	case r.peers[path] == nil:
-		if len(out) > 0 {
+		if len(out) > 0 || (sysSym && r.authenticates(sym)) {
 			r.peers[path] = addr
 		}
 	case !sameAddr(addr, r.peers[path]) && sysSym && r.authenticates(sym):
@@ -653,7 +841,7 @@ func (r *MultipathReceiver) tickLoop() {
 			r.emit(out)
 			r.sendFeedback(fbs, peers)
 			if probe != nil {
-				r.subs[probePath].WriteTo(probe, peers[probePath])
+				_ = writeDatagram(r.subs[probePath], probe, peers[probePath])
 			}
 		}
 	}
@@ -690,7 +878,7 @@ func (r *MultipathReceiver) sendFeedback(sealed [][]byte, peers []net.Addr) {
 	for _, fb := range sealed {
 		for i, peer := range peers {
 			if peer != nil {
-				r.subs[i].WriteTo(fb, peer)
+				_ = writeDatagram(r.subs[i], fb, peer)
 			}
 		}
 	}

@@ -1,6 +1,15 @@
 package session
 
-import "net"
+import (
+	"errors"
+	"io"
+	"net"
+	"reflect"
+)
+
+// ErrNilSubstrate is returned when a caller tries to build a session host over a nil
+// datagram substrate.
+var ErrNilSubstrate = errors.New("meld: session: nil substrate")
 
 // Substrate is the datagram service a session host runs the coded flow over: an
 // unreliable, unordered, point-to-point datagram pipe. The host is a dumb pump on top of
@@ -24,6 +33,31 @@ type Substrate interface {
 	LocalAddr() net.Addr
 	// Close releases the substrate; a ReadFrom blocked on it then returns an error.
 	Close() error
+}
+
+func validateSubstrate(s Substrate) error {
+	if s == nil {
+		return ErrNilSubstrate
+	}
+	v := reflect.ValueOf(s)
+	switch v.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		if v.IsNil() {
+			return ErrNilSubstrate
+		}
+	}
+	return nil
+}
+
+func writeDatagram(s Substrate, p []byte, addr net.Addr) error {
+	n, err := s.WriteTo(p, addr)
+	if err != nil {
+		return err
+	}
+	if n != len(p) {
+		return io.ErrShortWrite
+	}
+	return nil
 }
 
 // dialedSubstrate adapts a connected (dialed) UDP socket — which rejects WriteTo with a

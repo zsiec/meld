@@ -62,15 +62,16 @@ const (
 // it from the bitstream; RefersTo holds ABSOLUTE unit ids (the shaper has already
 // resolved the codec's relative references).
 type Unit struct {
-	ID          uint32        // monotonic dependency key (one per access unit)
-	Class       PriorityClass // protection tier
-	RAP         bool          // random-access point (resync anchor)
-	Discardable bool          // nothing surviving references this unit
-	Picture     bool          // a coded picture (a displayed frame), not a parameter set / SEI / metadata
-	TemporalID  uint8         // enhancement-layer depth (drop high first → fewer fps)
-	RefersTo    []uint32      // unit ids this AU decodes from (absolute)
-	Confidence  Confidence    // signaled vs inferred importance
-	Size        int           // AU size in bytes (how many coded symbols it spans)
+	ID              uint32        // monotonic dependency key (one per access unit)
+	Class           PriorityClass // protection tier
+	RAP             bool          // random-access point (resync anchor)
+	RecoveryRefresh bool          // coded reference slice inside a signaled intra-refresh recovery interval
+	Discardable     bool          // nothing surviving references this unit
+	Picture         bool          // a coded picture (a displayed frame), not a parameter set / SEI / metadata
+	TemporalID      uint8         // enhancement-layer depth (drop high first → fewer fps)
+	RefersTo        []uint32      // unit ids this AU decodes from (absolute)
+	Confidence      Confidence    // signaled vs inferred importance
+	Size            int           // AU size in bytes (how many coded symbols it spans)
 }
 
 // Decodable returns, for each unit, whether it is DECODABLE given the set of units the

@@ -251,6 +251,116 @@ func TestFlowReactiveRepairEntirelyLostGeneration(t *testing.T) {
 	}
 }
 
+func TestReceiverFeedbackReportsInteriorStructuralGenerationGap(t *testing.T) {
+	cfg := testConfig()
+	cfg.Redundancy = 0
+	rng := rand.New(rand.NewSource(123))
+	s := NewSender(cfg)
+	r := NewReceiver(cfg)
+	now := clock.Timestamp(0)
+
+	for i := 0; i < 3*cfg.GenSize; i++ {
+		s.Write(now, makeChunk(rng, uint32(i)))
+		for {
+			d, ok := s.PollSend()
+			if !ok {
+				break
+			}
+			sym, err := wire.DecodeSymbol(d)
+			if err != nil {
+				t.Fatalf("decode symbol: %v", err)
+			}
+			// Leave the cursor generation deficient, drop the whole next generation,
+			// then admit a later generation so the missing middle one is structural
+			// but not yet at the cursor.
+			if sym.SrcIndex == uint32(cfg.GenSize-1) {
+				continue
+			}
+			if sym.SrcIndex >= uint32(cfg.GenSize) && sym.SrcIndex < uint32(2*cfg.GenSize) {
+				continue
+			}
+			r.FeedSymbol(now, d)
+		}
+		now = now.Add(testTick)
+	}
+
+	r.Tick(now.Add(feedbackIntervalMicros + 1))
+	var fb wire.Feedback
+	seen := false
+	for {
+		d, ok := r.PollSend()
+		if !ok {
+			break
+		}
+		got, err := wire.DecodeFeedback(d)
+		if err != nil {
+			t.Fatalf("decode feedback: %v", err)
+		}
+		fb, seen = got, true
+	}
+	if !seen {
+		t.Fatal("receiver emitted no feedback")
+	}
+	if fb.Deficits[0] == 0 {
+		t.Fatalf("cursor generation deficit = 0, want non-zero; feedback=%+v", fb)
+	}
+	if fb.Deficits[1] != structuralGapDeficit {
+		t.Fatalf("interior structural deficit = %d, want %d; feedback=%+v",
+			fb.Deficits[1], structuralGapDeficit, fb)
+	}
+}
+
+func TestSenderStampsSendTimestamp(t *testing.T) {
+	cfg := testConfig()
+	cfg.GenSize = 2
+	cfg.Redundancy = 1
+	now := clock.Timestamp(123_456)
+	s := NewSender(cfg)
+	s.Write(now, make([]byte, testSym))
+	d, ok := s.PollSend()
+	if !ok {
+		t.Fatal("no systematic emitted")
+	}
+	sym, err := wire.DecodeSymbol(d)
+	if err != nil {
+		t.Fatalf("DecodeSymbol systematic: %v", err)
+	}
+	if sym.SendTimestamp != int64(now) {
+		t.Fatalf("systematic SendTimestamp = %d, want %d", sym.SendTimestamp, now)
+	}
+	s.Flush(now.Add(1))
+	for {
+		d, ok = s.PollSend()
+		if !ok {
+			t.Fatal("no repair emitted")
+		}
+		sym, err = wire.DecodeSymbol(d)
+		if err != nil {
+			t.Fatalf("DecodeSymbol repair: %v", err)
+		}
+		if sym.Kind == wire.Repair {
+			if sym.SendTimestamp != int64(now.Add(1)) {
+				t.Fatalf("repair SendTimestamp = %d, want %d", sym.SendTimestamp, now.Add(1))
+			}
+			break
+		}
+	}
+
+	sl := NewSlidingSender(Config{Flow: cfg.Flow, SymbolSize: cfg.SymbolSize, Sliding: true, CodingWindow: 8, BufferMicros: cfg.BufferMicros})
+	sl.Write(now, make([]byte, testSym))
+	d, ok = sl.PollSend()
+	if !ok {
+		t.Fatal("no sliding systematic emitted")
+	}
+	sym, err = wire.DecodeSymbol(d)
+	if err != nil {
+		t.Fatalf("DecodeSymbol sliding systematic: %v", err)
+	}
+	if sym.SendTimestamp != int64(now) {
+		t.Fatalf("sliding systematic SendTimestamp = %d, want %d", sym.SendTimestamp, now)
+	}
+}
+
 // TestFlowUnrecoverableDeadline drops systematic past the budget AND all repair, so
 // the holes can never be recovered: they must be skipped at the deadline, with the
 // four invariants intact and full loss accounting.

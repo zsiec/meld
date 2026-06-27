@@ -1,6 +1,7 @@
 package session
 
 import (
+	"io"
 	"net"
 	"sync"
 	"time"
@@ -130,7 +131,8 @@ func (p *pacerState) due(now clock.Timestamp) [][]byte {
 	var out [][]byte
 	for len(p.queue) > 0 && p.tokens > 0 {
 		d := p.queue[0]
-		p.queue = p.queue[1:]
+		copy(p.queue[0:], p.queue[1:])
+		p.queue = p.queue[:len(p.queue)-1]
 		p.queuedBytes -= int64(len(d))
 		p.tokens -= int64(len(d))
 		out = append(out, d)
@@ -141,7 +143,8 @@ func (p *pacerState) due(now clock.Timestamp) [][]byte {
 // drainAll pops the entire queue regardless of credit — the end-of-stream flush, where
 // pacing the tail is pointless and the bytes just need to get out.
 func (p *pacerState) drainAll() [][]byte {
-	out := p.queue
+	out := make([][]byte, len(p.queue))
+	copy(out, p.queue)
 	p.queue = nil
 	p.queuedBytes = 0
 	return out
@@ -171,10 +174,18 @@ func (p *pacerState) untilNextMicros() int64 {
 // standing queue delay the pacer is about to impose. Write() compares it to the queue-time
 // limit to decide backpressure. Conservative (ignores any positive credit).
 func (p *pacerState) queueDrainMicros() int64 {
+	return p.drainMicrosForBytes(p.queuedBytes)
+}
+
+func (p *pacerState) drainMicrosForBytes(bytes int64) int64 {
 	if p.rateBytesPerSec < 1 {
 		return 1 << 62
 	}
-	return p.queuedBytes * 1_000_000 / p.rateBytesPerSec
+	return bytes * 1_000_000 / p.rateBytesPerSec
+}
+
+func (p *pacerState) queueDrainMicrosAfter(d []byte) int64 {
+	return p.drainMicrosForBytes(p.queuedBytes + int64(len(d)))
 }
 
 // minPaceSleepMicros floors the pacer's wake-up interval so it never busy-spins on a
@@ -247,25 +258,25 @@ func (hp *hostPacer) setRate(bytesPerSec int64) {
 }
 
 // put enqueues datagrams for paced transmission, applying backpressure: if the standing
-// queue already exceeds the queue-time limit it blocks the caller until the backlog drains
-// under the limit (or the pacer closes). This is the source budget contract — the only
-// place media can be slowed, since the core never refuses it. Returns the first async
-// substrate write error, if any.
+// queue would exceed the queue-time limit it blocks the caller until the backlog drains
+// enough to admit the next datagram (or the pacer closes). This is the source budget
+// contract — the only place media can be slowed, since the core never refuses it.
+// Returns the first async substrate write error, if any.
 func (hp *hostPacer) put(datagrams [][]byte) error {
 	if len(datagrams) == 0 {
 		return hp.err()
 	}
 	hp.mu.Lock()
-	for hp.st.queueDrainMicros() > hp.limitMicros {
-		select {
-		case <-hp.done:
-			hp.mu.Unlock()
-			return net.ErrClosed
-		default:
-		}
-		hp.cond.Wait()
-	}
 	for _, d := range datagrams {
+		for len(hp.st.queue) > 0 && hp.st.queueDrainMicrosAfter(d) > hp.limitMicros {
+			select {
+			case <-hp.done:
+				hp.mu.Unlock()
+				return net.ErrClosed
+			default:
+			}
+			hp.cond.Wait()
+		}
 		hp.st.enqueue(d)
 	}
 	hp.mu.Unlock()
@@ -292,7 +303,11 @@ func (hp *hostPacer) loop() {
 		hp.mu.Unlock()
 
 		for _, d := range out {
-			if _, err := hp.write(d); err != nil {
+			n, err := hp.write(d)
+			if err == nil && n != len(d) {
+				err = io.ErrShortWrite
+			}
+			if err != nil {
 				hp.setErr(err)
 				break
 			}

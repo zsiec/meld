@@ -27,9 +27,11 @@ func TestSymbolRoundTrip(t *testing.T) {
 		{Flow: 7, PathID: 255, Kind: Systematic, SrcIndex: 3, SendTimestamp: 1_700_000_000_000_000,
 			Deadline: 1 << 41, Payload: []byte("with send ts on a path")},
 		{Flow: 9, Kind: Systematic, SrcIndex: 50, Priority: 4, HasFrameDesc: true,
-			FrameStart: 12, FrameLen: 7, FrameRefs: []uint32{8, 20}, FrameRAP: true, Payload: []byte("with frame desc")},
+			FrameStart: 12, FrameLen: 7, FrameRefs: []uint32{8, 20}, FrameRAP: true, FrameRecoveryRefresh: true, Payload: []byte("with frame desc")},
 		{Flow: 9, Kind: Systematic, SrcIndex: 51, HasFrameDesc: true, FrameStart: 13, FrameLen: 1,
-			FrameDiscardable: true, SendTimestamp: 42, Payload: []byte("desc + ts")},
+			FrameDiscardable: true, FrameNonPicture: true, SendTimestamp: 42, Payload: []byte("desc + ts")},
+		{Flow: 10, Kind: SparseRepair, SrcIndex: 99, N: 4, RepairKey: 123, Priority: 3, Deadline: 55,
+			SendTimestamp: 44, SparseIDs: []uint32{12, 21, 24, 33}, Payload: []byte("sparse repair")},
 	}
 	for i, want := range cases {
 		enc := EncodeSymbol(nil, want)
@@ -43,9 +45,12 @@ func TestSymbolRoundTrip(t *testing.T) {
 		}
 		if got.Flow != want.Flow || got.Epoch != want.Epoch || got.PathID != want.PathID || got.Kind != want.Kind ||
 			got.WindowBase != want.WindowBase || got.SrcIndex != want.SrcIndex || got.N != want.N ||
-			got.RepairKey != want.RepairKey || got.Priority != want.Priority || got.Deadline != want.Deadline || got.SendTimestamp != want.SendTimestamp ||
+			got.RepairKey != want.RepairKey || !u32eq(got.SparseIDs, want.SparseIDs) ||
+			got.Priority != want.Priority || got.Deadline != want.Deadline || got.SendTimestamp != want.SendTimestamp ||
 			got.HasFrameDesc != want.HasFrameDesc || got.FrameLen != want.FrameLen || got.FrameStart != want.FrameStart ||
-			!u32eq(got.FrameRefs, want.FrameRefs) || got.FrameRAP != want.FrameRAP || got.FrameDiscardable != want.FrameDiscardable {
+			!u32eq(got.FrameRefs, want.FrameRefs) || got.FrameRAP != want.FrameRAP ||
+			got.FrameRecoveryRefresh != want.FrameRecoveryRefresh ||
+			got.FrameDiscardable != want.FrameDiscardable || got.FrameNonPicture != want.FrameNonPicture {
 			t.Fatalf("case %d: header mismatch: got %+v want %+v", i, got, want)
 		}
 		// The leading byte carries the current version in its high nibble.
@@ -67,7 +72,9 @@ func feedbackEqual(a, b Feedback) bool {
 	if a.Flow != b.Flow || a.Epoch != b.Epoch || a.DecodedLowEdge != b.DecodedLowEdge ||
 		a.HighestSeen != b.HighestSeen || a.Deficit != b.Deficit || a.EcnCE != b.EcnCE ||
 		a.LossRate != b.LossRate || a.Deficits != b.Deficits ||
-		a.CongestionLoss != b.CongestionLoss || a.Burstiness != b.Burstiness {
+		a.CongestionLoss != b.CongestionLoss || a.Burstiness != b.Burstiness ||
+		a.Frames != b.Frames || a.DecodableFrames != b.DecodableFrames ||
+		a.Keyframes != b.Keyframes || a.DecodableKeyframes != b.DecodableKeyframes {
 		return false
 	}
 	return u16eq(a.PathLoss, b.PathLoss) && u16eq(a.SlotDist, b.SlotDist)
@@ -89,7 +96,8 @@ func TestFeedbackRoundTrip(t *testing.T) {
 	want := Feedback{Flow: 42, Epoch: 9, DecodedLowEdge: 1000, HighestSeen: 1050, Deficit: 7, EcnCE: 3,
 		LossRate: 19661, Deficits: [MaxFeedbackGens]uint8{7, 0, 3, 0, 1, 0, 0, 255},
 		CongestionLoss: 1234, Burstiness: 512,
-		PathLoss: []uint16{26214, 6553, 3276}, SlotDist: []uint16{52000, 9000, 3000, 535}}
+		PathLoss: []uint16{26214, 6553, 3276}, SlotDist: []uint16{52000, 9000, 3000, 535},
+		Frames: 120, DecodableFrames: 117, Keyframes: 4, DecodableKeyframes: 3}
 	enc := EncodeFeedback(nil, want)
 	typ, err := PeekType(enc)
 	if err != nil || !IsFeedback(typ) {
@@ -116,8 +124,14 @@ func TestFeedbackRoundTrip(t *testing.T) {
 	// decodes those fields but leaves the per-path slices nil.
 	ext, err := DecodeFeedback(enc[:feedbackLenExt])
 	if err != nil || ext.CongestionLoss != want.CongestionLoss || ext.Burstiness != want.Burstiness ||
-		ext.PathLoss != nil || ext.SlotDist != nil {
+		ext.PathLoss != nil || ext.SlotDist != nil || ext.Frames != 0 {
 		t.Fatalf("ext-only decode: %+v err=%v", ext, err)
+	}
+	single := want
+	single.PathLoss, single.SlotDist = nil, nil
+	singleGot, err := DecodeFeedback(EncodeFeedback(nil, single))
+	if err != nil || !feedbackEqual(singleGot, single) {
+		t.Fatalf("single-path media feedback: got %+v err=%v", singleGot, err)
 	}
 }
 
@@ -136,6 +150,17 @@ func TestDecodeShortAndBadType(t *testing.T) {
 	}
 	if _, err := PeekType(nil); err != ErrShort {
 		t.Fatalf("want ErrShort, got %v", err)
+	}
+}
+
+func TestSparseRepairRejectsOversizedIDList(t *testing.T) {
+	ids := make([]uint32, sparseMaxIDs+1)
+	for i := range ids {
+		ids[i] = uint32(i)
+	}
+	enc := EncodeSymbol(nil, Symbol{Flow: 1, Kind: SparseRepair, SparseIDs: ids, Payload: []byte("x")})
+	if _, err := DecodeSymbol(enc); err != ErrInvalid {
+		t.Fatalf("want ErrInvalid, got %v", err)
 	}
 }
 

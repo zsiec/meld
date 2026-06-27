@@ -38,6 +38,9 @@ var (
 	// ErrVersion is returned when the format version nibble is not one this build
 	// understands — the guard that keeps a future field from decoding as garbage.
 	ErrVersion = errors.New("meld: wire: unsupported format version")
+	// ErrInvalid is returned when a datagram is well-formed enough to parse its base
+	// header but declares an invalid bounded field, such as an oversized sparse list.
+	ErrInvalid = errors.New("meld: wire: invalid field")
 )
 
 // Version is the current wire-format version, carried in the high nibble of every
@@ -57,6 +60,7 @@ const (
 	typeHandshakeCookie = 0x08 // responder → initiator mac2 cookie reply (under load)
 	typeMTUProbe        = 0x09 // sender → receiver padded DPLPMTUD probe (RFC 8899)
 	typeMTUProbeAck     = 0x0A // receiver → sender probe acknowledgement
+	typeSparseRepair    = 0x0B // repair over an explicit sparse source-id set
 	typeMask            = 0x0F
 )
 
@@ -74,7 +78,7 @@ func splitLead(b0 uint8) (typeTag uint8, err error) {
 	switch t {
 	case typeSystematic, typeRepair, typeFeedback, typeClockProbe, typeClockEcho,
 		typeHandshakeInit, typeHandshakeResp, typeHandshakeCookie,
-		typeMTUProbe, typeMTUProbeAck:
+		typeMTUProbe, typeMTUProbeAck, typeSparseRepair:
 		return t, nil
 	default:
 		return 0, ErrType
@@ -91,13 +95,16 @@ const (
 	// flagDesc extension (variable): FrameStart(4) + FrameLen(2) + descFlags(1) + nRefs(1)
 	// + nRefs×RefStart(4). descHeadLen is the fixed head; descMaxRefs caps the count so a
 	// forged nRefs cannot over-read (a B-frame needs 2 references; AV1's buffer holds 7).
-	descHeadLen = 8
-	descMaxRefs = 15
-	flagSendTS  = 0x01
-	flagDesc    = 0x02
+	descHeadLen  = 8
+	descMaxRefs  = 15
+	sparseMaxIDs = 64
+	flagSendTS   = 0x01
+	flagDesc     = 0x02
 	// descFlags bits inside the frame-descriptor extension's flags byte.
-	descRAP         = 0x01
-	descDiscardable = 0x02
+	descRAP             = 0x01
+	descDiscardable     = 0x02
+	descNonPicture      = 0x04
+	descRecoveryRefresh = 0x08
 )
 
 // MaxFeedbackGens is the number of consecutive generations (from the delivery
@@ -108,13 +115,15 @@ const MaxFeedbackGens = 32
 // feedbackLen is the v1 BASE feedback length (through Deficits). feedbackLenExt adds the
 // CongestionLoss (N1) and Burstiness (N2) tail fields; after it comes the variable per-path
 // multipath section (N5): one nPaths byte, then nPaths PathLoss values, then nPaths+1
-// SlotDist values. Per the extension policy (package doc), the encoder always writes the
-// fullest form and the decoder reads each tail group only when present — so a peer that
-// knows only an earlier prefix ignores the rest, no version bump.
+// SlotDist values. A media-damage tail follows that per-path section. Per the extension
+// policy (package doc), the encoder always writes the fullest form and the decoder reads
+// each tail group only when present — so a peer that knows only an earlier prefix ignores
+// the rest, no version bump.
 const (
-	feedbackLen      = 21 + MaxFeedbackGens
-	feedbackLenExt   = feedbackLen + 4
-	feedbackMaxPaths = 8 // bound on the per-path section (a forged nPaths cannot allocate unboundedly)
+	feedbackLen           = 21 + MaxFeedbackGens
+	feedbackLenExt        = feedbackLen + 4
+	feedbackMediaStatsLen = 16
+	feedbackMaxPaths      = 8 // bound on the per-path section (a forged nPaths cannot allocate unboundedly)
 )
 
 // Kind distinguishes a verbatim source symbol from a coded repair symbol.
@@ -126,12 +135,18 @@ const (
 	Systematic Kind = iota
 	// Repair carries a random linear combination of a window of source symbols.
 	Repair
+	// SparseRepair carries a random linear combination of explicitly listed source
+	// ids. It is used for protected/reference-layer repair without coding unrelated
+	// disposable columns in the same contiguous span.
+	SparseRepair
 )
 
 // Symbol is the normalized coded symbol crossing the waist. For a Systematic
 // symbol, SrcIndex is the source id and N/RepairKey are unused. For a Repair
 // symbol, WindowBase+N delimit the window the combination spans and RepairKey
-// regenerates the GF(2^8) coefficients (internal/code.GenCoeffs).
+// regenerates the GF(2^8) coefficients (internal/code.GenCoeffs). For a
+// SparseRepair symbol, SparseIDs lists the source columns explicitly and N is
+// len(SparseIDs).
 //
 // Priority and Deadline are the (currently minimal) slice of the generic media
 // descriptor the core acts on for unequal protection and deadline eviction; the
@@ -142,12 +157,13 @@ type Symbol struct {
 	Epoch      uint16 // generation of the flow; bumps on flow reset / key update (reserved; 0 until used)
 	PathID     uint8  // which path the host sent this symbol on (host-stamped; 0 == single path / path 0)
 	Kind       Kind
-	WindowBase uint32 // low edge of the coding window
-	SrcIndex   uint32 // Systematic: source id. Repair: repair counter.
-	N          uint16 // Repair: window width covered
-	RepairKey  uint16 // Repair: coefficient PRNG seed
-	Priority   uint8  // descriptor: protection tier (0 = most disposable)
-	Deadline   int64  // descriptor: decode-by, in clock microseconds
+	WindowBase uint32   // low edge of the coding window
+	SrcIndex   uint32   // Systematic: source id. Repair: repair counter.
+	N          uint16   // Repair: window width covered
+	RepairKey  uint16   // Repair: coefficient PRNG seed
+	SparseIDs  []uint32 // SparseRepair: explicitly coded source ids, in coefficient order
+	Priority   uint8    // descriptor: protection tier (0 = most disposable)
+	Deadline   int64    // descriptor: decode-by, in clock microseconds
 	// SendTimestamp, when non-zero, is the sender's clock time (microseconds) at
 	// emission, carried in an 8-byte header extension flagged by flagSendTS (N4
 	// refinement): with the receiver's receive time it gives a per-symbol one-way
@@ -167,13 +183,17 @@ type Symbol struct {
 	// frame's id) is NOT mis-attributed; FrameRefs are the first source ids of EVERY
 	// dependency frame (a B-frame's two bracketing anchors, a P-frame's one) — the unit is
 	// decodable only if all of them are; FrameRAP marks a random-access point;
-	// FrameDiscardable marks a unit nothing references.
-	HasFrameDesc     bool
-	FrameStart       uint32
-	FrameLen         uint16
-	FrameRefs        []uint32
-	FrameRAP         bool
-	FrameDiscardable bool
+	// FrameRecoveryRefresh marks a reference slice participating in a signaled intra-refresh
+	// interval; FrameDiscardable marks a unit nothing references; FrameNonPicture marks
+	// metadata/parameter material that is not a displayed coded picture.
+	HasFrameDesc         bool
+	FrameStart           uint32
+	FrameLen             uint16
+	FrameRefs            []uint32
+	FrameRAP             bool
+	FrameRecoveryRefresh bool
+	FrameDiscardable     bool
+	FrameNonPicture      bool
 
 	Payload []byte // coded bytes, sized to the validated path MTU
 }
@@ -181,8 +201,16 @@ type Symbol struct {
 // EncodeSymbol appends the encoded Symbol to dst and returns the extended slice.
 func EncodeSymbol(dst []byte, s Symbol) []byte {
 	typeTag := uint8(typeSystematic)
-	if s.Kind == Repair {
+	switch s.Kind {
+	case Repair:
 		typeTag = typeRepair
+	case SparseRepair:
+		typeTag = typeSparseRepair
+		n := len(s.SparseIDs)
+		if n > int(^uint16(0)) {
+			n = int(^uint16(0))
+		}
+		s.N = uint16(n)
 	}
 	var h [symbolHeader]byte
 	h[0] = lead(typeTag)
@@ -216,8 +244,14 @@ func EncodeSymbol(dst []byte, s Symbol) []byte {
 		if s.FrameRAP {
 			head[6] |= descRAP
 		}
+		if s.FrameRecoveryRefresh {
+			head[6] |= descRecoveryRefresh
+		}
 		if s.FrameDiscardable {
 			head[6] |= descDiscardable
+		}
+		if s.FrameNonPicture {
+			head[6] |= descNonPicture
 		}
 		n := len(s.FrameRefs)
 		if n > 255 {
@@ -229,6 +263,17 @@ func EncodeSymbol(dst []byte, s Symbol) []byte {
 			var r [4]byte
 			binary.BigEndian.PutUint32(r[:], s.FrameRefs[i])
 			dst = append(dst, r[:]...)
+		}
+	}
+	if s.Kind == SparseRepair {
+		n := int(s.N)
+		if n > len(s.SparseIDs) {
+			n = len(s.SparseIDs)
+		}
+		for i := 0; i < n; i++ {
+			var id [4]byte
+			binary.BigEndian.PutUint32(id[:], s.SparseIDs[i])
+			dst = append(dst, id[:]...)
 		}
 	}
 	return append(dst, s.Payload...)
@@ -251,6 +296,8 @@ func DecodeSymbol(b []byte) (Symbol, error) {
 		s.Kind = Systematic
 	case typeRepair:
 		s.Kind = Repair
+	case typeSparseRepair:
+		s.Kind = SparseRepair
 	default:
 		return Symbol{}, ErrType
 	}
@@ -280,7 +327,9 @@ func DecodeSymbol(b []byte) (Symbol, error) {
 		s.FrameLen = binary.BigEndian.Uint16(b[off+4:])
 		df := b[off+6]
 		s.FrameRAP = df&descRAP != 0
+		s.FrameRecoveryRefresh = df&descRecoveryRefresh != 0
 		s.FrameDiscardable = df&descDiscardable != 0
+		s.FrameNonPicture = df&descNonPicture != 0
 		n := int(b[off+7])
 		off += descHeadLen
 		if len(b) < off+n*4 {
@@ -292,6 +341,20 @@ func DecodeSymbol(b []byte) (Symbol, error) {
 				s.FrameRefs[i] = binary.BigEndian.Uint32(b[off:])
 				off += 4
 			}
+		}
+	}
+	if s.Kind == SparseRepair {
+		n := int(s.N)
+		if n <= 0 || n > sparseMaxIDs {
+			return Symbol{}, ErrInvalid
+		}
+		if len(b) < off+n*4 {
+			return Symbol{}, ErrShort
+		}
+		s.SparseIDs = make([]uint32, n)
+		for i := range s.SparseIDs {
+			s.SparseIDs[i] = binary.BigEndian.Uint32(b[off:])
+			off += 4
 		}
 	}
 	s.Payload = b[off:]
@@ -351,6 +414,18 @@ type Feedback struct {
 	// single path (the sizer keeps its single-path binomial/GE form). Up to feedbackMaxPaths.
 	PathLoss []uint16
 	SlotDist []uint16
+
+	// --- media-damage tail extension (N6: appended, length-gated) ---
+
+	// Frames/DecodableFrames and Keyframes/DecodableKeyframes are cumulative receiver-side
+	// media decodability counters derived from WriteFrame descriptors. They let the sender's
+	// zero-config control loop distinguish ordinary wire loss from dependency damage and ask
+	// an attached encoder for a shorter recovery cadence when long bursts are damaging
+	// reference islands. Zero means absent or no descriptors observed.
+	Frames             uint32
+	DecodableFrames    uint32
+	Keyframes          uint32
+	DecodableKeyframes uint32
 }
 
 // EncodeFeedback appends the encoded Feedback to dst and returns the slice. It
@@ -374,7 +449,8 @@ func EncodeFeedback(dst []byte, f Feedback) []byte {
 	// nPaths=0 marks a single-path report.
 	n := len(f.PathLoss)
 	if n == 0 || n > feedbackMaxPaths || len(f.SlotDist) != n+1 {
-		return append(dst, 0)
+		dst = append(dst, 0)
+		return encodeFeedbackMediaStats(dst, f)
 	}
 	dst = append(dst, byte(n))
 	var tmp [2]byte
@@ -386,7 +462,16 @@ func EncodeFeedback(dst []byte, f Feedback) []byte {
 		binary.BigEndian.PutUint16(tmp[:], v)
 		dst = append(dst, tmp[:]...)
 	}
-	return dst
+	return encodeFeedbackMediaStats(dst, f)
+}
+
+func encodeFeedbackMediaStats(dst []byte, f Feedback) []byte {
+	var media [feedbackMediaStatsLen]byte
+	binary.BigEndian.PutUint32(media[0:], f.Frames)
+	binary.BigEndian.PutUint32(media[4:], f.DecodableFrames)
+	binary.BigEndian.PutUint32(media[8:], f.Keyframes)
+	binary.BigEndian.PutUint32(media[12:], f.DecodableKeyframes)
+	return append(dst, media[:]...)
 }
 
 // DecodeFeedback parses a Feedback datagram. The base fields require feedbackLen
@@ -435,6 +520,12 @@ func DecodeFeedback(b []byte) (Feedback, error) {
 				off += 2
 			}
 		}
+		if len(b) >= off+feedbackMediaStatsLen {
+			f.Frames = binary.BigEndian.Uint32(b[off:])
+			f.DecodableFrames = binary.BigEndian.Uint32(b[off+4:])
+			f.Keyframes = binary.BigEndian.Uint32(b[off+8:])
+			f.DecodableKeyframes = binary.BigEndian.Uint32(b[off+12:])
+		}
 	}
 	return f, nil
 }
@@ -450,7 +541,7 @@ func PeekType(b []byte) (uint8, error) {
 }
 
 // IsSymbol reports whether t (from PeekType) tags a media symbol.
-func IsSymbol(t uint8) bool { return t == typeSystematic || t == typeRepair }
+func IsSymbol(t uint8) bool { return t == typeSystematic || t == typeRepair || t == typeSparseRepair }
 
 // IsFeedback reports whether t tags a feedback report.
 func IsFeedback(t uint8) bool { return t == typeFeedback }

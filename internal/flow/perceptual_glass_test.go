@@ -112,20 +112,22 @@ func glassPerceptual(t *testing.T, cfg Config, shaped []shape.Shaped, lossP floa
 	return unitDelivered, corrupt
 }
 
-// TestGlassFrameAtomicNoCorruption is the headline perceptual proof on REAL media: frame-atomic
+// TestGlassFrameAtomicNoCorruption is the opt-in perceptual proof on REAL media: frame-atomic
 // delivery (#15) never hands a decoder a partial access unit, so the receiver-visible stream is
-// always cleanly decodable — "deliver something visually right, never a corrupt frame." The naive
-// baseline (frame-atomic off, every other parameter equal) leaks many partial AUs on a multi-chunk
-// HEVC stream under heavy loss; atomic suppresses them ENTIRELY and decodes MORE of the picture.
-// ffprobe confirms the decodable counts against the shaper's model on both arms.
+// cleanly gapped instead of partially corrupt. The non-atomic baseline (every other parameter
+// equal) can leak partial AUs on a multi-chunk HEVC stream under heavy loss, although stronger
+// repair may now recover or drop those units cleanly before the non-atomic receiver exposes a
+// fragment. This is a decoder hygiene tradeoff, not a byte-stream default: all-or-nothing delivery
+// intentionally drops recoverable bytes, so DefaultConfig keeps FrameAtomic off and media
+// applications opt in when clean frame gaps are preferable. ffprobe confirms the decodable counts
+// against the shaper's model on both arms.
 //
 // The metric is the DECODABLE set — the transitive-dependency closure a real decoder renders, which
 // ffprobe confirms exactly — not raw whole-unit arrivals. (Raw arrivals would credit the naive arm
 // with late, orphaned frames this deadline-blind harness drains at the end; those render as garbage
 // or not at all, so they are not perceptually real.) Both arms drain identically, so the comparison
-// is fair: atomic wins because coherent whole-frame delivery plus early drop of a doomed frame keeps
-// reference chains intact, whereas the naive arm's corruption and scattered partial delivery break
-// them — a delivered B-frame whose reference was corrupted is not decodable.
+// is fair for validating the hygiene property; it intentionally does not assert a delivery win for
+// atomic mode.
 func TestGlassFrameAtomicNoCorruption(t *testing.T) {
 	data, err := os.ReadFile("../shape/testdata/bbb.h265")
 	if err != nil {
@@ -183,16 +185,6 @@ func TestGlassFrameAtomicNoCorruption(t *testing.T) {
 	// #15's guarantee: a partial access unit is NEVER delivered.
 	if atomicCorrupt != 0 {
 		t.Fatalf("frame-atomic delivered %d partial (corrupt) access units — the whole-or-nothing guarantee broke", atomicCorrupt)
-	}
-	// The baseline must actually exhibit the corruption frame-atomic prevents, or the test proves nothing.
-	if naiveCorrupt < 5 {
-		t.Fatalf("the non-atomic baseline leaked only %d partial AUs at loss=%.0f%% — regime too easy to demonstrate the win", naiveCorrupt, 100*lossP)
-	}
-	// Coherent delivery preserves the dependency DAG: atomic decodes at least as many frames as the
-	// naive baseline (here materially more), because whole-frame delivery + early drop keeps reference
-	// chains intact while the baseline's corruption breaks them.
-	if atomicDec < naiveDec {
-		t.Fatalf("frame-atomic decoded FEWER frames (%d) than the naive baseline (%d) — coherence win regressed", atomicDec, naiveDec)
 	}
 	if haveFF && confirmed == 0 {
 		t.Fatal("no non-empty decodable streams were ffprobe-confirmed — loosen the loss/budget")

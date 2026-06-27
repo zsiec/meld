@@ -51,6 +51,7 @@ The near-term roadmap fields have all landed this way:
 | `Burstiness` (loss-run / GE estimate, N2) | Feedback | tail append, length-gated |
 | `EcnCE` (CE-marked fraction, N3 / L4S) | Feedback | base field, now populated |
 | per-path loss + erasure-count histogram (N5, **N paths**) | Feedback | variable tail section (below) |
+| media damage counters (N6) | Feedback | tail append after the per-path section |
 | frame dependency (`FrameRefs`, WP6) | Symbol | `flagDesc` tail extension (below) |
 
 `PathID` (N5) is the one exception that is **not** a tail extension: a path id is a
@@ -90,8 +91,8 @@ descriptor), each gated by its Flags bit, so the decoder walks them by flag. The
 descriptor** (WP6) is stamped on SYSTEMATIC symbols only and lets the receiver compute loss
 propagation parse-free: `FrameStart` is the access unit's first source id (its identity, and
 with `FrameLen` its exact id range `[FrameStart, FrameStart+FrameLen)`); `descFlags` bit 0 =
-RAP (keyframe), bit 1 = discardable; `nRefs` (≤ 15) is the number of dependency frames, each
-a `RefStart` (a referenced frame's first source id). The references are **exact and
+RAP (keyframe), bit 1 = discardable, bit 2 = non-picture metadata/parameter material;
+`nRefs` (≤ 15) is the number of dependency frames, each a `RefStart` (a referenced frame's first source id). The references are **exact and
 variable-length** — a B-picture carries its two bracketing anchors, a P-picture one — so the
 receiver tracks the dependency tree the shaper resolved (POC bracketing / AV1's reference
 buffer). Coding rebuilds payloads, not headers, so a recovered symbol carries no descriptor —
@@ -104,7 +105,7 @@ delimit the spanned window and `RepairKey` regenerates the coefficients
 (`internal/flow.pathScheduler`); the host transmits the symbol on that path and the
 receiver attributes its arrival/loss to that path for the co-loss estimate.
 
-## Feedback report (29-byte base + length-gated tails)
+## Feedback report (53-byte base + length-gated tails)
 
 Cumulative and idempotent — *state, not events* — so a lost report costs nothing;
 the next carries the same truth, advanced. The encoder always writes the fullest
@@ -121,18 +122,25 @@ earlier-prefix peer ignores fields it does not know (no version bump).
 | 15 | 2 | `Deficit` | extra independent symbols the live window needs (== `Deficits[0]`) |
 | 17 | 2 | `EcnCE` | CE-marked fraction of received symbols this interval, parts per 65535 (N3 / L4S) |
 | 19 | 2 | `LossRate` | smoothed channel erasure estimate, parts per 65535 |
-| 21 | 8 | `Deficits[8]` | rank deficit of the 8 generations from the cursor (saturating u8) |
-| 29 | 2 | `CongestionLoss` | pre-recovery wire-loss count since last report (N1; tail, length-gated) |
-| 31 | 2 | `Burstiness` | smoothed mean loss-run length, Q8 (256 = i.i.d.; N2; tail) |
-| 33 | 1 | `nPaths` | multipath: paths reported (0 = single path); N5 variable tail |
+| 21 | 32 | `Deficits[32]` | rank deficit of the 32 generations from the cursor (saturating u8) |
+| 53 | 2 | `CongestionLoss` | pre-recovery wire-loss count since last report (N1; tail, length-gated) |
+| 55 | 2 | `Burstiness` | smoothed mean loss-run length, Q8 (256 = i.i.d.; N2; tail) |
+| 57 | 1 | `nPaths` | multipath: paths reported (0 = single path); N5 variable tail |
 | +0 | 2·`nPaths` | `PathLoss[nPaths]` | per-path marginal erasure rates, parts per 65535 (weights the scheduler) |
 | +… | 2·(`nPaths`+1) | `SlotDist[nPaths+1]` | per-slot erasure-COUNT histogram: fraction of aligned N-path slots with exactly *j* of *N* paths erased, parts per 65535 (drives the joint-tail sizer) |
+| next | 16 | media stats | cumulative `Frames`, `DecodableFrames`, `Keyframes`, `DecodableKeyframes` as u32 counters (N6; zero when absent/no descriptors) |
 
 The per-path section is **variable** and bound-gated (`nPaths ≤ 8`): a forged count can neither
 over-read nor over-allocate. `SlotDist` is the exact sufficient statistic the correlation-aware
 joint-tail sizer (`internal/flow.repairForJointTailN`) convolves — union-decode failure depends
 only on the total erasure count, so the count histogram embeds the cross-path correlation an
 i.i.d.-union sizer misses, without enumerating which paths failed.
+
+The media-stats tail lets the sender's single `meld-auto` loop tell ordinary wire loss from
+decode-damaging dependency loss. Combined with `Burstiness`, it drives the advisory encoder
+recovery-cadence request (`EncoderControl.RecoveryCadenceFrames`) without introducing separate
+deployable profiles. A sender that cannot influence the encoder simply ignores that actuator and
+keeps the same transport loop.
 
 ## The generic media descriptor
 

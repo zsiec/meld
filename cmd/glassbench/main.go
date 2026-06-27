@@ -1,5 +1,5 @@
-// Command glassbench is a glass-to-glass media-decodability comparison judged by a
-// NON-BIASED arbiter (ffprobe), not Meld's own model. It streams the same real H.264
+// Command glassbench is a glass-to-glass media-decodability comparison with ffprobe as
+// an external decoder check. It streams the same real H.264
 // clip through four transports over one shared impairment relay (loss + one-way delay,
 // matched latency budget) — Meld with media-aware unequal protection (WriteFrame/UEP),
 // Meld media-blind (Write/flat), real libSRT, and real libRIST — then reassembles each
@@ -13,6 +13,7 @@ package main
 import (
 	"container/heap"
 	"encoding/binary"
+	"errors"
 	"flag"
 	"fmt"
 	"math/rand"
@@ -43,12 +44,12 @@ type chunked struct {
 	chunkSize  int
 }
 
-func chunkClip(path string, chunkSize int) (*chunked, error) {
+func chunkClip(path string, chunkSize int, avcOpts shape.AVCOptions) (*chunked, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	shaped := shape.NewAVCShaper().Shape(data)
+	shaped := shape.NewAVCShaperWithOptions(avcOpts).Shape(data)
 	c := &chunked{units: make([]shape.Unit, len(shaped)), shaped: shaped,
 		unitChunks: map[uint32][]uint32{}, chunkSize: chunkSize}
 	var seq uint32
@@ -74,6 +75,149 @@ func chunkClip(path string, chunkSize int) (*chunked, error) {
 	return c, nil
 }
 
+const x264CadenceIntraRefresh = "intra-refresh"
+
+func transcodeX264CadenceCRF(path string, interval, crf int) (string, func(), error) {
+	if interval <= 0 {
+		return path, func() {}, nil
+	}
+	f, err := os.CreateTemp("", "glass-x264-*.h264")
+	if err != nil {
+		return "", nil, err
+	}
+	out := f.Name()
+	if err := f.Close(); err != nil {
+		os.Remove(out)
+		return "", nil, err
+	}
+	params := []string{
+		fmt.Sprintf("keyint=%d", interval),
+		fmt.Sprintf("min-keyint=%d", interval),
+		"scenecut=0",
+		"repeat-headers=1",
+		"intra-refresh=1",
+		"b-pyramid=none",
+	}
+	args := []string{"-y", "-v", "error", "-f", "h264", "-i", path, "-an", "-c:v", "libx264", "-preset", "veryfast"}
+	if crf > 0 {
+		args = append(args, "-crf", strconv.Itoa(crf))
+	}
+	args = append(args, "-x264-params", strings.Join(params, ":"), "-f", "h264", out)
+	cmd := exec.Command("ffmpeg", args...)
+	if b, err := cmd.CombinedOutput(); err != nil {
+		os.Remove(out)
+		msg := strings.TrimSpace(string(b))
+		if msg == "" {
+			msg = err.Error()
+		}
+		return "", nil, fmt.Errorf("ffmpeg x264 intra-refresh transcode: %s", msg)
+	}
+	return out, func() { os.Remove(out) }, nil
+}
+
+type boundedX264Result struct {
+	Path    string
+	Cleanup func()
+	CRF     int
+	PSNR    float64
+	OK      bool
+	Reason  string
+}
+
+func transcodeX264CadenceBounded(path string, interval int, maxBytes int64, minPSNR float64) (boundedX264Result, error) {
+	if interval <= 0 {
+		return boundedX264Result{Path: path, Cleanup: func() {}, OK: true}, nil
+	}
+	if maxBytes <= 0 {
+		out, cleanup, err := transcodeX264CadenceCRF(path, interval, 0)
+		if err != nil {
+			return boundedX264Result{}, err
+		}
+		psnr, err := averagePSNR(path, out)
+		if err != nil {
+			cleanup()
+			return boundedX264Result{}, err
+		}
+		if minPSNR > 0 && psnr < minPSNR {
+			cleanup()
+			return boundedX264Result{PSNR: psnr, Reason: "psnr_floor"}, nil
+		}
+		return boundedX264Result{Path: out, Cleanup: cleanup, PSNR: psnr, OK: true}, nil
+	}
+
+	const minCRF = 18
+	const maxCRF = 51
+	var best boundedX264Result
+	for lo, hi := minCRF, maxCRF; lo <= hi; {
+		crf := (lo + hi) / 2
+		out, cleanup, err := transcodeX264CadenceCRF(path, interval, crf)
+		if err != nil {
+			if best.Cleanup != nil {
+				best.Cleanup()
+			}
+			return boundedX264Result{}, err
+		}
+		st, err := os.Stat(out)
+		if err != nil {
+			cleanup()
+			if best.Cleanup != nil {
+				best.Cleanup()
+			}
+			return boundedX264Result{}, err
+		}
+		if st.Size() <= maxBytes {
+			if best.Cleanup != nil {
+				best.Cleanup()
+			}
+			best = boundedX264Result{Path: out, Cleanup: cleanup, CRF: crf, OK: true}
+			hi = crf - 1
+		} else {
+			cleanup()
+			lo = crf + 1
+		}
+	}
+	if !best.OK {
+		return boundedX264Result{Reason: "byte_cap"}, nil
+	}
+	psnr, err := averagePSNR(path, best.Path)
+	if err != nil {
+		best.Cleanup()
+		return boundedX264Result{}, err
+	}
+	best.PSNR = psnr
+	if minPSNR > 0 && psnr < minPSNR {
+		best.Cleanup()
+		return boundedX264Result{PSNR: psnr, Reason: "psnr_floor"}, nil
+	}
+	return best, nil
+}
+
+func averagePSNR(ref, dist string) (float64, error) {
+	cmd := exec.Command("ffmpeg", "-v", "info", "-f", "h264", "-i", ref, "-f", "h264", "-i", dist, "-lavfi", "psnr", "-f", "null", "-")
+	b, err := cmd.CombinedOutput()
+	if err != nil {
+		return 0, fmt.Errorf("ffmpeg psnr: %s", strings.TrimSpace(string(b)))
+	}
+	out := string(b)
+	idx := strings.LastIndex(out, "average:")
+	if idx < 0 {
+		return 0, fmt.Errorf("ffmpeg psnr: average PSNR not found")
+	}
+	rest := out[idx+len("average:"):]
+	fields := strings.Fields(rest)
+	if len(fields) == 0 {
+		return 0, fmt.Errorf("ffmpeg psnr: malformed average PSNR")
+	}
+	if strings.EqualFold(fields[0], "inf") {
+		return 999, nil
+	}
+	v, err := strconv.ParseFloat(fields[0], 64)
+	if err != nil {
+		return 0, fmt.Errorf("ffmpeg psnr average %q: %w", fields[0], err)
+	}
+	return v, nil
+}
+
 // deliveredUnits maps a delivered chunk-seq set to the units fully delivered (all chunks).
 func (c *chunked) deliveredUnits(seqs map[uint32]bool) map[uint32]bool {
 	out := map[uint32]bool{}
@@ -90,9 +234,10 @@ func (c *chunked) deliveredUnits(seqs map[uint32]bool) map[uint32]bool {
 	return out
 }
 
-// reassemble builds the Annex-B stream of the DECODABLE units (delivered + dependency
-// closure) and returns it plus the displayed-picture count the decoder should reproduce.
-func (c *chunked) reassemble(delivered map[uint32]bool) ([]byte, int) {
+// reassembleDecodable builds the model-filtered Annex-B stream of DECODABLE units
+// (delivered + dependency closure) and returns it plus the displayed-picture count the
+// decoder should reproduce. This is a model sanity helper, not the benchmark arbiter.
+func (c *chunked) reassembleDecodable(delivered map[uint32]bool) ([]byte, int) {
 	dec := shape.Decodable(c.units, delivered)
 	var out []byte
 	pics := 0
@@ -109,22 +254,66 @@ func (c *chunked) reassemble(delivered map[uint32]bool) ([]byte, int) {
 	return out, pics
 }
 
-// ffprobeFrames asks the non-biased arbiter how many frames the stream actually decodes.
-func ffprobeFrames(h264 []byte) int {
+// reassembleDelivered builds the Annex-B stream from the raw delivered chunk set, in
+// source order. A unit with any delivered chunk gets one start code, then only the
+// delivered byte ranges; partial units are intentionally passed to ffprobe as partial
+// units instead of being filtered through Meld's dependency oracle.
+func (c *chunked) reassembleDelivered(seqs map[uint32]bool) []byte {
+	var out []byte
+	for _, sh := range c.shaped {
+		started := false
+		for _, seq := range c.unitChunks[sh.Unit.ID] {
+			if !seqs[seq] {
+				continue
+			}
+			if !started {
+				out = append(out, 0, 0, 0, 1)
+				started = true
+			}
+			pkt := c.chunks[seq]
+			if len(pkt) > seqHdr {
+				out = append(out, pkt[seqHdr:]...)
+			}
+		}
+	}
+	return out
+}
+
+// ffprobeFrames asks ffprobe how many frames the stream actually decodes.
+func ffprobeFrames(h264 []byte) (int, error) {
+	if len(h264) == 0 {
+		return 0, nil
+	}
 	f, err := os.CreateTemp("", "glass-*.h264")
 	if err != nil {
-		return -1
+		return 0, err
 	}
 	defer os.Remove(f.Name())
-	f.Write(h264)
-	f.Close()
+	if _, err := f.Write(h264); err != nil {
+		f.Close()
+		return 0, err
+	}
+	if err := f.Close(); err != nil {
+		return 0, err
+	}
 	out, err := exec.Command("ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0",
 		"-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", f.Name()).Output()
 	if err != nil {
-		return -1
+		var exit *exec.ExitError
+		if errors.As(err, &exit) {
+			return 0, nil // invalid/undecodable stream, not a benchmark infrastructure failure
+		}
+		return 0, err
 	}
-	n, _ := strconv.Atoi(strings.TrimSpace(string(out)))
-	return n
+	s := strings.TrimSpace(string(out))
+	if s == "" || s == "N/A" {
+		return 0, nil
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 // --- impairment relay (forward media dropped per dropper, owd both ways) — cref-identical ---
@@ -232,7 +421,7 @@ func (h *delayHeap) Pop() interface{} {
 // buffers absorb bursts the relay has not drained, and a single time-ordered forwarder per direction
 // releases packets at their scheduled time (rather than one timer per packet) so the clip's big-frame
 // burst cannot cluster simultaneous timer fires — the artifact that dropped packets at 0% loss.
-func relayOn(listenPort int, downstream string, drop func() bool, owd time.Duration) (int, func()) {
+func relayOn(listenPort int, downstream string, drop func() bool, owd time.Duration, jitterSeed int64, trace *seedTrace) (int, func()) {
 	down, _ := net.ResolveUDPAddr("udp", downstream)
 	pub, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: listenPort})
 	if err != nil {
@@ -247,7 +436,10 @@ func relayOn(listenPort int, downstream string, drop func() bool, owd time.Durat
 		sync.Mutex
 		a *net.UDPAddr
 	}
-	rng := rand.New(rand.NewSource(int64(pub.LocalAddr().(*net.UDPAddr).Port)))
+	if jitterSeed == 0 {
+		jitterSeed = 1
+	}
+	rng := rand.New(rand.NewSource(jitterSeed))
 	forwarder := func(out *net.UDPConn, fixedTo *net.UDPAddr) chan<- delayed {
 		in := make(chan delayed, 1<<16)
 		go func() {
@@ -302,12 +494,16 @@ func relayOn(listenPort int, downstream string, drop func() bool, owd time.Durat
 			client.Lock()
 			client.a = a
 			client.Unlock()
-			if drop != nil && drop() {
-				continue
-			}
+			dropped := drop != nil && drop()
 			d := owd
 			if jitterDur > 0 {
 				d += time.Duration(rng.Int63n(int64(jitterDur)))
+			}
+			if trace != nil {
+				trace.recordRelay(b[:n], dropped, d)
+			}
+			if dropped {
+				continue
 			}
 			relayEnq.Add(1)
 			fwdCh <- delayed{at: time.Now().Add(d), b: append([]byte(nil), b[:n]...)}
@@ -341,11 +537,104 @@ func arqLatencyMs(rttMs, mult, floorMs int) int {
 
 // --- Meld arm (public API, real UDP) ---
 
+type meldArmConfig struct {
+	name               string
+	uep                bool
+	frame              bool
+	frameAtomic        bool
+	sliding            bool
+	disableFramePolicy bool
+	repairCeiling      bool
+}
+
+func meldArm(name string) (meldArmConfig, bool) {
+	switch name {
+	case "meld", "meld-flat", "meld-flat-unit":
+		return meldArmConfig{name: name}, true
+	case "meld-auto":
+		return meldArmConfig{name: name, uep: true, frame: true, sliding: true}, true
+	case "meld-uep-unit":
+		return meldArmConfig{name: name, uep: true}, true
+	case "meld-flat-frame":
+		return meldArmConfig{name: name, frame: true}, true
+	case "meld-uep", "meld-uep-frame":
+		return meldArmConfig{name: name, uep: true, frame: true}, true
+	case "meld-uep-frame-atomic":
+		return meldArmConfig{name: name, uep: true, frame: true, frameAtomic: true}, true
+	case "meld-uep-frame-noatomic":
+		return meldArmConfig{name: name, uep: true, frame: true, disableFramePolicy: true}, true
+	case "meld-sld":
+		return meldArmConfig{name: name, sliding: true}, true
+	case "meld-sld-uep":
+		return meldArmConfig{name: name, uep: true, frame: true, sliding: true}, true
+	case "meld-repair-ceiling":
+		return meldArmConfig{name: name, uep: true, frame: true, sliding: true, repairCeiling: true}, true
+	}
+	return meldArmConfig{}, false
+}
+
+func isMeldArm(name string) bool {
+	_, ok := meldArm(name)
+	return ok
+}
+
+type meldRunResult struct {
+	got       map[uint32]bool
+	txStats   meld.SenderStats
+	rxStats   meld.ReceiverStats
+	relayEnq  int64
+	relaySent int64
+}
+
 func runMeld(c *chunked, uep, sliding bool, loss float64, rttMs, budgetMs int, paceUs, maxBps, seed int64) map[uint32]bool {
+	arm := meldArmConfig{uep: uep, frame: uep, sliding: sliding}
+	return runMeldArm(c, arm, loss, rttMs, budgetMs, paceUs, maxBps, seed, nil).got
+}
+
+func runMeldNamed(c *chunked, name string, loss float64, rttMs, budgetMs int, paceUs, maxBps, seed int64) meldRunResult {
+	return runMeldNamedTrace(c, name, loss, rttMs, budgetMs, paceUs, maxBps, seed, nil)
+}
+
+func runMeldNamedTrace(c *chunked, name string, loss float64, rttMs, budgetMs int, paceUs, maxBps, seed int64, trace *seedTrace) meldRunResult {
+	arm, ok := meldArm(name)
+	if !ok {
+		return meldRunResult{}
+	}
+	return runMeldArm(c, arm, loss, rttMs, budgetMs, paceUs, maxBps, seed, trace)
+}
+
+func meldFrameDesc(sh shape.Shaped, chunks int, uep bool) meld.FrameDesc {
+	fd := meld.FrameDesc{
+		FrameID:         sh.Unit.ID,
+		RefFrameIDs:     sh.Unit.RefersTo,
+		Chunks:          uint16(chunks),
+		TemporalID:      sh.Unit.TemporalID,
+		RAP:             sh.Unit.RAP,
+		RecoveryRefresh: sh.Unit.RecoveryRefresh,
+		Discardable:     sh.Unit.Discardable,
+		NonPicture:      !sh.Unit.Picture,
+	}
+	if uep {
+		fd.Priority = sh.Unit.Class.Wire()
+	} else {
+		fd.Priority = 2 // base tier (media-blind)
+	}
+	return fd
+}
+
+func runMeldArm(c *chunked, arm meldArmConfig, loss float64, rttMs, budgetMs int, paceUs, maxBps, seed int64, trace *seedTrace) meldRunResult {
 	owd := time.Duration(rttMs/2) * time.Millisecond
 	cfg := meld.DefaultConfig()
 	cfg.SymbolSize = seqHdr + c.chunkSize
 	cfg.BufferMicros = int64(budgetMs) * 1000
+	cfg.Sliding = arm.sliding
+	if arm.frameAtomic {
+		cfg.FrameAtomic = true
+	}
+	if arm.disableFramePolicy {
+		cfg.FrameAtomic = false
+		cfg.EvictBrokenFrames = false
+	}
 	if meldTgtFail > 0 {
 		cfg.TargetFailure = meldTgtFail // tighter ⇒ more proactive (cover the tail, skip the reactive round)
 	}
@@ -361,7 +650,7 @@ func runMeld(c *chunked, uep, sliding bool, loss float64, rttMs, budgetMs int, p
 	if meldNoReorder {
 		cfg.AutoReorderHoldoff = false // disable the self-tuning reorder window (A/B the default-on)
 	}
-	if sliding {
+	if arm.sliding {
 		// Band-form sliding coder: repair is fungible across a wide window, so a
 		// concentrated burst is covered without a round trip (vs the generation
 		// coder, where a burst overwhelms one generation). CodingWindow is the max
@@ -373,18 +662,29 @@ func runMeld(c *chunked, uep, sliding bool, loss float64, rttMs, budgetMs int, p
 	if maxBps > 0 {
 		cfg.MaxBitrate = maxBps // a realistic link cap creates the scarcity UEP allocates within
 	}
+	if arm.repairCeiling {
+		cfg.TargetFailure = 1e-12
+		cfg.Redundancy = 1.0
+		cfg.RepairWithinBudget = false
+	}
 	rx, err := meld.NewReceiver("127.0.0.1:0", cfg)
 	if err != nil {
-		return nil
+		if os.Getenv("GLASSDBG") != "" {
+			fmt.Fprintf(os.Stderr, "meld NewReceiver: %v\n", err)
+		}
+		return meldRunResult{}
 	}
 	relayEnq.Store(0)
 	relaySent.Store(0)
-	port, stop := relayOn(0, rx.LocalAddr(), dropper(loss, seed), owd)
+	port, stop := relayOn(0, rx.LocalAddr(), dropper(loss, seed), owd, seed, trace)
 	defer stop()
 	tx, err := meld.NewSender(fmt.Sprintf("127.0.0.1:%d", port), cfg)
 	if err != nil {
+		if os.Getenv("GLASSDBG") != "" {
+			fmt.Fprintf(os.Stderr, "meld NewSender: %v\n", err)
+		}
 		rx.Close()
-		return nil
+		return meldRunResult{}
 	}
 	got := map[uint32]bool{}
 	var mu sync.Mutex
@@ -408,13 +708,7 @@ func runMeld(c *chunked, uep, sliding bool, loss float64, rttMs, budgetMs int, p
 	// chunk seq -> the unit's descriptor, so WriteFrame carries the media metadata.
 	descOf := map[uint32]meld.FrameDesc{}
 	for _, sh := range c.shaped {
-		fd := meld.FrameDesc{FrameID: sh.Unit.ID, RefFrameIDs: sh.Unit.RefersTo,
-			Chunks: uint16(len(c.unitChunks[sh.Unit.ID])), RAP: sh.Unit.RAP, Discardable: sh.Unit.Discardable}
-		if uep {
-			fd.Priority = sh.Unit.Class.Wire()
-		} else {
-			fd.Priority = 2 // base tier (media-blind)
-		}
+		fd := meldFrameDesc(sh, len(c.unitChunks[sh.Unit.ID]), arm.uep)
 		for _, s := range c.unitChunks[sh.Unit.ID] {
 			descOf[s] = fd
 		}
@@ -422,9 +716,12 @@ func runMeld(c *chunked, uep, sliding bool, loss float64, rttMs, budgetMs int, p
 	start := time.Now()
 	for i, pkt := range c.chunks {
 		seq := binary.BigEndian.Uint32(pkt[:seqHdr])
-		if uep {
+		switch {
+		case arm.frame:
 			tx.WriteFrame(pkt, descOf[seq])
-		} else {
+		case arm.uep:
+			tx.WriteUnit(pkt, descOf[seq].Priority)
+		default:
 			tx.WriteUnit(pkt, 2)
 		}
 		if d := time.Duration(i+1)*time.Duration(paceUs)*time.Microsecond - time.Since(start); d > 0 {
@@ -433,11 +730,11 @@ func runMeld(c *chunked, uep, sliding bool, loss float64, rttMs, budgetMs int, p
 	}
 	tx.Flush()
 	time.Sleep(owd + time.Duration(budgetMs+400)*time.Millisecond)
+	txStats, rxStats := tx.Stats(), rx.Stats()
 	tx.Close()
 	rx.Close()
 	<-done
 	if os.Getenv("GLASSDBG") != "" {
-		ts, rs := tx.Stats(), rx.Stats()
 		var miss [10]int
 		total := len(c.chunks)
 		for i := 0; i < total; i++ {
@@ -445,10 +742,13 @@ func runMeld(c *chunked, uep, sliding bool, loss float64, rttMs, budgetMs int, p
 				miss[i*10/total]++
 			}
 		}
-		fmt.Fprintf(os.Stderr, "[dbg sld=%v] tx src=%d repair=%d(reactive=%d) | relay enq=%d sent=%d | rx deliv=%d recov=%d lost=%d evicted=%d | got=%d/%d | miss-by-decile=%v\n",
-			cfg.Sliding, ts.Source, ts.Repair, ts.ReactiveRepair, relayEnq.Load(), relaySent.Load(), rs.Delivered, rs.Recovered, rs.Lost, rs.Evicted, len(got), total, miss)
+		fmt.Fprintf(os.Stderr, "[dbg arm=%s frame=%v uep=%v atomic=%v noframepolicy=%v sld=%v] tx src=%d repair=%d(reactive=%d throttled=%d) | relay enq=%d sent=%d | rx deliv=%d recov=%d lost=%d evicted=%d | got=%d/%d | miss-by-decile=%v\n",
+			arm.name, arm.frame, arm.uep, cfg.FrameAtomic, arm.disableFramePolicy, cfg.Sliding,
+			txStats.Source, txStats.Repair, txStats.ReactiveRepair, txStats.Throttled,
+			relayEnq.Load(), relaySent.Load(),
+			rxStats.Delivered, rxStats.Recovered, rxStats.Lost, rxStats.Evicted, len(got), total, miss)
 	}
-	return got
+	return meldRunResult{got: got, txStats: txStats, rxStats: rxStats, relayEnq: relayEnq.Load(), relaySent: relaySent.Load()}
 }
 
 // --- C-stack arms (real subprocess + relay) — cref-identical drive ---
@@ -488,6 +788,55 @@ func feed(port int, chunks [][]byte, paceUs int64) {
 	}
 }
 
+type benchProc struct {
+	cmd  *exec.Cmd
+	done chan struct{}
+	mu   sync.Mutex
+	err  error
+}
+
+func startBenchProc(cmd *exec.Cmd) (*benchProc, error) {
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	p := &benchProc{cmd: cmd, done: make(chan struct{})}
+	go func() {
+		err := cmd.Wait()
+		p.mu.Lock()
+		p.err = err
+		p.mu.Unlock()
+		close(p.done)
+	}()
+	return p, nil
+}
+
+func (p *benchProc) waitErr() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.err
+}
+
+func (p *benchProc) exited() (error, bool) {
+	select {
+	case <-p.done:
+		return p.waitErr(), true
+	default:
+		return nil, false
+	}
+}
+
+func (p *benchProc) stop() {
+	if p == nil {
+		return
+	}
+	if _, ok := p.exited(); ok {
+		return
+	}
+	_ = p.cmd.Process.Kill()
+	<-p.done
+}
+
 func runLibsrt(c *chunked, loss float64, rttMs, latMs int, paceUs int64, seed int64, fec string) map[uint32]bool {
 	owd := time.Duration(rttMs/2) * time.Millisecond
 	rport, sink := freeUDP(), freeUDP()
@@ -502,26 +851,44 @@ func runLibsrt(c *chunked, loss float64, rttMs, latMs int, paceUs int64, seed in
 	recv := exec.Command("srt-live-transmit",
 		fmt.Sprintf("srt://:%d?mode=listener&latency=%d%s", rport, latMs, pf),
 		fmt.Sprintf("udp://127.0.0.1:%d", sink))
-	if recv.Start() != nil {
+	recvP, err := startBenchProc(recv)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "libsrt recv:", err)
 		return nil
 	}
+	defer recvP.stop()
 	time.Sleep(1000 * time.Millisecond)
-	feedp, stop := relayOn(0, fmt.Sprintf("127.0.0.1:%d", rport), dropper(loss, seed), owd)
+	if err, ok := recvP.exited(); ok {
+		fmt.Fprintln(os.Stderr, "libsrt recv exited:", err)
+		return nil
+	}
+	feedp, stop := relayOn(0, fmt.Sprintf("127.0.0.1:%d", rport), dropper(loss, seed), owd, seed, nil)
 	defer stop()
 	feedInPort := freeUDP()
 	send := exec.Command("srt-live-transmit",
 		fmt.Sprintf("udp://:%d", feedInPort),
 		fmt.Sprintf("srt://127.0.0.1:%d?mode=caller&latency=%d%s", feedp, latMs, pf))
-	if send.Start() != nil {
+	sendP, err := startBenchProc(send)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "libsrt send:", err)
 		return nil
 	}
+	defer sendP.stop()
 	time.Sleep(1500*time.Millisecond + owd)
+	if err, ok := sendP.exited(); ok {
+		fmt.Fprintln(os.Stderr, "libsrt send exited:", err)
+		return nil
+	}
 	feed(feedInPort, c.chunks, paceUs)
 	time.Sleep(owd + time.Duration(latMs+800)*time.Millisecond)
-	send.Process.Kill()
-	send.Wait()
-	recv.Process.Kill()
-	recv.Wait()
+	if err, ok := sendP.exited(); ok {
+		fmt.Fprintln(os.Stderr, "libsrt send exited after feed:", err)
+		return nil
+	}
+	if err, ok := recvP.exited(); ok {
+		fmt.Fprintln(os.Stderr, "libsrt recv exited after feed:", err)
+		return nil
+	}
 	return got
 }
 
@@ -538,28 +905,46 @@ func runLibrist(c *chunked, loss float64, rttMs, latMs int, paceUs int64, seed i
 	recv := exec.Command(tools+"/ristreceiver", "-p", "0", "-b", strconv.Itoa(latMs),
 		"-i", fmt.Sprintf("rist://@127.0.0.1:%d", rport), "-o", fmt.Sprintf("udp://127.0.0.1:%d", sink))
 	recv.Env = env
-	if recv.Start() != nil {
+	recvP, err := startBenchProc(recv)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "librist recv:", err)
 		return nil
 	}
+	defer recvP.stop()
 	time.Sleep(1200 * time.Millisecond)
+	if err, ok := recvP.exited(); ok {
+		fmt.Fprintln(os.Stderr, "librist recv exited:", err)
+		return nil
+	}
 	relayE := freeEven()
-	_, sA := relayOn(relayE, fmt.Sprintf("127.0.0.1:%d", rport), dropper(loss, seed), owd) // RTP media (dropped)
-	_, sB := relayOn(relayE+1, fmt.Sprintf("127.0.0.1:%d", rport+1), nil, owd)             // RTCP/NACK (clean)
+	_, sA := relayOn(relayE, fmt.Sprintf("127.0.0.1:%d", rport), dropper(loss, seed), owd, seed, nil) // RTP media (dropped)
+	_, sB := relayOn(relayE+1, fmt.Sprintf("127.0.0.1:%d", rport+1), nil, owd, seed+1, nil)           // RTCP/NACK (clean)
 	defer sA()
 	defer sB()
 	send := exec.Command(tools+"/ristsender", "-p", "0", "-b", strconv.Itoa(latMs),
 		"-i", fmt.Sprintf("udp://@127.0.0.1:%d", feedIn), "-o", fmt.Sprintf("rist://127.0.0.1:%d", relayE))
 	send.Env = env
-	if send.Start() != nil {
+	sendP, err := startBenchProc(send)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "librist send:", err)
 		return nil
 	}
+	defer sendP.stop()
 	time.Sleep(1500*time.Millisecond + owd)
+	if err, ok := sendP.exited(); ok {
+		fmt.Fprintln(os.Stderr, "librist send exited:", err)
+		return nil
+	}
 	feed(feedIn, c.chunks, paceUs)
 	time.Sleep(owd + time.Duration(latMs+800)*time.Millisecond)
-	send.Process.Kill()
-	send.Wait()
-	recv.Process.Kill()
-	recv.Wait()
+	if err, ok := sendP.exited(); ok {
+		fmt.Fprintln(os.Stderr, "librist send exited after feed:", err)
+		return nil
+	}
+	if err, ok := recvP.exited(); ok {
+		fmt.Fprintln(os.Stderr, "librist recv exited after feed:", err)
+		return nil
+	}
 	return got
 }
 
@@ -568,13 +953,80 @@ type score struct {
 	frameRate, keyRate float64
 }
 
+type benchRun struct {
+	seqs  map[uint32]bool
+	meld  *meldRunResult
+	trace *seedTrace
+}
+
 func grade(c *chunked, seqs map[uint32]bool) (score, []byte, int) {
 	du := c.deliveredUnits(seqs)
-	h264, pics := c.reassemble(du)
+	_, pics := c.reassembleDecodable(du)
 	return score{
 		frameRate: shape.DecodableFrameRate(c.units, du),
 		keyRate:   shape.DecodableKeyframeRate(c.units, du),
-	}, h264, pics
+	}, c.reassembleDelivered(seqs), pics
+}
+
+type missingSummary struct {
+	firstMissingUnit    int64
+	firstMissingPicture int64
+	firstMissingKey     int64
+	firstBrokenUnit     int64
+	firstBrokenRef      int64
+}
+
+func missingSummaryFor(c *chunked, seqs map[uint32]bool) missingSummary {
+	out := missingSummary{-1, -1, -1, -1, -1}
+	delivered := c.deliveredUnits(seqs)
+	dec := shape.Decodable(c.units, delivered)
+	for _, sh := range c.shaped {
+		id := sh.Unit.ID
+		if !delivered[id] {
+			if out.firstMissingUnit < 0 {
+				out.firstMissingUnit = int64(id)
+			}
+			if sh.Unit.Picture && out.firstMissingPicture < 0 {
+				out.firstMissingPicture = int64(id)
+			}
+			if sh.Unit.RAP && out.firstMissingKey < 0 {
+				out.firstMissingKey = int64(id)
+			}
+			continue
+		}
+		if !dec[id] && out.firstBrokenUnit < 0 {
+			out.firstBrokenUnit = int64(id)
+			for _, ref := range sh.Unit.RefersTo {
+				if !dec[ref] {
+					out.firstBrokenRef = int64(ref)
+					break
+				}
+			}
+		}
+	}
+	return out
+}
+
+func printSeedDiag(c *chunked, arm string, rep int, seed int64, ff int, sc score, seqs map[uint32]bool, m *meldRunResult) {
+	if os.Getenv("GLASSDBG") == "" {
+		return
+	}
+	ms := missingSummaryFor(c, seqs)
+	chunks := len(seqs)
+	txSrc, txRepair, txReactive, txThrottled := uint64(0), uint64(0), uint64(0), uint64(0)
+	rxDelivered, rxRecovered, rxLost, rxEvicted := uint64(0), uint64(0), uint64(0), uint64(0)
+	relayEnq, relaySent := int64(-1), int64(-1)
+	if m != nil {
+		txSrc, txRepair, txReactive, txThrottled = m.txStats.Source, m.txStats.Repair, m.txStats.ReactiveRepair, m.txStats.Throttled
+		rxDelivered, rxRecovered, rxLost, rxEvicted = m.rxStats.Delivered, m.rxStats.Recovered, m.rxStats.Lost, m.rxStats.Evicted
+		relayEnq, relaySent = m.relayEnq, m.relaySent
+	}
+	fmt.Fprintf(os.Stderr,
+		"glassseed arm=%s rep=%d seed=%d ff=%d frame_pct=%.3f key_pct=%.3f chunks=%d/%d tx_src=%d tx_repair=%d tx_reactive=%d tx_throttled=%d relay_enq=%d relay_sent=%d rx_delivered=%d rx_recovered=%d rx_lost=%d rx_evicted=%d first_missing_unit=%d first_missing_picture=%d first_missing_key=%d first_broken_unit=%d first_broken_ref=%d\n",
+		arm, rep, seed, ff, sc.frameRate, sc.keyRate, chunks, len(c.chunks),
+		txSrc, txRepair, txReactive, txThrottled, relayEnq, relaySent,
+		rxDelivered, rxRecovered, rxLost, rxEvicted,
+		ms.firstMissingUnit, ms.firstMissingPicture, ms.firstMissingKey, ms.firstBrokenUnit, ms.firstBrokenRef)
 }
 
 func main() {
@@ -587,11 +1039,16 @@ func main() {
 	maxMbps := flag.Float64("maxmbps", 0, "meld MaxBitrate cap Mbps (0=default ~100); set near source rate to create UEP scarcity")
 	reps := flag.Int("reps", 4, "seeds per arm")
 	chunkSize := flag.Int("chunk", 1316, "video bytes per chunk")
-	arms := flag.String("arms", "meld-uep,meld-flat,libsrt,libsrt-fec,librist", "comma list")
+	arms := flag.String("arms", "meld-auto,libsrt,librist", "comma list")
 	sweep := flag.Bool("sweep", false, "iso-quality min-latency mode: find each transport's B_min vs RTT for quality bar -q")
 	q := flag.Float64("q", 0.999, "quality bar: minimum delivery fraction (sweep mode)")
 	rtts := flag.String("rtts", "20,50,100,200,400", "RTTs (ms) to sweep (sweep mode)")
 	streamK := flag.Int("streamk", 4, "stream-length multiplier so delivery%% resolves a tight bar (sweep mode)")
+	macroFrontier := flag.Bool("macrofrontier", false, "macro frontier mode: sweep ffprobe-decoded frames across loss/burst/RTT/latency")
+	frontierLosses := flag.String("frontierlosses", "0.05,0.10", "macro frontier forward loss fractions")
+	frontierBursts := flag.String("frontierbursts", "0,24", "macro frontier GE mean burst lengths in packets (0=i.i.d.)")
+	frontierMults := flag.String("frontiermults", "1,1.5,2,3", "macro frontier latency budgets as RTT multipliers")
+	frontierTop := flag.Int("frontiertop", 8, "macro frontier rows per summary section")
 	geburst := flag.Float64("geburst", 0, "GE mean burst length in packets (0=i.i.d.); marginal loss stays -loss")
 	atxrtt := flag.Float64("atxrtt", 0, "probe mode: measure delivery at this fixed ×RTT budget (no bisection), printing per-seed spread")
 	sldwin := flag.Int("sldwin", 256, "Meld sliding CodingWindow (max band width); 0 = coder default")
@@ -600,7 +1057,15 @@ func main() {
 	gensize := flag.Int("gensize", 0, "Meld GenSize override (0 = default)")
 	noauto := flag.Bool("noauto", false, "disable Meld AutoGenSize (pin GenSize)")
 	noreorder := flag.Bool("noreorder", false, "disable Meld AutoReorderHoldoff (on by default)")
+	sourceConstrained := flag.Bool("sourceconstrained", false, "model a constrained encoder/source: drop AVC SEI positively identified as non-recovery; default preserves SEI")
+	sourceDropDisposable := flag.Bool("sourcedropdisposable", false, "constrained AVC source model: also drop non-reference disposable pictures")
+	autoEncoderCadence := flag.Bool("autoencoder", false, "macro frontier: model Meld encoder recovery-cadence actuator; meld-auto may use bounded x264 source variants")
+	autoEncoderInterval := flag.Int("autoencoderinterval", 0, "macro frontier autoencoder: recovery interval in frames (0=mode default)")
+	autoEncoderByteCap := flag.Float64("autoencoderbytecap", 0, "macro frontier autoencoder: max Meld source bytes as a multiple of baseline source bytes (0=unbounded)")
+	autoEncoderPSNRMin := flag.Float64("autoencoderpsnrmin", 0, "macro frontier autoencoder: minimum average PSNR dB vs baseline source (0=disabled)")
 	jitterMs := flag.Int("jitter", 0, "max per-datagram forward jitter ms (injects reorder)")
+	reportDir := flag.String("reportdir", "", "write ladder report artifacts to this directory")
+	reportCaseName := flag.String("reportcase", "", "case name for report artifacts (default derived from loss/burst/RTT)")
 	flag.Parse()
 	jitterDur = time.Duration(*jitterMs) * time.Millisecond
 	meldNoReorder = *noreorder
@@ -611,7 +1076,12 @@ func main() {
 	meldGenSize = *gensize
 	meldNoAuto = *noauto
 
-	c, err := chunkClip(*clip, *chunkSize)
+	clipPath := *clip
+	avcOpts := shape.AVCOptions{
+		SourceConstrained:      *sourceConstrained || *sourceDropDisposable,
+		DropDisposablePictures: *sourceDropDisposable,
+	}
+	c, err := chunkClip(clipPath, *chunkSize, avcOpts)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "clip:", err)
 		os.Exit(1)
@@ -636,6 +1106,34 @@ func main() {
 		paceUs = 1
 	}
 	meldMax := int64(*maxMbps * 1e6)
+	if *macroFrontier {
+		if err := runMacroFrontier(c, macroFrontierOptions{
+			Losses:              parseFloatList(*frontierLosses),
+			Bursts:              parseFloatList(*frontierBursts),
+			RTTs:                parseRTTs(*rtts),
+			Mults:               parseFloatList(*frontierMults),
+			Arms:                strings.Split(*arms, ","),
+			Reps:                *reps,
+			FloorMs:             *floorMs,
+			PaceUs:              paceUs,
+			MeldMax:             meldMax,
+			Mbps:                *mbps,
+			ChunkSize:           *chunkSize,
+			TotalPics:           totalPics,
+			OutDir:              *reportDir,
+			TopN:                *frontierTop,
+			SourceClip:          clipPath,
+			AVCOpts:             avcOpts,
+			AutoEncoderCadence:  *autoEncoderCadence,
+			AutoEncoderInterval: *autoEncoderInterval,
+			AutoEncoderByteCap:  *autoEncoderByteCap,
+			AutoEncoderPSNRMin:  *autoEncoderPSNRMin,
+		}); err != nil {
+			fmt.Fprintln(os.Stderr, "macro frontier:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if *sweep {
 		if *atxrtt > 0 {
 			runProbe(c, *loss, paceUs, meldMax, *mbps, parseRTTs(*rtts), *reps, *atxrtt, *streamK, strings.Split(*arms, ","))
@@ -644,44 +1142,134 @@ func main() {
 		}
 		return
 	}
-	// no-loss sanity: ffprobe must decode all pictures from the full clip
-	full := map[uint32]bool{}
-	for _, u := range c.units {
-		full[u.ID] = true
+	var report *benchReport
+	if *reportDir != "" {
+		name := strings.TrimSpace(*reportCaseName)
+		if name == "" {
+			name = makeCaseName(*loss, *geburst, *rtt, *mult, *jitterMs)
+		}
+		var err error
+		report, err = newBenchReport(*reportDir, reportCase{
+			Name:                name,
+			Clip:                *clip,
+			Loss:                *loss,
+			GEBurst:             *geburst,
+			RTTMs:               *rtt,
+			RTTMult:             *mult,
+			BufferMs:            *floorMs,
+			BudgetMs:            budgetMs,
+			BitrateMbps:         *mbps,
+			MaxMbps:             *maxMbps,
+			ChunkSize:           *chunkSize,
+			Reps:                *reps,
+			Arms:                *arms,
+			SldWindow:           *sldwin,
+			AutoEncoderCadence:  *autoEncoderCadence,
+			AutoEncoderInterval: *autoEncoderInterval,
+			AutoEncoderByteCap:  *autoEncoderByteCap,
+			AutoEncoderPSNRMin:  *autoEncoderPSNRMin,
+			JitterMs:            *jitterMs,
+			SourceConstrained:   avcOpts.SourceConstrained,
+			DropDisposable:      avcOpts.DropDisposablePictures,
+		})
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "report:", err)
+			os.Exit(1)
+		}
 	}
-	fullH, fullPics := c.reassemble(full)
+	// no-loss sanity: ffprobe must decode all pictures from the full clip
+	fullSeqs := map[uint32]bool{}
+	for i := range c.chunks {
+		fullSeqs[uint32(i)] = true
+	}
+	fullH := c.reassembleDelivered(fullSeqs)
+	_, fullPics := c.reassembleDecodable(c.deliveredUnits(fullSeqs))
+	fullFF, err := ffprobeFrames(fullH)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "ffprobe full clip:", err)
+		os.Exit(1)
+	}
+	if fullFF != fullPics {
+		fmt.Fprintf(os.Stderr, "ffprobe full clip decoded %d frames, model predicts %d\n", fullFF, fullPics)
+		os.Exit(1)
+	}
 	fmt.Printf("# glassbench: %s — %d units, %d pictures, %d keyframes, %d DISPOSABLE units, %d chunks (%dB)\n",
 		*clip, len(c.units), totalPics, totalKey, disposable, len(c.chunks), *chunkSize)
-	fmt.Printf("# ffprobe(full clip) = %d frames (decodable-set model predicts %d)\n", ffprobeFrames(fullH), fullPics)
+	fmt.Printf("# ffprobe(full clip) = %d frames (decodable-set model predicts %d)\n", fullFF, fullPics)
 	fmt.Printf("# loss %.0f%%, RTT %dms, budget %dms (%dxRTT), %.0f Mbps, %d seeds; arbiter=ffprobe\n",
 		*loss*100, *rtt, budgetMs, *mult, *mbps, *reps)
+	if avcOpts.SourceConstrained {
+		fmt.Printf("# source constrained: AVC non-recovery SEI shed before transport\n")
+	}
+	if avcOpts.DropDisposablePictures {
+		fmt.Printf("# source constrained: AVC non-reference pictures shed before transport\n")
+	}
 	fmt.Printf("# metric: ffprobe-decoded frames (mean), and the model's decodable frame%% / keyframe%%\n\n")
-	fmt.Printf("%-12s  ff-frames  frame%%  keyframe%%\n", "arm")
+	fmt.Printf("%-24s  ff-frames  frame%%  keyframe%%\n", "arm")
 
-	run := func(name string, fn func(seed int64) map[uint32]bool) {
+	run := func(name string, fn func(seed int64, trace *seedTrace) benchRun) {
 		var ffSum int
 		var frSum, kfSum float64
+		var repairSum, reactiveSum uint64
 		ok := 0
+		failed := 0
 		for s := 1; s <= *reps; s++ {
-			seqs := fn(int64(s)*7919 + 13)
+			seed := int64(s)*7919 + 13
+			var trace *seedTrace
+			if report != nil {
+				trace = report.newTrace(name, s, seed)
+			}
+			res := fn(seed, trace)
+			seqs := res.seqs
 			if seqs == nil {
+				failed++
 				continue
 			}
 			sc, h264, _ := grade(c, seqs)
-			ff := ffprobeFrames(h264)
-			if ff < 0 {
-				ff = 0
+			ff, err := ffprobeFrames(h264)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "%s seed %d ffprobe: %v\n", name, s, err)
+				failed++
+				continue
+			}
+			printSeedDiag(c, name, s, seed, ff, sc, seqs, res.meld)
+			if res.meld != nil {
+				repairSum += res.meld.txStats.Repair
+				reactiveSum += res.meld.txStats.ReactiveRepair
+			}
+			if report != nil {
+				if err := report.addSeed(c, name, s, seed, ff, sc, seqs, res.meld, res.trace); err != nil {
+					fmt.Fprintln(os.Stderr, "report seed:", err)
+					failed++
+					continue
+				}
 			}
 			ffSum += ff
 			frSum += sc.frameRate
 			kfSum += sc.keyRate
 			ok++
 		}
-		if ok == 0 {
-			fmt.Printf("%-12s  FAILED\n", name)
+		addReportResult := func() {
+			if report == nil {
+				return
+			}
+			row := reportResult{Case: report.cas.Name, Arm: name, Failed: failed, Seeds: ok}
+			if ok > 0 {
+				row.FFMean = float64(ffSum) / float64(ok)
+				row.FramePctMean = frSum / float64(ok)
+				row.KeyPctMean = kfSum / float64(ok)
+				row.RepairMean = float64(repairSum) / float64(ok)
+				row.ReactiveMean = float64(reactiveSum) / float64(ok)
+			}
+			report.addResult(row)
+		}
+		if failed > 0 || ok == 0 {
+			addReportResult()
+			fmt.Printf("%-24s  FAILED (%d/%d seeds failed)\n", name, failed, *reps)
 			return
 		}
-		fmt.Printf("%-12s  %7.1f   %5.1f%%   %6.1f%%\n",
+		addReportResult()
+		fmt.Printf("%-24s  %7.1f   %5.1f%%   %6.1f%%\n",
 			name, float64(ffSum)/float64(ok), 100*frSum/float64(ok), 100*kfSum/float64(ok))
 	}
 
@@ -689,33 +1277,52 @@ func main() {
 	for _, a := range strings.Split(*arms, ",") {
 		want[strings.TrimSpace(a)] = true
 	}
-	order := []string{"meld-uep", "meld-flat", "libsrt", "libsrt-fec", "librist"}
+	order := []string{
+		"meld", "meld-auto", "meld-flat", "meld-flat-unit",
+		"meld-uep-unit", "meld-flat-frame", "meld-uep", "meld-uep-frame", "meld-uep-frame-atomic", "meld-uep-frame-noatomic",
+		"meld-sld", "meld-sld-uep", "meld-repair-ceiling",
+		"oracle-source", "oracle-ideal",
+		"libsrt", "libsrt-fec", "librist",
+	}
 	sort.SliceStable(order, func(i, j int) bool { return false })
 	for _, a := range order {
 		if !want[a] {
 			continue
 		}
+		if isMeldArm(a) {
+			run(a, func(seed int64, trace *seedTrace) benchRun {
+				res := runMeldNamedTrace(c, a, *loss, *rtt, budgetMs, paceUs, meldMax, seed, trace)
+				return benchRun{seqs: res.got, meld: &res, trace: trace}
+			})
+			continue
+		}
 		switch a {
-		case "meld-uep":
-			run("meld-uep", func(seed int64) map[uint32]bool {
-				return runMeld(c, true, false, *loss, *rtt, budgetMs, paceUs, meldMax, seed)
+		case "oracle-source":
+			run("oracle-source", func(seed int64, trace *seedTrace) benchRun {
+				return benchRun{seqs: allChunkSeqs(c), trace: trace}
 			})
-		case "meld-flat":
-			run("meld-flat", func(seed int64) map[uint32]bool {
-				return runMeld(c, false, false, *loss, *rtt, budgetMs, paceUs, meldMax, seed)
-			})
-		case "meld-sld":
-			run("meld-sld", func(seed int64) map[uint32]bool {
-				return runMeld(c, false, true, *loss, *rtt, budgetMs, paceUs, meldMax, seed)
+		case "oracle-ideal":
+			run("oracle-ideal", func(seed int64, trace *seedTrace) benchRun {
+				return benchRun{seqs: idealDeadlineSeqs(c, *rtt, budgetMs), trace: trace}
 			})
 		case "libsrt":
-			run("libsrt", func(seed int64) map[uint32]bool { return runLibsrt(c, *loss, *rtt, budgetMs, paceUs, seed, "") })
+			run("libsrt", func(seed int64, trace *seedTrace) benchRun {
+				return benchRun{seqs: runLibsrt(c, *loss, *rtt, budgetMs, paceUs, seed, ""), trace: trace}
+			})
 		case "libsrt-fec":
-			run("libsrt-fec", func(seed int64) map[uint32]bool {
-				return runLibsrt(c, *loss, *rtt, budgetMs, paceUs, seed, "fec,cols:10,rows:5,arq:onreq")
+			run("libsrt-fec", func(seed int64, trace *seedTrace) benchRun {
+				return benchRun{seqs: runLibsrt(c, *loss, *rtt, budgetMs, paceUs, seed, "fec,cols:10,rows:5,arq:onreq"), trace: trace}
 			})
 		case "librist":
-			run("librist", func(seed int64) map[uint32]bool { return runLibrist(c, *loss, *rtt, budgetMs, paceUs, seed) })
+			run("librist", func(seed int64, trace *seedTrace) benchRun {
+				return benchRun{seqs: runLibrist(c, *loss, *rtt, budgetMs, paceUs, seed), trace: trace}
+			})
+		}
+	}
+	if report != nil {
+		if err := report.write(); err != nil {
+			fmt.Fprintln(os.Stderr, "report:", err)
+			os.Exit(1)
 		}
 	}
 }

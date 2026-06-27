@@ -63,6 +63,7 @@ type simResult struct {
 	latencyMicros []int64 // per-delivered-symbol latency (now - write time), for p50/p99
 	finalPEst     float64 // the sender's loss estimate at end of run (feedback-driven; for diagnostics)
 	finalBurstQ8  int     // the sender's burstiness estimate at end of run (Q8; 256 == i.i.d.)
+	finalCliff    bool    // whether the sender detected an unsatisfiable one-way-delay budget
 }
 
 // pctlMicros returns the p-th percentile (0..1) of the latency samples in microseconds, or 0 if empty.
@@ -246,6 +247,7 @@ func (sl simLink) run() simResult {
 	res.sstats = s.Stats()
 	if gs, ok := s.(*Sender); ok {
 		res.finalPEst, res.finalBurstQ8 = gs.pEst, gs.burstQ8
+		res.finalCliff = gs.delayCliff
 	}
 	return res
 }

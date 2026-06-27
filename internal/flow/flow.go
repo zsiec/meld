@@ -129,21 +129,29 @@ type Config struct {
 	// BufferMicros is the playout/deadline budget: a generation must be delivered
 	// within this of its start, or its still-missing symbols are declared lost.
 	BufferMicros int64
-	// Sliding selects the band-form sliding-window coder instead of the default
-	// generation coder: a repair is fungible across a coding window of CodingWindow
-	// symbols, delivered on decode (no per-generation close), at O(CodingWindow²)
-	// decode cost. Use it when the latency budget is TIGHT relative to the RTT —
-	// especially budget < RTT (long-haul low-latency contribution), where its
-	// continuous RTT-independent proactive repair recovers within a deadline an ARQ
-	// round trip and the generation coder's reactive tier cannot — and on
-	// bandwidth-constrained links (lower repair overhead). At a generous budget with
-	// a low RTT the generation coder has lower latency, so leave this off there.
+	// Sliding selects the band-form sliding-window coder, the default main profile:
+	// a repair is fungible across a coding window of CodingWindow symbols, delivered
+	// on decode (no per-generation close), at O(CodingWindow²) decode cost. Its
+	// continuous RTT-independent repair is the primary low-latency media path; set it
+	// false to use the generation coder fallback/control path.
 	Sliding bool
 	// CodingWindow is the MAX sliding band width in source symbols — the recovery span
 	// and O(window²) decode-cost cap. The sender adapts the effective span below it to
 	// the deadline budget (see SlidingSender.effectiveBand), so this is a ceiling, not
 	// a fixed width. 0 selects the default. Ignored unless Sliding.
 	CodingWindow int
+	// SingletonRepairGap delays targeted one-source repair for protected/reference chunks
+	// by this many later source symbols, putting the source and its dedicated repair in
+	// different burst neighborhoods. 0 selects the default short-burst spacing.
+	// Sender-side policy; the receiver follows the wire symbol's WindowBase/N.
+	SingletonRepairGap int
+	// ProtectedRepairPhasing lets the sliding sender move protected singleton and sparse
+	// repair release points around SingletonRepairGap, and when no explicit gap is
+	// configured it expands that spacing from the measured loss-run length. That makes
+	// protected repairs exist in different burst neighborhoods at emission time while
+	// keeping the repair count unchanged. Sender-side policy; on by default for the
+	// sliding media profile.
+	ProtectedRepairPhasing bool
 	// MaxGenSymbols caps a symbol's declared window N (RFC 8681 ls_max_size): the
 	// receiver refuses any symbol with N greater than this, bounding decoder
 	// allocation against a forged wide window (the raw uint16 N would otherwise size a
@@ -215,21 +223,20 @@ type Config struct {
 	// frame (the next keyframe) delivers sooner and the cursor advances past the dead
 	// sub-tree. Because the sender retires every generation below the reported cursor
 	// (DecodedLowEdge), that advance is also the implicit "stop repairing this GOP"
-	// signal — reactive repair budget is reclaimed for live generations, no extra wire
-	// field. Requires frame descriptors (Sender.WriteFrame); a no-op for plain byte
-	// streams. OFF by default: it trades byte-completeness (a doomed-but-recoverable id
+	// signal — reactive repair budget is reclaimed for live coding windows, no extra wire
+	// field. Works in both generation and sliding profiles. Requires frame descriptors
+	// (Sender.WriteFrame); a no-op for plain byte streams. OFF by default: it trades byte-completeness (a doomed-but-recoverable id
 	// is dropped) for picture-completeness (every DECODABLE frame is still delivered
 	// whole, in order, never late), so only media flows that consume whole frames want it.
 	EvictBrokenFrames bool
 	// FrameAtomic makes delivery picture-atomic: an access unit's source ids are released to
 	// the application ALL TOGETHER once the whole frame is recoverable in time, or dropped ALL
 	// TOGETHER (including its already-recovered chunks) if any chunk is unrecoverable, its
-	// reference sub-tree is dead, or its deadline passes incomplete. So the decoder is NEVER
-	// handed a PARTIAL access unit — it gets a clean whole frame or a clean gap to conceal
-	// (freeze / motion-compensated extrapolation), which the human visual system tolerates far
-	// better than the spatial artifacts (and predictor poisoning) of a half-decoded frame. The
-	// perceptual form of EvictBrokenFrames, superseding it when set. Requires frame descriptors
-	// (Sender.WriteFrame); a no-op for plain byte streams. ON by default for media flows.
+	// reference sub-tree is dead, or its deadline passes incomplete. This is an opt-in decoder
+	// hygiene policy for consumers that prefer clean frame gaps over partial access units.
+	// It is OFF by default because it deliberately drops recoverable bytes and is a consumer
+	// policy, not a byte-stream transport invariant. Requires frame descriptors
+	// (Sender.WriteFrame); a no-op for plain byte streams.
 	FrameAtomic bool
 	// ShedTopLayerOverBudget makes the SENDER proactively shed the top temporal layer under
 	// budget pressure: when the offered media rate exceeds the rate budget, the highest-TID
@@ -308,25 +315,41 @@ func (c Config) codingWindow() int {
 	return defaultCodingWindow
 }
 
+// singletonRepairGap returns the source-symbol separation between a protected
+// systematic and its targeted repair.
+func (c Config) singletonRepairGap() uint32 {
+	if c.SingletonRepairGap > 0 {
+		return uint32(c.SingletonRepairGap)
+	}
+	if c.Sliding {
+		return slidingSingletonRepairGap
+	}
+	return defaultSingletonRepairGap
+}
+
 // DefaultConfig returns a reasonable starting configuration for a 1316-byte
-// media chunk (the bench/RTP payload size).
+// media chunk (the bench/RTP payload size). The main profile is the band-form
+// sliding coder; set Sliding=false to use the legacy generation coder.
 func DefaultConfig() Config {
 	return Config{
-		SymbolSize:     1316,
-		GenSize:        16,
-		Redundancy:     0.15, // floor; the controller adapts above it
-		TargetFailure:  1e-3,
-		BufferMicros:   200_000, // 200 ms
-		Pace:           true,    // host pacer on: smooth to the budget, backpressure the source
-		ProactiveDecay: true,    // on by default: burst-guarded variance-margin offload (cuts overhead, self-reverts on bursts)
-		AutoGenSize:    true,    // on by default: zero-config self-measuring generation width (Pareto win over fixed GenSize across a real-timing sweep; no-op where it can't help, fixes the fixed-width burst/high-RTT delivery holes)
+		SymbolSize:             1316,
+		GenSize:                16,
+		Redundancy:             0.15, // floor; the controller adapts above it
+		TargetFailure:          1e-3,
+		BufferMicros:           200_000, // 200 ms
+		Sliding:                true,    // main media profile: continuous coded repair + UEP-friendly WriteFrame metadata
+		Pace:                   true,    // host pacer on: smooth to the budget, backpressure the source
+		ProtectedRepairPhasing: true,    // on by default: burst-aware emission timing for protected reference repair
+		ProactiveDecay:         true,    // on by default: burst-guarded variance-margin offload (cuts overhead, self-reverts on bursts)
+		AutoGenSize:            true,    // on by default: zero-config self-measuring generation width (Pareto win over fixed GenSize across a real-timing sweep; no-op where it can't help, fixes the fixed-width burst/high-RTT delivery holes)
 		// on by default: cap proactive repair to the rate budget so a tight budget sheds protection
 		// gracefully instead of the host pacer delaying media (fixes the budget<2xRTT delivery
 		// collapse — bench: 4% → ~99%); inert where the budget is ample (byte-identical), never hurts.
 		RepairWithinBudget: true,
-		// on by default: deliver each access unit all-or-nothing so the decoder never renders a
-		// partial picture (a no-op for byte streams, which carry no frame descriptors).
-		FrameAtomic: true,
+		// FrameAtomic is intentionally opt-in: the default media path keeps deliverable bytes
+		// flowing and uses WriteFrame metadata for protection/telemetry rather than destructive
+		// all-or-nothing gating.
+		FrameAtomic: false,
 		// on by default: size the loss-estimate reorder window from measured reorder. Self-disabling
 		// where there is no reorder (a cref no-regression sweep across loss 1/3/8% holds delivery and
 		// cuts proactive overhead severalfold under real-timing reorder); single-path only for now.

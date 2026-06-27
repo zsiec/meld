@@ -19,9 +19,9 @@ const handshakeTimeout = 10 * time.Second
 var (
 	// errHandshakeTimeout is returned when the encryption handshake does not complete.
 	errHandshakeTimeout = errors.New("meld: session: encryption handshake timed out")
-	// ErrChunkTooLarge is returned when an encrypted Write exceeds SymbolSize-Overhead (the
-	// AEAD tag leaves 16 fewer bytes than the cleartext budget).
-	ErrChunkTooLarge = errors.New("meld: session: encrypted chunk exceeds SymbolSize minus the AEAD tag")
+	// ErrChunkTooLarge is returned when a Write exceeds the payload space that fits
+	// into one coded symbol. Encrypted flows reserve the AEAD tag inside SymbolSize.
+	ErrChunkTooLarge = errors.New("meld: session: chunk exceeds the coded symbol payload budget")
 	// ErrFlowExhausted is returned when a flow has sealed the entire 2^32 source-index
 	// space; the host must re-handshake rather than wrap the nonce.
 	ErrFlowExhausted = errors.New("meld: session: source-index space exhausted, re-handshake the flow")
@@ -261,6 +261,9 @@ func newSealState(sec *SecurityConfig, symSize int, flowID uint32) sealState {
 // unique, so the flow is capped at 2^32 symbols (ErrFlowExhausted) rather than wrapping.
 func (s *sealState) seal(p []byte) ([]byte, error) {
 	if s.sec == nil {
+		if len(p) > s.symSize {
+			return nil, ErrChunkTooLarge
+		}
 		return p, nil
 	}
 	if len(p) > s.symSize-crypto.Overhead {

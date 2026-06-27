@@ -201,10 +201,9 @@ predictable — the proactive-FEC scheduler exploits that.
 8. **Interlaced = two ADUs/epochs per frame.** With `I`=field1/field2 the picture
    is two passes with two deadlines; never merge fields into one coding epoch.
 
-> **Code-family fit:** JPEG XS's T0/T1 (header + LL) is the canonical home for a
-> **RaptorQ block engine** when the (still tight) budget allows gathering a small
-> block — near-optimal overhead on the bytes whose loss is fatal — while T2/T3 ride
-> the steady sliding-window path. See [`../coding.md`](../coding.md).
+> **Implementation status:** the current shaper emits one RAP unit per codestream.
+> Header/slice/subband-aware JPEG XS UEP is still a refinement, and the shipped coding
+> engine remains the project-wide systematic RLNC path described in [`../coding.md`](../coding.md).
 
 ---
 

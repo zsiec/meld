@@ -8,11 +8,12 @@ import (
 
 // SenderStats counts what the Sender has emitted.
 type SenderStats struct {
-	Source         uint64 // systematic symbols emitted
-	Repair         uint64 // repair symbols emitted (fixed proactive)
-	ReactiveRepair uint64 // repair symbols emitted in response to a feedback deficit
-	Throttled      uint64 // repair symbols dropped by the rate ceiling (N1 token bucket)
-	Shed           uint64 // top-temporal-layer source chunks dropped at the encoder (ShedTopLayerOverBudget)
+	Source                uint64 // systematic symbols emitted
+	Repair                uint64 // repair symbols emitted (fixed proactive)
+	ReactiveRepair        uint64 // repair symbols emitted in response to a feedback deficit
+	Throttled             uint64 // repair symbols dropped by the rate ceiling (N1 token bucket)
+	Shed                  uint64 // top-temporal-layer source chunks dropped at the encoder (ShedTopLayerOverBudget)
+	RecoveryCadenceFrames uint16 // encoder max recovery interval request; 0 means relaxed
 }
 
 // retGen is a closed generation the sender retains so it can answer a feedback
@@ -31,7 +32,17 @@ type retGen struct {
 	inflightAt  clock.Timestamp // when the in-flight reactive repair was last sent
 	lastDeficit int             // the deficit the previous feedback reported (to credit demonstrably-landed repair)
 	pri         uint8           // the generation's protection tier (max over its units; for repair stamping)
+	reactPri    uint8           // tier used for deficit-driven repair; may boost frame-aware references
 	minTID      uint8           // shallowest TemporalID in the generation (temporal-depth UEP; 255 = none)
+}
+
+type pendingSingletonRepair struct {
+	id        uint32
+	src       []byte
+	priority  uint8
+	deadline  clock.Timestamp
+	releaseAt uint32
+	lane      uint8
 }
 
 // Sender is the coded transmit half of a flow. It emits systematic symbols as
@@ -46,6 +57,7 @@ type Sender struct {
 	genDL       clock.Timestamp       // current generation's deadline
 	inGen       int                   // source symbols in the current generation
 	genMaxPri   uint8                 // highest protection tier written into the live generation (UEP; WP6)
+	genReactPri uint8                 // highest tier to use when the live generation needs reactive repair
 	retained    map[uint32]*retGen    // closed generations awaiting ack/deadline, by base
 	rttMicros   int64                 // EWMA RTT estimate (microseconds)
 	pEst        float64               // estimated channel erasure rate (from feedback)
@@ -56,6 +68,7 @@ type Sender struct {
 	interMicros int64                 // EWMA of the per-symbol fill time, µs (AutoGenSize fill gate)
 	curGenWidth int                   // width fixed when the live generation opened (stamped on every symbol)
 	rttSampled  bool                  // a real RTT sample has arrived (AutoGenSize stays narrow until then)
+	delayCliff  bool                  // latest raw feedback sample proves one-way propagation cannot fit the deadline
 	now         clock.Timestamp       // most recent entry-point time (for the rate ceiling)
 	bucket      tokenBucket           // aggregate emit-rate ceiling (N1), driven by cc when present
 	shedBucket  tokenBucket           // write-side budget for ShedTopLayerOverBudget (tracks the written media rate)
@@ -65,6 +78,7 @@ type Sender struct {
 	sched       *pathScheduler        // N-path placement (N5); nil ⇒ single path
 	pathLossPpm []int                 // per-path marginal erasure rates (ppm), from feedback (N5)
 	slotDistPpm []int                 // per-slot erasure-count histogram (ppm), from feedback (N5)
+	singletons  []pendingSingletonRepair
 	// Frame descriptor (WP6): the shaper's frame id → the source id of that frame's first
 	// chunk, so the wire carries frame identity + dependency in source-id space.
 	frameStart   map[uint32]uint32
@@ -72,14 +86,18 @@ type Sender struct {
 	haveCurFrame bool
 	sendQ        [][]byte
 	stats        SenderStats
+	cadence      recoveryCadenceController
 }
 
 // senderFrameWindow bounds the sender's frame-start map: references are recent (within a
 // GOP), so a frame id this far below the current one is pruned. maxFrameRefs caps the
 // per-frame dependency count carried on the wire (a B-frame needs 2).
 const (
-	senderFrameWindow = 512
-	maxFrameRefs      = 15
+	senderFrameWindow           = 512
+	maxFrameRefs                = 15
+	defaultSingletonRepairGap   = 8    // symbols; generation-mode short-burst targeted-repair spacing
+	slidingSingletonRepairGap   = 16   // symbols; spreads sliding UEP repair outside burst16/burst24 neighborhoods
+	referenceBoostMaxRedundancy = 0.20 // above this, the static floor already protects references
 )
 
 // pruneFrameStarts drops far-back frame-start entries so the map stays bounded.
@@ -108,6 +126,9 @@ func NewSender(cfg Config) *Sender {
 		shedBucket: newTokenBucket(cfg.maxBitrate()),
 		genMinTID:  noTemporalID, // sentinel: no frame descriptor seen yet (min-tracking start)
 	}
+	if cfg.NominalRTTMicros > 0 && cfg.BufferMicros > 0 {
+		s.delayCliff = cfg.NominalRTTMicros/2 >= cfg.BufferMicros
+	}
 	s.live.SetPool(pool)
 	if cfg.CongestionControl {
 		s.cc = newCongestionController(0, cfg.SymbolSize+symHeaderBytes, cfg.maxBitrate())
@@ -133,13 +154,15 @@ func (s *Sender) Write(now clock.Timestamp, data []byte) {
 // systematic symbols (wire.Symbol frame-descriptor extension); the core's own sizing acts
 // only on Priority.
 type FrameDesc struct {
-	Priority    uint8    // protection tier (as WriteUnit)
-	FrameID     uint32   // the access unit this chunk belongs to (the shaper's unit id)
-	RefFrameIDs []uint32 // dependency access units (a B-frame's two anchors, a P-frame's one)
-	Chunks      uint16   // the access unit's total chunk count (so the receiver knows its id range)
-	TemporalID  uint8    // temporal-scalability layer (0 = base; higher = finer/leaf frames)
-	RAP         bool     // random-access point (keyframe)
-	Discardable bool     // nothing references this unit
+	Priority        uint8    // protection tier (as WriteUnit)
+	FrameID         uint32   // the access unit this chunk belongs to (the shaper's unit id)
+	RefFrameIDs     []uint32 // dependency access units (a B-frame's two anchors, a P-frame's one)
+	Chunks          uint16   // the access unit's total chunk count (so the receiver knows its id range)
+	TemporalID      uint8    // temporal-scalability layer (0 = base; higher = finer/leaf frames)
+	RAP             bool     // random-access point (keyframe)
+	RecoveryRefresh bool     // reference slice inside a signaled intra-refresh recovery interval
+	Discardable     bool     // nothing references this unit
+	NonPicture      bool     // metadata/parameter material, not a displayed coded picture
 }
 
 // WriteUnit hands one source media chunk to the flow at time now carrying a protection
@@ -204,20 +227,24 @@ func (s *Sender) writeSystematic(now clock.Timestamp, data []byte, priority uint
 	if priority > s.genMaxPri {
 		s.genMaxPri = priority // the generation is protected as hard as its most-critical unit
 	}
+	if p := s.reactivePriorityFor(priority, fd); p > s.genReactPri {
+		s.genReactPri = p
+	}
 	if fd != nil && fd.TemporalID < s.genMinTID {
 		s.genMinTID = fd.TemporalID // shallowest layer drives the temporal-depth UEP floor (effectiveProtectionTier)
 	}
 	id := s.live.Add(data)
 	src, _ := s.live.Source(id)
 	sym := wire.Symbol{
-		Flow:       s.cfg.Flow,
-		Kind:       wire.Systematic,
-		WindowBase: s.live.Base(),
-		SrcIndex:   id,
-		N:          uint16(s.curGenWidth),
-		Priority:   priority,
-		Deadline:   int64(dl),
-		Payload:    src,
+		Flow:          s.cfg.Flow,
+		Kind:          wire.Systematic,
+		WindowBase:    s.live.Base(),
+		SrcIndex:      id,
+		N:             uint16(s.curGenWidth),
+		Priority:      priority,
+		Deadline:      int64(dl),
+		SendTimestamp: int64(now),
+		Payload:       src,
 	}
 	if fd != nil {
 		// Translate the shaper's frame ids into SOURCE-id space: a frame's identity on the
@@ -236,6 +263,8 @@ func (s *Sender) writeSystematic(now clock.Timestamp, data []byte, priority uint
 		sym.FrameStart = s.frameStart[fd.FrameID]
 		sym.FrameLen = fd.Chunks
 		sym.FrameRAP, sym.FrameDiscardable = fd.RAP, fd.Discardable
+		sym.FrameRecoveryRefresh = fd.RecoveryRefresh
+		sym.FrameNonPicture = fd.NonPicture
 		sym.FrameRefs = nil
 		for _, ref := range fd.RefFrameIDs {
 			if rs, ok := s.frameStart[ref]; ok {
@@ -252,11 +281,77 @@ func (s *Sender) writeSystematic(now clock.Timestamp, data []byte, priority uint
 		sym.PathID = uint8(s.sched.systematicPath())
 	}
 	s.emit(sym)
+	if s.shouldSingletonProtect(priority, fd) {
+		s.queueSingletonRepair(id, src, priority, dl)
+	}
 	s.stats.Source++
+	s.flushSingletonRepairs(id, false)
 	s.inGen++
 	if s.inGen >= s.curGenWidth {
 		s.closeGen(now)
 	}
+}
+
+func (s *Sender) queueSingletonRepair(id uint32, src []byte, priority uint8, deadline clock.Timestamp) {
+	cp := make([]byte, len(src))
+	copy(cp, src)
+	s.singletons = append(s.singletons, pendingSingletonRepair{
+		id:        id,
+		src:       cp,
+		priority:  priority,
+		deadline:  deadline,
+		releaseAt: id + s.cfg.singletonRepairGap(),
+	})
+}
+
+func (s *Sender) flushSingletonRepairs(highest uint32, force bool) {
+	keep := s.singletons[:0]
+	for _, p := range s.singletons {
+		if force || highest >= p.releaseAt {
+			s.emitSingletonRepair(p.id, p.src, p.priority, p.deadline)
+			continue
+		}
+		keep = append(keep, p)
+	}
+	s.singletons = keep
+}
+
+func (s *Sender) emitSingletonRepair(id uint32, src []byte, priority uint8, deadline clock.Timestamp) {
+	enc := code.NewEncoderAt(s.cfg.SymbolSize, id)
+	enc.Add(src)
+	s.emitRepairWithDeadline(enc, 0, 1, priority, false, deadline)
+}
+
+func (s *Sender) singletonRepairEnabled() bool {
+	return s.cfg.MaxBitrate <= 0 && s.cc == nil
+}
+
+func (s *Sender) shouldSingletonProtect(priority uint8, fd *FrameDesc) bool {
+	if !s.singletonRepairEnabled() || !s.referenceBoostEnabled() {
+		return false
+	}
+	if priority > uepCenterTier {
+		return true
+	}
+	return fd != nil && priority == uepCenterTier && !fd.Discardable && (!fd.RAP || fd.RecoveryRefresh)
+}
+
+func (s *Sender) reactivePriorityFor(priority uint8, fd *FrameDesc) uint8 {
+	if s.referenceBoostEnabled() && fd != nil && priority == uepCenterTier && !fd.Discardable && (!fd.RAP || fd.RecoveryRefresh) {
+		return uepCenterTier + 1
+	}
+	return priority
+}
+
+func (s *Sender) referenceBoostEnabled() bool {
+	return s.cfg.Redundancy <= referenceBoostMaxRedundancy
+}
+
+func (s *Sender) sizingPriority(priority uint8) uint8 {
+	if !s.referenceBoostEnabled() {
+		return uepCenterTier
+	}
+	return priority
 }
 
 // Flush closes a partially filled generation (end of stream), emitting its fixed
@@ -266,6 +361,7 @@ func (s *Sender) Flush(now clock.Timestamp) {
 	if s.inGen > 0 {
 		s.closeGen(now)
 	}
+	s.flushSingletonRepairs(0, true)
 }
 
 // closeGen emits the current generation's fixed repair, retains it for reactive
@@ -289,15 +385,20 @@ func (s *Sender) closeGen(now clock.Timestamp) {
 	}
 	base := s.live.Base()
 	pri := s.genMaxPri
+	reactPri := s.genReactPri
+	if reactPri < pri {
+		reactPri = pri
+	}
 	var key uint16
 	for r := s.repairCountFor(n); int(key) < r; key++ {
 		s.emitRepair(s.live, key, n, pri, false)
 	}
-	s.retained[base] = &retGen{enc: s.live, n: n, proactive: int(key), deadline: s.genDL, nextKey: key, closeAt: now, pri: pri, minTID: s.genMinTID}
+	s.retained[base] = &retGen{enc: s.live, n: n, proactive: int(key), deadline: s.genDL, nextKey: key, closeAt: now, pri: pri, reactPri: reactPri, minTID: s.genMinTID}
 	s.live = code.NewEncoderAt(s.cfg.SymbolSize, base+uint32(n))
 	s.live.SetPool(s.pool)
 	s.inGen = 0
 	s.genMaxPri = 0            // reset for the next generation
+	s.genReactPri = 0          // reset the reactive-repair tier
 	s.genMinTID = noTemporalID // reset the temporal-depth floor (sentinel: no frame seen)
 }
 
@@ -333,6 +434,7 @@ func (s *Sender) FeedFeedback(now clock.Timestamp, fb wire.Feedback) {
 	if s.burstQ8 = int(fb.Burstiness); s.burstQ8 < burstQ8One {
 		s.burstQ8 = burstQ8One // mean loss-run length for the burst-aware sizer (N2)
 	}
+	s.cadence.observeFeedback(fb)
 	if s.sched != nil && len(fb.PathLoss) > 0 && len(fb.SlotDist) == len(fb.PathLoss)+1 {
 		// Per-path marginals weight the scheduler (toward the better deliverer); the per-slot
 		// erasure-count histogram drives the joint-tail sizer (proactive repair).
@@ -379,12 +481,16 @@ func (s *Sender) FeedFeedback(now clock.Timestamp, fb wire.Feedback) {
 // replaces fixed-stride genBaseOf so the generation width need not be a shared constant: the
 // sender walks its own (possibly varying) generation boundaries.
 func (s *Sender) genBaseContaining(id uint32) (uint32, bool) {
+	var best uint32
+	found := false
 	for base, g := range s.retained {
 		if base <= id && id < base+uint32(g.n) {
-			return base, true
+			if !found || base < best {
+				best, found = base, true
+			}
 		}
 	}
-	return 0, false
+	return best, found
 }
 
 // genWidthNow returns the width to OPEN the next generation with — fixed for that whole
@@ -449,6 +555,9 @@ func (s *Sender) reactiveRepair(now clock.Timestamp, g *retGen, deficit int) {
 	if now.After(g.deadline) {
 		return // too late to matter
 	}
+	if s.repairArrivesTooLate() {
+		return
+	}
 	if deficit > g.n {
 		deficit = g.n
 	}
@@ -470,16 +579,32 @@ func (s *Sender) reactiveRepair(now clock.Timestamp, g *retGen, deficit int) {
 	if g.inflightAt != 0 && now.Sub(g.inflightAt) >= s.rttMicros+feedbackIntervalMicros {
 		g.inflight = 0
 	}
+	repairPri := s.sizingPriority(g.reactPri)
+	if repairPri < s.sizingPriority(g.pri) {
+		repairPri = s.sizingPriority(g.pri)
+	}
 	prev := g.lastDeficit
 	g.lastDeficit = deficit
-	// Convergence gate (the key to not over-sending, and RTT-estimate-free): a deficit that is
-	// still DROPPING — or seen for the first time — is converging on its own and must NOT be
-	// reacted to. The first feedback after a generation closes counts its still-in-flight
+	if prev == 0 && repairPri > uepCenterTier {
+		if g.lastRx != 0 && now.Sub(g.lastRx) < minReactiveIntervalMicros {
+			return
+		}
+		s.emitRepair(g.enc, g.nextKey, g.n, repairPri, true)
+		g.nextKey++
+		g.inflight++
+		g.inflightAt = now
+		g.lastRx = now
+		return
+	}
+	// Convergence gate (the key to not over-sending, and RTT-estimate-free): after the
+	// one-symbol protected probe above, a deficit that is still DROPPING — or a first
+	// observation for an unboosted generation — is converging on its own and must not be
+	// batch-reacted to. The first feedback after a generation closes can count still-in-flight
 	// systematic symbols as losses (a wildly inflated deficit that shrinks as they land), and a
-	// prior reactive batch landing also shows up as a drop; sizing to either floods the link —
-	// the low-RTT overhead inversion. Only a STUCK deficit (no improvement since the last
-	// feedback) is a genuine residual needing new repair. A drop IS repair / late systematic
-	// landing, so credit it against the in-flight tally and wait one more feedback.
+	// prior reactive batch landing also shows up as a drop; sizing to either floods the link.
+	// Only a STUCK deficit (no improvement since the last feedback) is a genuine residual
+	// needing a larger repair batch. A drop is repair / late systematic landing, so credit it
+	// against the in-flight tally and wait one more feedback.
 	if prev == 0 || deficit < prev {
 		if landed := prev - deficit; landed > 0 {
 			if g.inflight -= landed; g.inflight < 0 {
@@ -513,13 +638,13 @@ func (s *Sender) reactiveRepair(now clock.Timestamp, g *retGen, deficit int) {
 	// decode-failure target (more repair per unit of deficit), a disposable leaf a looser one.
 	// Without this the reactive tier was flat across tiers, diluting unequal protection — the
 	// budget that should climb the dependency spine was spread evenly on every deficit.
-	delta := targetFailureForTier(effectiveProtectionTier(g.pri, g.minTID), s.cfg.targetFailure())
+	delta := targetFailureForTier(effectiveProtectionTier(repairPri, g.minTID), s.cfg.targetFailure())
 	extra := symbolsForDeficit(effective, p, delta, maxRepairFactor)
 	if extra > remaining {
 		extra = remaining
 	}
 	for i := 0; i < extra; i++ {
-		s.emitRepair(g.enc, g.nextKey, g.n, g.pri, true)
+		s.emitRepair(g.enc, g.nextKey, g.n, repairPri, true)
 		g.nextKey++
 	}
 	g.inflight += extra
@@ -532,11 +657,14 @@ func (s *Sender) reactiveRepair(now clock.Timestamp, g *retGen, deficit int) {
 // baseline redundancy (which covers the lag before the estimate catches a sudden
 // loss onset).
 func (s *Sender) repairCountFor(n int) int {
+	if s.repairArrivesTooLate() {
+		return 0
+	}
 	// Unequal protection (WP6): the generation's decode-failure target is the configured
 	// baseline tightened/loosened by its protection tier — parameter sets and RAPs get an
 	// exponentially smaller δ (more repair), disposable leaves a larger one (less), so a
 	// fixed budget is steered up the dependency spine.
-	delta := targetFailureForTier(effectiveProtectionTier(s.genMaxPri, s.genMinTID), s.cfg.targetFailure())
+	delta := targetFailureForTier(effectiveProtectionTier(s.sizingPriority(s.genMaxPri), s.genMinTID), s.cfg.targetFailure())
 	var r int
 	if s.sched != nil {
 		// Multipath: size the TOTAL repair against the JOINT erasure tail across all paths
@@ -609,6 +737,10 @@ func (s *Sender) repairCountFor(n int) int {
 		}
 	}
 	return r
+}
+
+func (s *Sender) repairArrivesTooLate() bool {
+	return s.delayCliff
 }
 
 // maxRepairWithinBudget returns the largest proactive repair count for a generation of n
@@ -744,6 +876,9 @@ func (s *Sender) updateRTT(now clock.Timestamp, fb wire.Feedback) {
 	if sample <= 0 {
 		return
 	}
+	if s.cfg.BufferMicros > 0 {
+		s.delayCliff = sample >= 2*s.cfg.BufferMicros
+	}
 	s.rttSampled = true                                  // a real RTT sample exists (AutoGenSize may now widen)
 	s.rttMicros = s.rttMicros - s.rttMicros/8 + sample/8 // EWMA, weight 1/8
 	if s.cc != nil {
@@ -760,6 +895,7 @@ func (s *Sender) Tick(now clock.Timestamp) {
 	s.now = now
 	if s.inGen > 0 && now.Sub(s.lastWrite) >= flushIdleMicros {
 		s.closeGen(now)
+		s.flushSingletonRepairs(0, true)
 	}
 	for base, g := range s.retained {
 		if now.After(g.deadline) {
@@ -781,7 +917,14 @@ func (s *Sender) PollSend() ([]byte, bool) {
 }
 
 // Stats returns a snapshot of what has been emitted.
-func (s *Sender) Stats() SenderStats { return s.stats }
+func (s *Sender) Stats() SenderStats {
+	st := s.stats
+	st.RecoveryCadenceFrames = s.cadence.encoderControl().RecoveryCadenceFrames
+	return st
+}
+
+// EncoderControl returns the current advisory source-control request for an attached encoder.
+func (s *Sender) EncoderControl() EncoderControl { return s.cadence.encoderControl() }
 
 // RateBudgetBitsPerSec returns the current send-rate budget the host should pace the
 // media source within (the congestion controller's output, or the static ceiling when
@@ -800,16 +943,26 @@ func (s *Sender) RateBudgetBitsPerSec() int64 {
 // repair carries its generation's protection tier so the wire reflects what it protects.
 func (s *Sender) emitRepair(enc *code.Encoder, key uint16, n int, pri uint8, reactive bool) {
 	base, nn, pay := enc.Repair(key)
+	s.emitRepairPayload(enc, base, nn, key, pri, reactive, s.deadlineOf(base, n), pay)
+}
+
+func (s *Sender) emitRepairWithDeadline(enc *code.Encoder, key uint16, n int, pri uint8, reactive bool, deadline clock.Timestamp) {
+	base, nn, pay := enc.Repair(key)
+	s.emitRepairPayload(enc, base, nn, key, pri, reactive, deadline, pay)
+}
+
+func (s *Sender) emitRepairPayload(enc *code.Encoder, base uint32, n int, key uint16, pri uint8, reactive bool, deadline clock.Timestamp, pay []byte) {
 	sym := wire.Symbol{
-		Flow:       s.cfg.Flow,
-		Kind:       wire.Repair,
-		WindowBase: base,
-		SrcIndex:   uint32(key),
-		N:          uint16(nn),
-		RepairKey:  key,
-		Priority:   pri,
-		Deadline:   int64(s.deadlineOf(base, n)),
-		Payload:    pay,
+		Flow:          s.cfg.Flow,
+		Kind:          wire.Repair,
+		WindowBase:    base,
+		SrcIndex:      uint32(key),
+		N:             uint16(n),
+		RepairKey:     key,
+		Priority:      pri,
+		Deadline:      int64(deadline),
+		SendTimestamp: int64(s.now),
+		Payload:       pay,
 	}
 	if s.sched != nil {
 		// Repair is metered toward the better-delivering path (weighted round-robin),

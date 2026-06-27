@@ -152,7 +152,77 @@ func TestReactiveRepairClampsSaturatedDeficit(t *testing.T) {
 	}
 }
 
+func TestSlidingReactiveRepairClampsSaturatedDeficit(t *testing.T) {
+	cfg := testConfig()
+	cfg.Sliding = true
+	cfg.CodingWindow = cfg.GenSize
+	cfg.BufferMicros = 2_000_000
+	s := NewSlidingSender(cfg)
+
+	now := clock.Timestamp(0)
+	for i := 0; i < cfg.GenSize; i++ {
+		s.Write(now, make([]byte, testSym))
+		now = now.Add(200)
+	}
+	drainSlidingSend(s)
+
+	before := s.Stats()
+	s.FeedFeedback(now.Add(50_000), wire.Feedback{
+		Flow:           cfg.Flow,
+		DecodedLowEdge: 0,
+		HighestSeen:    uint32(cfg.GenSize),
+		Deficit:        0xFFFF,
+		LossRate:       65535,
+	})
+	after := s.Stats()
+	attempted := int(after.ReactiveRepair - before.ReactiveRepair)
+	limit := maxRepairFactor * cfg.GenSize
+	if attempted > limit {
+		t.Fatalf("sliding saturated deficit attempted %d reactive repairs, want <= %d", attempted, limit)
+	}
+}
+
+func TestSlidingReactiveRepairCumulativeCap(t *testing.T) {
+	cfg := testConfig()
+	cfg.Sliding = true
+	cfg.CodingWindow = cfg.GenSize
+	cfg.BufferMicros = 2_000_000
+	s := NewSlidingSender(cfg)
+
+	now := clock.Timestamp(0)
+	for i := 0; i < cfg.GenSize; i++ {
+		s.Write(now, make([]byte, testSym))
+		now = now.Add(200)
+	}
+	drainSlidingSend(s)
+
+	before := s.Stats()
+	for i := 1; i <= 4; i++ {
+		s.FeedFeedback(now.Add(int64(i)*maxReactiveIntervalMicros), wire.Feedback{
+			Flow:           cfg.Flow,
+			DecodedLowEdge: 0,
+			HighestSeen:    uint32(cfg.GenSize),
+			Deficit:        0xFFFF,
+			LossRate:       65535,
+		})
+	}
+	after := s.Stats()
+	attempted := int(after.ReactiveRepair - before.ReactiveRepair)
+	limit := maxRepairFactor * cfg.GenSize
+	if attempted > limit {
+		t.Fatalf("repeated saturated feedback attempted %d reactive repairs, want cumulative <= %d", attempted, limit)
+	}
+}
+
 func drainSend(s *Sender) {
+	for {
+		if _, ok := s.PollSend(); !ok {
+			return
+		}
+	}
+}
+
+func drainSlidingSend(s *SlidingSender) {
 	for {
 		if _, ok := s.PollSend(); !ok {
 			return

@@ -26,6 +26,9 @@ const (
 	controlSeqLen = 8
 )
 
+// ControlOverhead is the trailer length added to every authenticated control datagram.
+const ControlOverhead = controlSeqLen + controlTagLen
+
 // SendControlKey returns the key this side seals its outbound control datagrams under;
 // RecvControlKey returns the key it verifies the peer's under. The two are distinct,
 // directional keys (so one direction's datagram can never verify in the other), and one

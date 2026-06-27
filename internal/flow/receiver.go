@@ -37,7 +37,7 @@ type ReceiverStats struct {
 // payloads, not headers): such a fully-recovered frame's structure is unknown, so it is
 // not counted, and a lost id at a frame boundary may be attributed to the adjacent frame.
 type FrameStats struct {
-	Frames             uint64 // access units resolved (excludes parameter-set-only units the shaper didn't mark)
+	Frames             uint64 // displayed coded pictures resolved (excludes non-picture metadata/parameter units)
 	DecodableFrames    uint64 // of those, decodable (delivered + dependency closure intact)
 	Keyframes          uint64 // resolved random-access points
 	DecodableKeyframes uint64
@@ -48,6 +48,7 @@ type frameInfo struct {
 	refs      []uint32 // dependency frame starts (all must be decodable)
 	length    uint16   // chunk count: the frame's ids are [start, start+length)
 	rap       bool
+	nonPic    bool
 	broken    bool // a source id of this frame was lost (not recovered)
 	resolved  bool
 	decodable bool
@@ -573,7 +574,10 @@ func (r *Receiver) noteFrame(sym wire.Symbol) {
 	if r.frames[sym.FrameStart] != nil {
 		return
 	}
-	r.frames[sym.FrameStart] = &frameInfo{refs: sym.FrameRefs, length: sym.FrameLen, rap: sym.FrameRAP}
+	r.frames[sym.FrameStart] = &frameInfo{
+		refs: sym.FrameRefs, length: sym.FrameLen, rap: sym.FrameRAP,
+		nonPic: sym.FrameNonPicture,
+	}
 	i := sort.Search(len(r.frameStarts), func(i int) bool { return r.frameStarts[i] >= sym.FrameStart })
 	r.frameStarts = append(r.frameStarts, 0)
 	copy(r.frameStarts[i+1:], r.frameStarts[i:])
@@ -653,14 +657,16 @@ func (r *Receiver) resolveFrame(start uint32) {
 		}
 	}
 	fi.decodable = dec
-	r.fstats.Frames++
-	if dec {
-		r.fstats.DecodableFrames++
-	}
-	if fi.rap {
-		r.fstats.Keyframes++
+	if !fi.nonPic {
+		r.fstats.Frames++
 		if dec {
-			r.fstats.DecodableKeyframes++
+			r.fstats.DecodableFrames++
+		}
+		if fi.rap {
+			r.fstats.Keyframes++
+			if dec {
+				r.fstats.DecodableKeyframes++
+			}
 		}
 	}
 	if len(r.frames) > frameMapCap {
@@ -778,7 +784,7 @@ func (r *Receiver) structuralGapHoldoff() int64 {
 		h = floor
 	}
 	if h <= 0 {
-		h = feedbackIntervalMicros
+		return feedbackIntervalMicros
 	}
 	if cap := r.cfg.BufferMicros / 2; cap > 0 && h > cap {
 		h = cap
@@ -802,7 +808,10 @@ func (r *Receiver) maybeFeedback(now clock.Timestamp) {
 		for i := range defs {
 			g := r.gens[base]
 			if g == nil {
-				break // structural gap (an entirely-lost generation); serviced once it is skipped
+				if base < r.highestSeen {
+					defs[i] = structuralGapDeficit
+				}
+				break // structural gap (an entirely-lost generation); sender clamps to its width
 			}
 			if d := g.dec.Deficit(g.n); d > 0 {
 				if d > 255 {
@@ -827,16 +836,21 @@ func (r *Receiver) maybeFeedback(now clock.Timestamp) {
 	if r.ecnSeen > 0 {
 		ceFrac = uint16(uint64(r.ecnCE) * 65535 / uint64(r.ecnSeen)) // CE-marked fraction (N3 / L4S)
 	}
+	frames, decFrames, keys, decKeys := feedbackFrameStats(r.fstats)
 	fb := wire.Feedback{
-		Flow:           r.cfg.Flow,
-		DecodedLowEdge: r.cursor,
-		HighestSeen:    r.highestSeen,
-		Deficit:        uint16(defs[0]),
-		EcnCE:          ceFrac,
-		LossRate:       uint16(r.lossEstimate() * 65535),
-		Deficits:       defs,
-		CongestionLoss: uint16(r.clSinceFB), // pre-recovery loss this interval (N1)
-		Burstiness:     uint16(r.meanBurstQ8),
+		Flow:               r.cfg.Flow,
+		DecodedLowEdge:     r.cursor,
+		HighestSeen:        r.highestSeen,
+		Deficit:            uint16(defs[0]),
+		EcnCE:              ceFrac,
+		LossRate:           uint16(r.lossEstimate() * 65535),
+		Deficits:           defs,
+		CongestionLoss:     uint16(r.clSinceFB), // pre-recovery loss this interval (N1)
+		Burstiness:         uint16(r.meanBurstQ8),
+		Frames:             frames,
+		DecodableFrames:    decFrames,
+		Keyframes:          keys,
+		DecodableKeyframes: decKeys,
 	}
 	r.ecnSeen, r.ecnCE = 0, 0 // per-interval; the CC integrates the reported fraction
 	if r.mpEnabled && r.coEst.primed {
@@ -1174,12 +1188,16 @@ func (r *Receiver) lossEstimate() float64 {
 // frontier). It replaces fixed-stride genBaseOf so the generation width need not be a shared
 // constant: the receiver follows the per-generation width the sender stamps on every symbol.
 func (r *Receiver) genBaseContaining(id uint32) (uint32, bool) {
+	var best uint32
+	found := false
 	for base, g := range r.gens {
 		if base <= id && id < base+uint32(g.n) {
-			return base, true
+			if !found || base < best {
+				best, found = base, true
+			}
 		}
 	}
-	return 0, false
+	return best, found
 }
 
 // updateRef refines the per-symbol deadline fit from one stamped (id, deadline):

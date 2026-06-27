@@ -1,11 +1,11 @@
 # Sliding-window coding — the band-form low-latency profile
 
-> **Status (built, benched, shipping as a selectable profile).** The band-form
+> **Status (built, benched, default main profile).** The band-form
 > sliding decoder (`internal/code.BandDecoder`) is wired into `internal/flow` as a
-> selectable low-latency profile (`Config.Sliding`, `CodingWindow`) behind the same
-> `coreSender`/`coreReceiver` host seam as the generation coder. It is **not** the
-> default — the generation coder still owns the low-RTT / generous-budget point —
-> but it **serves the tight-budget long-haul regime the generation coder cannot**.
+> selectable profile (`Config.Sliding`, `CodingWindow`) behind the same
+> `coreSender`/`coreReceiver` host seam as the generation coder. It is now the
+> default main profile; the generation coder remains the explicit fallback/control
+> path for regimes or features where it still wins or has parity first.
 > Three rounds of work got it there:
 >
 > 1. **Band-form decode** (commit `721aabc`, `b76…`) replaced the first, dense windowed decoder.
@@ -25,18 +25,10 @@
 >    TestLatencyProfile ./internal/flow`, and `txbench -lowlat`) located where the
 >    profile applies, below.
 >
-> **Where each coder applies.** At a low-RTT or generous-budget operating point the
-> **generation coder is the low-latency default** and the sliding profile does not
-> displace it — a wider band lowers overhead but raises recovery latency, and the
-> generation coder (eager systematic delivery + concentrated per-generation repair +
-> parallel reactive) already sits at the low-latency point when the budget has
-> headroom. The **band-form sliding profile exists for the budget-below-RTT regime**:
-> a playout budget *smaller than the RTT* — low-latency contribution over a long-haul
-> lossy link — where ARQ cannot fit a retransmit round and the generation coder's
-> reactive tier storms on generations that have already missed their deadline. There
-> the sliding profile's continuous, RTT-independent proactive repair, with the
-> adaptive band held small by the tight deadline, recovers within the budget where
-> the generation coder cannot.
+> **Where each coder applies.** Sliding is the main path because its repair is
+> continuous, RTT-independent, and UEP-friendly. The generation coder remains useful
+> as a fallback/control path for low-RTT generous-budget comparisons and for host
+> features that have not yet reached sliding parity.
 >
 > **The honest trade-off.** The sliding profile does **not** win on latency at a
 > generous budget — it trades latency for overhead efficiency on tight and

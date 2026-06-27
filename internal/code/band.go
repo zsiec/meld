@@ -194,6 +194,65 @@ func (d *BandDecoder) AddRepair(base uint32, n int, repairKey uint16, payload []
 	d.deliverReady()
 }
 
+// AddSparseRepair feeds a repair over an explicit, strictly increasing source-id
+// set. The id span must fit inside the band so the existing bounded row operations
+// remain O(b²). Columns not listed by ids have coefficient zero, which lets this
+// protect reference-layer symbols without spending rank on disposable gaps in the
+// same neighborhood.
+func (d *BandDecoder) AddSparseRepair(ids []uint32, repairKey uint16, payload []byte) {
+	if len(ids) == 0 || len(ids) > d.b {
+		return
+	}
+	for i := 1; i < len(ids); i++ {
+		if ids[i] <= ids[i-1] {
+			return
+		}
+	}
+	first, last := ids[0], ids[len(ids)-1]
+	if uint64(last)-uint64(first)+1 > uint64(d.b) {
+		return
+	}
+	d.grow(last)
+	if last < d.cursor {
+		return
+	}
+	coeffs := GenCoeffs(repairKey, len(ids))
+	pay := d.pad(payload)
+	cursor := d.cursor
+	startSet := false
+	var start, end uint32
+	for i, id := range ids {
+		c := coeffs[i]
+		if c == 0 {
+			continue
+		}
+		if id < cursor {
+			v, ok := d.recent[id]
+			if !ok {
+				return // spans a below-cursor column that was lost — cannot use
+			}
+			gf.MulAdd(pay, v, c)
+			continue
+		}
+		if !startSet {
+			start, startSet = id, true
+		}
+		end = id
+	}
+	if !startSet {
+		return
+	}
+	dense := make([]byte, int(end-start)+1)
+	for i, id := range ids {
+		if id < start || id > end {
+			continue
+		}
+		dense[id-start] = coeffs[i]
+	}
+	d.reduce(&beq{start: start, coeffs: dense, pay: pay})
+	d.deliverReady()
+}
+
 // Skip declares the head-of-line symbol lost (deadline) and advances past it, so
 // later symbols can be delivered. Reports whether it skipped (false when the cursor
 // is already deliverable — drain Deliver first — or nothing is past it).
@@ -206,6 +265,27 @@ func (d *BandDecoder) Skip() bool {
 	}
 	d.dropColumn(d.cursor) // surgically remove the lost unknown, preserving neighbor recoverability
 	d.lost++
+	d.retire(d.cursor, nil, false)
+	d.cursor++
+	d.deliverReady()
+	return true
+}
+
+// Evict drops the head-of-line symbol without charging decoder loss. It is used by
+// media-aware receivers that deliberately abandon a source id whose frame is already
+// known undecodable; the receiver accounts that separately from deadline loss.
+func (d *BandDecoder) Evict() bool {
+	if d.cursor >= d.highest {
+		return false
+	}
+	if data, ok := d.known[d.cursor]; ok {
+		delete(d.known, d.cursor)
+		d.retire(d.cursor, data, true)
+		d.cursor++
+		d.deliverReady()
+		return true
+	}
+	d.dropColumn(d.cursor)
 	d.retire(d.cursor, nil, false)
 	d.cursor++
 	d.deliverReady()

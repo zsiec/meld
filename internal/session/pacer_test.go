@@ -167,6 +167,64 @@ func TestPacerState_BurstFloor(t *testing.T) {
 	}
 }
 
+func TestHostPacerPutBlocksBeforeCrossingQueueLimit(t *testing.T) {
+	hp := &hostPacer{
+		limitMicros: 1_000_000,
+		sig:         make(chan struct{}, 1),
+		done:        make(chan struct{}),
+	}
+	hp.cond = sync.NewCond(&hp.mu)
+	hp.st.setRate(1_000, 5_000) // 1000 bytes/sec
+
+	done := make(chan error, 1)
+	go func() {
+		done <- hp.put([][]byte{dg(1, 500), dg(2, 600)})
+	}()
+
+	deadline := time.After(200 * time.Millisecond)
+	for {
+		hp.mu.Lock()
+		queued := len(hp.st.queue)
+		hp.mu.Unlock()
+		if queued == 1 {
+			break
+		}
+		select {
+		case err := <-done:
+			t.Fatalf("put returned before blocking at the limit: %v", err)
+		case <-deadline:
+			t.Fatalf("put did not enqueue first datagram before blocking; queued=%d", queued)
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	select {
+	case err := <-done:
+		t.Fatalf("put returned with over-limit second datagram admitted: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	hp.mu.Lock()
+	hp.st.drainAll()
+	hp.cond.Broadcast()
+	hp.mu.Unlock()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("put after drain: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("put did not resume after queue drained")
+	}
+	hp.mu.Lock()
+	defer hp.mu.Unlock()
+	if got := len(hp.st.queue); got != 1 {
+		t.Fatalf("queued after resume = %d, want 1 second datagram", got)
+	}
+}
+
 // TestHostPacer_BackpressureAndDrain exercises the goroutine wrapper end to end: a burst
 // far over the queue-time limit makes put() block (backpressure), the loop drains it to
 // the sink at the budget, every datagram arrives exactly once in order, and flushClose

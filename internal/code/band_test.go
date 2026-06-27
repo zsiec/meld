@@ -212,6 +212,56 @@ func TestBandLateRepairRecoversCorrectly(t *testing.T) {
 	}
 }
 
+func TestBandSparseRepairRecoversProtectedColumnsOnly(t *testing.T) {
+	const b = 8
+	rng := rand.New(rand.NewSource(123))
+	src := winSrc(rng, 6)
+	enc := NewEncoder(winSym)
+	for i := 0; i < 6; i++ {
+		enc.Add(src[i])
+	}
+	d := NewBandDecoder(winSym, b, 3*b)
+	delivered := map[uint32]bool{}
+	drain := func() {
+		for {
+			r, ok := d.Deliver()
+			if !ok {
+				return
+			}
+			if !bytes.Equal(r.Data, src[r.ID]) {
+				t.Fatalf("delivered wrong bytes for id %d", r.ID)
+			}
+			delivered[r.ID] = true
+		}
+	}
+
+	// Protected ids 1 and 3 are lost; unprotected ids 2,4,5 arrive. Sparse repair
+	// over only [1,3] must recover both without spending rank on id 2.
+	d.AddSystematic(0, src[0])
+	d.AddSystematic(2, src[2])
+	d.AddSystematic(4, src[4])
+	d.AddSystematic(5, src[5])
+	drain()
+	if d.Cursor() != 1 {
+		t.Fatalf("cursor %d, want stuck at protected id 1", d.Cursor())
+	}
+
+	ids := []uint32{1, 3}
+	for key := uint16(0); key < 2; key++ {
+		pay, ok := enc.RepairSparse(key, ids)
+		if !ok {
+			t.Fatal("RepairSparse returned !ok")
+		}
+		d.AddSparseRepair(ids, key, pay)
+		drain()
+	}
+	for id := uint32(0); id < 6; id++ {
+		if !delivered[id] {
+			t.Fatalf("id %d not delivered after sparse repair", id)
+		}
+	}
+}
+
 // TestBandLateRepairSoundness stresses the late-repair path under random loss with REAL
 // encodings and DELAYED repair arrival (so the cursor outruns a repair's base before it lands),
 // asserting every delivered byte matches the source — a wrong recent-history fold would corrupt

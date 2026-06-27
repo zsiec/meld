@@ -8,9 +8,27 @@ const (
 	avcSPS    = 7  // sequence parameter set
 	avcPPS    = 8  // picture parameter set
 	avcAUD    = 9  // access unit delimiter
+	avcFiller = 12 // filler data
 	avcSPSExt = 13 // sequence parameter set extension
 	avcSubSPS = 15 // subset SPS (SVC/MVC base)
 )
+
+const avcSEIRecoveryPoint = 6
+
+// AVCOptions controls optional source-side filtering. The default shaper is conservative
+// and preserves SEI because it may carry captions, HDR, or recovery points.
+type AVCOptions struct {
+	// SourceConstrained means the caller has decided the encoded source is under a
+	// real bandwidth/latency constraint. Only then may the shaper shed SEI NALs that
+	// can be positively identified as non-recovery metadata. Malformed SEI is retained
+	// fail-safe, and unconstrained sources preserve SEI exactly as received.
+	SourceConstrained bool
+	// DropDisposablePictures may shed non-reference coded pictures when SourceConstrained
+	// is also true. These AVC slices have nal_ref_idc == 0, so no future picture should
+	// depend on them; dropping them models an encoder/source that sacrifices top-layer
+	// frame rate before transport to reduce burst exposure around the reference spine.
+	DropDisposablePictures bool
+}
 
 // AVCShaper maps an H.264 Annex-B elementary stream to generic descriptors. Tier and
 // discardability come from the NAL header (nal_ref_idc + nal_unit_type); the DEPENDENCY
@@ -22,6 +40,8 @@ const (
 // One unit per slice NAL (multi-slice pictures yield multiple units referencing the same
 // anchors — a benign approximation).
 type AVCShaper struct {
+	opts AVCOptions
+
 	nextID       uint32
 	spsID, ppsID int64 // active parameter-set unit ids, or -1
 	prevRef      int64 // previous reference picture unit id, or -1
@@ -30,13 +50,27 @@ type AVCShaper struct {
 	spsValid               bool
 	prevPocMsb, prevPocLsb int
 	refs                   []pocRef // recent reference pictures (for B-frame bracketing), by POC
+
+	recoveryCountdown int
+	recoveryRefs      []uint32
 }
 
 // NewAVCShaper returns a fresh H.264 shaper.
-func NewAVCShaper() *AVCShaper { return &AVCShaper{spsID: -1, ppsID: -1, prevRef: -1} }
+func NewAVCShaper() *AVCShaper {
+	return &AVCShaper{spsID: -1, ppsID: -1, prevRef: -1, recoveryCountdown: -1}
+}
+
+// NewAVCShaperWithOptions returns a fresh H.264 shaper with explicit source-policy
+// options.
+func NewAVCShaperWithOptions(opts AVCOptions) *AVCShaper {
+	s := NewAVCShaper()
+	s.opts = opts
+	return s
+}
 
 // Shape parses an Annex-B buffer and returns the protectable units in order. Parameter
-// sets, SEI, and slices become units; AUD / filler / end-of-sequence are dropped.
+// sets, SEI, and slices become units; AUD / filler / end-of-sequence are dropped. When
+// SourceConstrained is true, non-recovery SEI is also dropped before source chunking.
 func (s *AVCShaper) Shape(annexB []byte) []Shaped {
 	var out []Shaped
 	for _, nal := range nalUnits(annexB) {
@@ -64,25 +98,51 @@ func (s *AVCShaper) Shape(annexB []byte) []Shaped {
 			si, _ := parseSliceHeader(nal, s.sps)
 			poc := s.computePOC(si, true, true)
 			s.refs = s.refs[:0]
+			s.recoveryCountdown = -1
+			s.recoveryRefs = s.recoveryRefs[:0]
 			s.prevRef = int64(u.ID) // an IDR resets the reference chain
 			s.addRef(poc, u.ID)     // an IDR is a reference
 		case avcNonIDR:
 			u.Picture, u.Confidence = true, Inferred // AVC's deeper ref structure (LTRP/MMCO) is not modeled
 			si, ok := parseSliceHeader(nal, s.sps)
 			poc := s.computePOC(si, false, refIdc != 0)
+			recoveryActive := s.recoveryCountdown >= 0
+			recoveryComplete := s.consumeRecoveryCountdown()
 			if ok && s.spsValid && si.sliceType == sliceB {
 				u.RefersTo = s.bracket(poc) // a B-frame's two bracketing anchors (by POC)
 			} else {
 				u.RefersTo = s.refChain() // P / I / unparseable ⇒ the previous reference
 			}
 			if refIdc == 0 {
+				if s.opts.SourceConstrained && s.opts.DropDisposablePictures {
+					continue
+				}
 				u.Class, u.Discardable = ClassDisposable, true
 			} else {
 				u.Class = ClassBase
+				if recoveryActive {
+					u.RecoveryRefresh = true
+				}
+				if recoveryComplete {
+					u.Class, u.RAP, u.Confidence = ClassRAP, true, Signaled
+					u.RefersTo = append(s.paramRefs(), s.recoveryRefs...)
+					s.refs = s.refs[:0]
+					s.recoveryRefs = s.recoveryRefs[:0]
+				}
 				s.prevRef = int64(u.ID)
 				s.addRef(poc, u.ID)
+				if s.recoveryCountdown >= 0 {
+					s.recoveryRefs = append(s.recoveryRefs, u.ID)
+				}
 			}
 		case avcSEI:
+			if s.opts.SourceConstrained && !avcSEIHasPayloadType(nal, avcSEIRecoveryPoint) {
+				continue
+			}
+			if cnt, ok := avcSEIRecoveryFrameCnt(nal); ok {
+				s.recoveryCountdown = cnt
+				s.recoveryRefs = s.recoveryRefs[:0]
+			}
 			// Conservative: SEI may carry a recovery point or HDR — protect at a mid tier
 			// rather than treat as disposable; classifying its payload is later work.
 			u.Class, u.Confidence = ClassEnhancement, Inferred
@@ -114,6 +174,18 @@ func (s *AVCShaper) refChain() []uint32 {
 		return []uint32{uint32(s.prevRef)}
 	}
 	return nil
+}
+
+func (s *AVCShaper) consumeRecoveryCountdown() bool {
+	if s.recoveryCountdown < 0 {
+		return false
+	}
+	if s.recoveryCountdown == 0 {
+		s.recoveryCountdown = -1
+		return true
+	}
+	s.recoveryCountdown--
+	return false
 }
 
 // computePOC derives a picture's order count from its slice header (pic_order_cnt_type 0,

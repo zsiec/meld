@@ -221,3 +221,87 @@ func ebspToRbsp(b []byte) []byte {
 	}
 	return out
 }
+
+// avcSEIHasPayloadType reports whether an AVC SEI NAL contains a SEI message with the
+// requested payload type. Malformed SEI returns true so source filtering fails safe and
+// preserves metadata it cannot classify.
+func avcSEIHasPayloadType(nal []byte, want int) bool {
+	if len(nal) < 2 || nal[0]&0x1f != avcSEI {
+		return true
+	}
+	rbsp := ebspToRbsp(nal[1:])
+	for off := 0; off < len(rbsp); {
+		if rbsp[off] == 0x80 && trailingZeroBits(rbsp[off+1:]) {
+			return false
+		}
+		payloadType, ok := readSEIExtValue(rbsp, &off)
+		if !ok {
+			return true
+		}
+		payloadSize, ok := readSEIExtValue(rbsp, &off)
+		if !ok || payloadSize < 0 || off+payloadSize > len(rbsp) {
+			return true
+		}
+		if payloadType == want {
+			return true
+		}
+		off += payloadSize
+	}
+	return false
+}
+
+func avcSEIRecoveryFrameCnt(nal []byte) (int, bool) {
+	if len(nal) < 2 || nal[0]&0x1f != avcSEI {
+		return 0, false
+	}
+	rbsp := ebspToRbsp(nal[1:])
+	for off := 0; off < len(rbsp); {
+		if rbsp[off] == 0x80 && trailingZeroBits(rbsp[off+1:]) {
+			return 0, false
+		}
+		payloadType, ok := readSEIExtValue(rbsp, &off)
+		if !ok {
+			return 0, false
+		}
+		payloadSize, ok := readSEIExtValue(rbsp, &off)
+		if !ok || payloadSize < 0 || off+payloadSize > len(rbsp) {
+			return 0, false
+		}
+		if payloadType == avcSEIRecoveryPoint {
+			r := newBitReader(rbsp[off : off+payloadSize])
+			cnt := int(r.ue())
+			if r.overran() {
+				return 0, false
+			}
+			return cnt, true
+		}
+		off += payloadSize
+	}
+	return 0, false
+}
+
+func readSEIExtValue(b []byte, off *int) (int, bool) {
+	if *off >= len(b) {
+		return 0, false
+	}
+	v := 0
+	for *off < len(b) && b[*off] == 0xff {
+		v += 255
+		*off += 1
+	}
+	if *off >= len(b) {
+		return 0, false
+	}
+	v += int(b[*off])
+	*off += 1
+	return v, true
+}
+
+func trailingZeroBits(b []byte) bool {
+	for _, c := range b {
+		if c != 0 {
+			return false
+		}
+	}
+	return true
+}

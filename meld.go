@@ -100,9 +100,9 @@ type Config struct {
 	TargetFailure float64
 	// BufferMicros is the playout/deadline budget in microseconds.
 	BufferMicros int64
-	// Sliding selects the band-form sliding-window coder instead of the default
-	// generation coder. It codes continuous, fungible repair over one elastic window
-	// and delivers each symbol the instant it decodes.
+	// Sliding selects the band-form sliding-window coder, the default main profile.
+	// It codes continuous, fungible repair over one elastic window and delivers each
+	// symbol the instant it decodes. Set false to use the generation coder fallback.
 	//
 	// Reach for it when the latency budget (BufferMicros) is TIGHT relative to the
 	// RTT — above all when the budget is SMALLER than the round trip: low-latency
@@ -112,21 +112,20 @@ type Config struct {
 	// less repair overhead (a wider coding window needs a smaller variance margin),
 	// so it suits bandwidth-constrained links.
 	//
-	// It is NOT a universal low-latency win: at a GENEROUS budget with a low RTT the
-	// generation coder delivers at LOWER latency — a wider recovery band trades
-	// latency for overhead efficiency — so leave Sliding off for low-RTT or
-	// relaxed-deadline paths. Decode costs O(CodingWindow²) per symbol.
+	// Its tradeoff is decode cost and a wider recovery band: at a generous budget
+	// with a low RTT, generation mode can still be a useful control/fallback path.
+	// Decode costs O(CodingWindow²) per symbol.
 	Sliding bool
 	// CodingWindow is the MAX sliding band width in source symbols — the recovery
 	// span and O(window²) decode-cost cap. The sender adapts the effective span below
 	// it to fit the deadline budget, so this is a ceiling, not a fixed width. 0 ⇒
 	// default. Ignored unless Sliding.
 	CodingWindow int
-	// CongestionControl enables the delay-based congestion controller: it derives the
-	// send-rate budget from the standing-queue delay (loss-agnostic, since coding masks
-	// loss) and throttles REPAIR to stay within it — protecting media goodput and
-	// surfacing a target rate the source should pace within. Off ⇒ a static rate
-	// ceiling only. Leave off until validated on your paths.
+	// CongestionControl enables the generation-mode delay-based congestion controller:
+	// it derives the send-rate budget from the standing-queue delay (loss-agnostic,
+	// since coding masks loss) and throttles REPAIR to stay within it — protecting media
+	// goodput and surfacing a target rate the source should pace within. Off, or Sliding
+	// mode today, means a static rate ceiling only. Leave off until validated on your paths.
 	CongestionControl bool
 	// Pace enables the host transmit pacer: the sender smooths coded datagrams onto the
 	// wire at a rate slaved to the congestion/ceiling budget (never a second controller)
@@ -135,6 +134,13 @@ type Config struct {
 	// microburst, and the source is bounded by the budget rather than bloating a buffer.
 	// On by default (DefaultConfig). Turn off to transmit each emit immediately.
 	Pace bool
+	// ProbeMTU enables host-side DPLPMTUD (RFC 8899): the sender probes the path MTU with
+	// padded, Don't-Fragment datagrams and detects size black holes. Phase 1 discovers and
+	// reports the PLPMTU; it does not yet resize SymbolSize automatically. Off by default.
+	ProbeMTU bool
+	// MaxProbeMTU is the largest UDP payload size DPLPMTUD probes for. 0 selects the
+	// host default. Ignored unless ProbeMTU.
+	MaxProbeMTU int
 	// MaxBitrate caps the sender's aggregate emitted rate in bits/sec: media
 	// (systematic) is never dropped, but REPAIR is throttled to hold the total under
 	// this ceiling. 0 ⇒ a generous default (100 Mbps). Use it to bound redundancy to a
@@ -145,24 +151,28 @@ type Config struct {
 	// WriteFrame can no longer decode — its own loss, or a dead reference sub-tree — the
 	// receiver abandons it (and its dependents) immediately instead of waiting out each
 	// deadline, so the next keyframe resyncs sooner and the sender stops repairing the
-	// dead GOP. Requires WriteFrame descriptors; a no-op for plain Write byte streams. Off
-	// by default: it drops doomed-but-recoverable bytes to deliver whole DECODABLE frames
+	// dead GOP. Works in both generation and sliding profiles. Requires WriteFrame
+	// descriptors; a no-op for plain Write byte streams. Off by default: it drops doomed-but-recoverable bytes to deliver whole DECODABLE frames
 	// faster, so only flows that consume whole pictures want it.
 	EvictBrokenFrames bool
 	// FrameAtomic delivers each WriteFrame access unit ALL-OR-NOTHING: the app gets a whole
 	// frame once it is fully recoverable in time, or a clean gap (no fragment) if any chunk is
 	// lost, its reference sub-tree is dead, or its deadline passes — so the decoder conceals a
 	// missing frame (freeze) instead of rendering a corrupt one. The perceptual form of
-	// EvictBrokenFrames; supersedes it when set. Requires WriteFrame; a no-op for byte streams.
-	// ON by default (DefaultConfig) for media — a partial picture is perceptually worse than a
-	// dropped one. Set false to deliver source bytes as they recover (partial frames possible).
+	// EvictBrokenFrames; supersedes it when set. Generation profile only today;
+	// sliding accepts WriteFrame descriptors but does not yet deliver frame-atomically.
+	// Requires WriteFrame; a no-op for byte streams.
+	// OFF by default (DefaultConfig): WriteFrame metadata is useful for protection even when
+	// the application still wants recoverable bytes delivered. Enable this for consumers that
+	// prefer clean frame gaps over partial access units.
 	FrameAtomic bool
 	// ShedTopLayerOverBudget makes the sender proactively drop the top temporal layer (the
 	// highest-TemporalID, Discardable, non-reference WriteFrame units) when the source bitrate
 	// exceeds the rate budget — a clean transport-level temporal downscale ("drop every other
 	// frame") that keeps the base layer low-latency instead of queueing. Discardable frames have
 	// no dependents, so the receiver sees a smooth lower-fps stream, not loss. OFF by default (a
-	// deliberate ABR-style policy); the perceptual reactive shed (FrameAtomic) is already on.
+	// deliberate ABR-style policy). FrameAtomic provides a separate opt-in all-or-nothing
+	// receive policy for consumers that want clean frame gaps.
 	ShedTopLayerOverBudget bool
 	// RepairWithinBudget caps proactive repair to the rate budget (media + repair ≤ budget),
 	// so a tight latency budget sheds protection gracefully instead of the host pacer queueing
@@ -233,8 +243,8 @@ func (c Config) MaxChunk() int {
 	return c.SymbolSize
 }
 
-// DefaultConfig returns a starting configuration (1316-byte chunks, generation
-// 16, 25% redundancy, 200 ms buffer).
+// DefaultConfig returns a starting configuration (1316-byte chunks, sliding coded
+// repair, generation-size floor 16 for generation fallback, 200 ms buffer).
 func DefaultConfig() Config {
 	c := flow.DefaultConfig()
 	return Config{
@@ -243,11 +253,12 @@ func DefaultConfig() Config {
 		Redundancy:         c.Redundancy,
 		TargetFailure:      c.TargetFailure,
 		BufferMicros:       c.BufferMicros,
+		Sliding:            c.Sliding,
 		Pace:               c.Pace,               // on by default (flow.DefaultConfig)
 		ProactiveDecay:     c.ProactiveDecay,     // on by default (flow.DefaultConfig)
 		AutoGenSize:        c.AutoGenSize,        // on by default (flow.DefaultConfig): zero-config adaptive width
 		RepairWithinBudget: c.RepairWithinBudget, // on by default (flow.DefaultConfig): repair within the rate budget
-		FrameAtomic:        c.FrameAtomic,        // on by default (flow.DefaultConfig): all-or-nothing picture delivery
+		FrameAtomic:        c.FrameAtomic,        // opt-in: all-or-nothing picture delivery
 		AutoReorderHoldoff: c.AutoReorderHoldoff, // on by default (flow.DefaultConfig): self-tuning loss-estimate reorder window
 	}
 }
@@ -269,8 +280,11 @@ func (c Config) toFlow() flow.Config {
 		BufferMicros:           c.BufferMicros,
 		Sliding:                c.Sliding,
 		CodingWindow:           c.CodingWindow,
+		ProtectedRepairPhasing: true,
 		CongestionControl:      c.CongestionControl,
 		Pace:                   c.Pace,
+		ProbeMTU:               c.ProbeMTU,
+		MaxProbeMTU:            c.MaxProbeMTU,
 		MaxBitrate:             c.MaxBitrate,
 		EvictBrokenFrames:      c.EvictBrokenFrames,
 		FrameAtomic:            c.FrameAtomic,
@@ -283,6 +297,9 @@ func (c Config) toFlow() flow.Config {
 // generation is spread across paths and decoded from the union.
 func (c Config) toFlowPaths(paths int) flow.Config {
 	fc := c.toFlow()
+	// Multipath is still generation-profile internally. Public multipath remains usable from
+	// DefaultConfig while the sliding multipath path is implemented below the session layer.
+	fc.Sliding = false
 	fc.Paths = paths
 	return fc
 }
@@ -292,21 +309,26 @@ func (c Config) toFlowPaths(paths int) flow.Config {
 // stats parse-free (WP6). FrameID identifies the access unit (the shaper's unit id);
 // RefFrameIDs are its dependency access units (a B-frame's two anchors, a P-frame's one);
 // Chunks is its total chunk count (so the receiver knows its id range); RAP marks a
-// keyframe; Discardable marks a unit nothing references.
+// keyframe; RecoveryRefresh marks a reference slice inside a signaled intra-refresh
+// interval; Discardable marks a unit nothing references; NonPicture marks metadata/
+// parameter material that is not a displayed coded picture.
 type FrameDesc struct {
-	Priority    uint8
-	FrameID     uint32
-	RefFrameIDs []uint32
-	Chunks      uint16
-	TemporalID  uint8 // temporal-scalability layer (0 = base; higher = leaf frames shed first)
-	RAP         bool
-	Discardable bool
+	Priority        uint8
+	FrameID         uint32
+	RefFrameIDs     []uint32
+	Chunks          uint16
+	TemporalID      uint8 // temporal-scalability layer (0 = base; higher = leaf frames shed first)
+	RAP             bool
+	RecoveryRefresh bool
+	Discardable     bool
+	NonPicture      bool
 }
 
 func (d FrameDesc) toFlow() flow.FrameDesc {
 	return flow.FrameDesc{
 		Priority: d.Priority, FrameID: d.FrameID, RefFrameIDs: d.RefFrameIDs,
-		Chunks: d.Chunks, TemporalID: d.TemporalID, RAP: d.RAP, Discardable: d.Discardable,
+		Chunks: d.Chunks, TemporalID: d.TemporalID, RAP: d.RAP,
+		RecoveryRefresh: d.RecoveryRefresh, Discardable: d.Discardable, NonPicture: d.NonPicture,
 	}
 }
 
@@ -330,10 +352,25 @@ func frameStatsFromFlow(s flow.FrameStats) FrameStats {
 
 // SenderStats reports what a Sender has emitted.
 type SenderStats struct {
-	Source         uint64 // systematic symbols sent
-	Repair         uint64 // repair symbols sent (total)
-	ReactiveRepair uint64 // the subset sent in response to a feedback rank deficit
-	Throttled      uint64 // repair symbols dropped by the aggregate rate ceiling
+	Source                uint64 // systematic symbols sent
+	Repair                uint64 // repair symbols sent (total)
+	ReactiveRepair        uint64 // the subset sent in response to a feedback rank deficit
+	Throttled             uint64 // repair symbols dropped by the aggregate rate ceiling
+	RecoveryCadenceFrames uint16 // encoder max recovery interval request; 0 means relaxed
+}
+
+// EncoderControl is Meld's advisory source-control output for an attached encoder.
+// It does not create a separate deployable profile: a host may apply the request,
+// and if the encoder cannot comply, Meld continues with the same transport loop.
+type EncoderControl struct {
+	// RecoveryCadenceFrames asks the encoder to bound the distance between recovery
+	// points, in displayed frames. 0 means no active request. Encoders may satisfy
+	// this with keyframes, recovery-point SEI, or intra-refresh.
+	RecoveryCadenceFrames uint16
+}
+
+func encoderControlFromFlow(c flow.EncoderControl) EncoderControl {
+	return EncoderControl{RecoveryCadenceFrames: c.RecoveryCadenceFrames}
 }
 
 // ReceiverStats reports a Receiver's delivery outcomes.
@@ -373,6 +410,9 @@ func (c Config) Check() []string {
 				"head-of-line-blocks). Set NominalBitrateBps to your source rate (both ends), or — "+
 				"simpler — use AutoGenSize, which measures it itself.")
 		}
+	}
+	if c.Sliding && c.CongestionControl {
+		w = append(w, "meld: CongestionControl is generation-mode only today; Sliding will use the static MaxBitrate ceiling.")
 	}
 	return w
 }
@@ -437,8 +477,17 @@ func (s *Sender) Flush() { s.s.Flush() }
 // Stats returns emission counters.
 func (s *Sender) Stats() SenderStats {
 	st := s.s.Stats()
-	return SenderStats{Source: st.Source, Repair: st.Repair, ReactiveRepair: st.ReactiveRepair, Throttled: st.Throttled}
+	return SenderStats{Source: st.Source, Repair: st.Repair, ReactiveRepair: st.ReactiveRepair, Throttled: st.Throttled, RecoveryCadenceFrames: st.RecoveryCadenceFrames}
 }
+
+// EncoderControl returns Meld's current advisory encoder-control request.
+func (s *Sender) EncoderControl() EncoderControl { return encoderControlFromFlow(s.s.EncoderControl()) }
+
+// PathMTU returns the discovered path PLPMTU in bytes, or 0 when ProbeMTU is off.
+func (s *Sender) PathMTU() int { return s.s.PathMTU() }
+
+// PathMTUBlackHoles returns the number of size-black-hole events DPLPMTUD detected.
+func (s *Sender) PathMTUBlackHoles() int { return s.s.PathMTUBlackHoles() }
 
 // Close flushes the tail and releases the socket.
 func (s *Sender) Close() error { return s.s.Close() }
@@ -489,7 +538,7 @@ func (r *Receiver) Stats() ReceiverStats {
 }
 
 // FrameStats returns the parse-free media-frame decodability snapshot (populated only
-// for senders using WriteFrame; zero otherwise).
+// for generation-profile senders using WriteFrame; zero otherwise).
 func (r *Receiver) FrameStats() FrameStats { return frameStatsFromFlow(r.r.FrameStats()) }
 
 // Close releases the socket.
@@ -535,8 +584,22 @@ func (s *MultipathSender) Flush() { s.s.Flush() }
 // Stats returns emission counters (aggregate across paths).
 func (s *MultipathSender) Stats() SenderStats {
 	st := s.s.Stats()
-	return SenderStats{Source: st.Source, Repair: st.Repair, ReactiveRepair: st.ReactiveRepair, Throttled: st.Throttled}
+	return SenderStats{Source: st.Source, Repair: st.Repair, ReactiveRepair: st.ReactiveRepair, Throttled: st.Throttled, RecoveryCadenceFrames: st.RecoveryCadenceFrames}
 }
+
+// EncoderControl returns Meld's current advisory encoder-control request.
+func (s *MultipathSender) EncoderControl() EncoderControl {
+	return encoderControlFromFlow(s.s.EncoderControl())
+}
+
+// PathMTUs returns each path's discovered PLPMTU in bytes. Entries are 0 when ProbeMTU is off.
+func (s *MultipathSender) PathMTUs() []int { return s.s.PathMTUs() }
+
+// PathMTU returns the path-set minimum PLPMTU in bytes, or 0 when ProbeMTU is off.
+func (s *MultipathSender) PathMTU() int { return s.s.PathMTU() }
+
+// PathMTUBlackHoles returns the aggregate number of size-black-hole events DPLPMTUD detected.
+func (s *MultipathSender) PathMTUBlackHoles() int { return s.s.PathMTUBlackHoles() }
 
 // Close flushes the tail and releases every path socket.
 func (s *MultipathSender) Close() error { return s.s.Close() }

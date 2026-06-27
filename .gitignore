@@ -5,6 +5,7 @@
 coverage.*
 /bin/
 /dist/
+/scratchpad/
 
 # editors / OS
 .DS_Store

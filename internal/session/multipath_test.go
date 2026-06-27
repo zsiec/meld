@@ -2,6 +2,7 @@ package session
 
 import (
 	"encoding/binary"
+	"errors"
 	"math/rand"
 	"sync"
 	"testing"
@@ -17,6 +18,72 @@ func mpTestCfg() flow.Config {
 	c.Redundancy = 0.15
 	c.BufferMicros = 300_000 // generous budget so the per-path estimate can ramp + reactive-repair
 	return c
+}
+
+func TestMultipathRejectsSlidingProfile(t *testing.T) {
+	cfg := mpTestCfg()
+	cfg.Sliding = true
+	if _, err := NewMultipathSender(nil, cfg, nil); !errors.Is(err, ErrSlidingMultipathUnsupported) {
+		t.Fatalf("NewMultipathSender sliding error = %v, want ErrSlidingMultipathUnsupported", err)
+	}
+	if _, err := newMultipathReceiver(nil, cfg, clock.NewRealClock(), nil, nil); !errors.Is(err, ErrSlidingMultipathUnsupported) {
+		t.Fatalf("newMultipathReceiver sliding error = %v, want ErrSlidingMultipathUnsupported", err)
+	}
+}
+
+func TestMultipathRejectsPathCountMismatch(t *testing.T) {
+	cfg := mpTestCfg()
+	cfg.Paths = 1
+	if _, err := NewMultipathSender([]string{"127.0.0.1:1", "127.0.0.1:2"}, cfg, nil); !errors.Is(err, ErrPathCountMismatch) {
+		t.Fatalf("NewMultipathSender mismatch error = %v, want ErrPathCountMismatch", err)
+	}
+	a, b := newPipe("a", "b", 1)
+	if _, err := newMultipathReceiver([]Substrate{a, b}, cfg, clock.NewRealClock(), nil, nil); !errors.Is(err, ErrPathCountMismatch) {
+		t.Fatalf("newMultipathReceiver mismatch error = %v, want ErrPathCountMismatch", err)
+	}
+}
+
+func TestMultipathCleartextFeedbackDuplicateWindow(t *testing.T) {
+	s := &MultipathSender{}
+	now := clock.Timestamp(10_000)
+	fb := []byte{1, 2, 3, 4}
+	s.rememberCleartextFeedback(now, fb)
+	if !s.duplicateCleartextFeedback(now.Add(feedbackDuplicateWindowMicros-1), append([]byte(nil), fb...)) {
+		t.Fatal("identical cleartext feedback inside the interval was not treated as duplicate")
+	}
+	if s.duplicateCleartextFeedback(now.Add(feedbackDuplicateWindowMicros+1), fb) {
+		t.Fatal("identical feedback after the interval must remain processable as fresh state")
+	}
+	if s.duplicateCleartextFeedback(now.Add(1), []byte{4, 3, 2, 1}) {
+		t.Fatal("different feedback must not be treated as duplicate")
+	}
+}
+
+func TestMultipathPMTUDDiscoversEachPath(t *testing.T) {
+	cfg := mpTestCfg()
+	cfg.ProbeMTU = true
+	cfg.MaxProbeMTU = 1280
+	rx, err := NewMultipathReceiver([]string{"127.0.0.1:0", "127.0.0.1:0"}, cfg, nil)
+	if err != nil {
+		t.Fatalf("NewMultipathReceiver: %v", err)
+	}
+	defer rx.Close()
+
+	tx, err := NewMultipathSender(rx.LocalAddrs(), cfg, nil)
+	if err != nil {
+		t.Fatalf("NewMultipathSender: %v", err)
+	}
+	defer tx.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		mtus := tx.PathMTUs()
+		if len(mtus) == 2 && mtus[0] == cfg.MaxProbeMTU && mtus[1] == cfg.MaxProbeMTU && tx.PathMTU() == cfg.MaxProbeMTU {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("multipath PMTUD did not discover both paths: mtus=%v min=%d", tx.PathMTUs(), tx.PathMTU())
 }
 
 // streamAndCollect writes n id-stamped chunks through tx at ~1 ms cadence and reads

@@ -68,3 +68,56 @@ func TestFrameAtomicDelivery(t *testing.T) {
 		}
 	})
 }
+
+func TestDefaultConfigFrameAtomicIsOptIn(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Flow = 1
+	cfg.SymbolSize = testSym
+	cfg.GenSize = 16
+	cfg.Redundancy = 0
+	cfg.BufferMicros = 50_000
+
+	if cfg.FrameAtomic {
+		t.Fatal("DefaultConfig enables FrameAtomic; high-delivery frame metadata must be the default, all-or-nothing delivery is opt-in")
+	}
+
+	s := NewSender(cfg)
+	r := NewReceiver(cfg)
+	now := clock.Timestamp(0)
+	fd := FrameDesc{Priority: 1, FrameID: 0, Chunks: 4, RAP: true}
+	for c := 0; c < 4; c++ {
+		s.WriteFrame(now, makeChunkN(uint32(c)), fd)
+	}
+	s.Flush(now)
+	for {
+		d, ok := s.PollSend()
+		if !ok {
+			break
+		}
+		sym, err := wire.DecodeSymbol(d)
+		if err != nil {
+			continue
+		}
+		if sym.Kind == wire.Systematic && sym.SrcIndex == 2 {
+			continue // make the frame incomplete and unrecoverable
+		}
+		r.FeedSymbol(now, d)
+	}
+	now = now.Add(cfg.BufferMicros + 100_000)
+	r.Tick(now)
+
+	var got []uint32
+	for {
+		id, _, ok := r.PollDeliver()
+		if !ok {
+			break
+		}
+		got = append(got, id)
+	}
+	if len(got) == 0 {
+		t.Fatal("default WriteFrame path dropped the whole broken frame; expected non-atomic byte delivery unless FrameAtomic is enabled")
+	}
+	if st := r.Stats(); st.Evicted != 0 {
+		t.Fatalf("default WriteFrame path evicted %d frame chunks; expected no frame-atomic evictions", st.Evicted)
+	}
+}

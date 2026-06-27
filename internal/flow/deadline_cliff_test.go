@@ -91,25 +91,23 @@ func TestDeadlineCliffControl(t *testing.T) {
 	}
 }
 
-// TestDeadlineCliffShedsOverhead is an ASPIRATIONAL guard (KNOWN GAP). Once the sender's RTT
+// TestDeadlineCliffShedsOverhead guards budget-aware repair shedding. Once the sender's RTT
 // estimate implies the one-way delay exceeds the budget, NOTHING it sends can be delivered —
 // so spending proactive + reactive repair on that flow is pure waste (the bench shows 47–180%
-// overhead at 0% delivery). A budget-aware controller should detect the unsatisfiable budget
-// and shed repair toward ~0 (and ideally surface the condition). Today it does not, so the
-// assertion is skipped; unskip it when the shed/backpressure path lands.
+// overhead at 0% delivery). When the path RTT is configured, the sender can know this before
+// startup and should shed repair toward zero instead of compounding the cliff.
 func TestDeadlineCliffShedsOverhead(t *testing.T) {
 	const budget = 200_000
-	cfg := Config{Flow: 1, SymbolSize: 256, GenSize: 16, Redundancy: 0.15, BufferMicros: budget}
+	cfg := Config{Flow: 1, SymbolSize: 256, GenSize: 16, Redundancy: 0.15, BufferMicros: budget, NominalRTTMicros: 600_000}
 	res := simLink{
 		cfg:       cfg,
 		owdMicros: 300_000,
 		srcMicros: 1_000,
-		n:         320,
+		n:         2000,
 		drop:      uniformDrop(0xC11FF, 0.10),
 	}.run()
-	t.Logf("unsatisfiable-budget overhead = %.0f%% at %d/%d delivered (want ~0%%)",
-		100*res.overhead(), res.delivered, res.n)
-	t.Skip("KNOWN GAP: sender does not yet detect one-way>budget and shed repair; unskip when budget-aware shedding lands")
+	t.Logf("unsatisfiable-budget overhead = %.0f%% at %d/%d delivered (cliff=%v, want ~0%%)",
+		100*res.overhead(), res.delivered, res.n, res.finalCliff)
 	if res.overhead() > 0.05 {
 		t.Fatalf("sender spent %.0f%% repair overhead on an undeliverable flow", 100*res.overhead())
 	}

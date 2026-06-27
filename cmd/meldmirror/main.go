@@ -78,7 +78,7 @@ func parseFlags() *options {
 	flag.DurationVar(&o.buffer, "buffer", 50*time.Millisecond, "Meld playout/deadline budget — must exceed the real end-to-end transport latency (code→wire→decode); push it lower on a fast/idle path, raise it on a busy machine or long link")
 	flag.Float64Var(&o.loss, "loss", 0, "mirror mode: fraction of uplink datagrams to drop (0..1)")
 	flag.Float64Var(&o.redundancy, "redundancy", -1, "Meld proactive code-rate floor (<0 = default)")
-	flag.BoolVar(&o.sliding, "sliding", false, "use the band-form sliding-window coder (RTT-independent repair; for a budget tighter than the RTT on a real lossy link)")
+	flag.BoolVar(&o.sliding, "sliding", true, "use the band-form sliding-window coder (default main profile; set false for generation fallback)")
 	flag.BoolVar(&o.pace, "pace", true, "pace coded datagrams onto the wire across the budget (off = send each emit immediately, lowest latency)")
 	flag.DurationVar(&o.duration, "duration", 0, "stop after this long (0 = run until Ctrl-C)")
 	flag.BoolVar(&o.verbose, "verbose", false, "show ffmpeg/ffplay info logging")

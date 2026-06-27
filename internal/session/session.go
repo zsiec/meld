@@ -49,6 +49,7 @@ type coreSender interface {
 	Flush(now clock.Timestamp)
 	PollSend() ([]byte, bool)
 	Stats() flow.SenderStats
+	EncoderControl() flow.EncoderControl
 	// RateBudgetBitsPerSec is the send-rate budget the host pacer releases within (the
 	// congestion controller's output, or the static ceiling). Read-only — the pacer
 	// never sets it; it only reshapes timing within it.
@@ -79,11 +80,50 @@ func newCoreReceiver(cfg flow.Config) coreReceiver {
 	return flow.NewReceiver(cfg)
 }
 
+func usesL4SMarking(cfg flow.Config) bool {
+	return cfg.CongestionControl && !cfg.Sliding
+}
+
+func usesECNReceive(cfg flow.Config) bool {
+	return !cfg.Sliding
+}
+
+func mtuProbeBodySize(size int, ctl controlState) int {
+	if ctl.active {
+		size -= crypto.ControlOverhead
+		if size < 0 {
+			return 0
+		}
+	}
+	return size
+}
+
+const (
+	minRecvBufferSize     = 2048
+	defaultMaxUDPDatagram = 64 << 10
+	maxWireSymbolOverhead = 1200 // base header + SendTimestamp + max frame descriptor extension slack
+)
+
+func recvBufferSize(cfg flow.Config) int {
+	size := defaultMaxUDPDatagram
+	if cfg.SymbolSize+maxWireSymbolOverhead > size {
+		size = cfg.SymbolSize + maxWireSymbolOverhead
+	}
+	if cfg.MaxProbeMTU > size {
+		size = cfg.MaxProbeMTU
+	}
+	if size < minRecvBufferSize {
+		return minRecvBufferSize
+	}
+	return size
+}
+
 // Sender is the UDP transmit host. It dials a remote, runs a flow.Sender, and
 // exposes a blocking Write. Safe for one writer plus the internal goroutines.
 type Sender struct {
 	sub       Substrate
 	clk       clock.Clock
+	cfg       flow.Config
 	mu        sync.Mutex
 	flow      coreSender
 	pace      *hostPacer  // host transmit pacer (nil when Config.Pace is off)
@@ -133,15 +173,20 @@ func newSender(sub Substrate, cfg flow.Config, clk clock.Clock, sec *SecurityCon
 // newSenderCfg is newSender with an explicit DPLPMTUD config, so a test can inject fast
 // probe timers without exposing them on the public Config.
 func newSenderCfg(sub Substrate, cfg flow.Config, clk clock.Clock, sec *SecurityConfig, pcfg pmtudConfig) (*Sender, error) {
+	if err := validateSubstrate(sub); err != nil {
+		return nil, err
+	}
 	if err := sec.validate(cfg.SymbolSize); err != nil {
 		sub.Close()
 		return nil, err
 	}
 	s := &Sender{
-		sub: sub, clk: clk, flow: newCoreSender(cfg), done: make(chan struct{}),
+		sub: sub, clk: clk, cfg: cfg, flow: newCoreSender(cfg), done: make(chan struct{}),
 		sealState: newSealState(sec, cfg.SymbolSize, cfg.Flow),
 	}
-	_ = setECN(sub) // mark outgoing data ECT(1) (L4S) so an AQM can CE-mark rather than drop
+	if usesL4SMarking(cfg) {
+		_ = setECN(sub) // mark outgoing data ECT(1) (L4S) so an AQM can CE-mark rather than drop
+	}
 	if cfg.ProbeMTU {
 		// Per-path DPLPMTUD: discover the path MTU and detect black holes. Set the socket's
 		// Don't-Fragment bit (best-effort) so probes test the path unfragmented.
@@ -154,7 +199,12 @@ func newSenderCfg(sub Substrate, cfg flow.Config, clk clock.Clock, sec *Security
 		// loops so tick/feedback can re-slave it; idle until the first media Write.
 		s.pace = newHostPacer(clk, s.flow.RateBudgetBitsPerSec()/8,
 			paceBurstMicros(cfg), paceQueueLimitMicros(cfg),
-			func(d []byte) (int, error) { return s.sub.WriteTo(d, nil) })
+			func(d []byte) (int, error) {
+				if err := writeDatagram(s.sub, d, nil); err != nil {
+					return 0, err
+				}
+				return len(d), nil
+			})
 	}
 	if sec.active() {
 		s.hsDone = make(chan struct{})
@@ -170,7 +220,7 @@ func newSenderCfg(sub Substrate, cfg flow.Config, clk clock.Clock, sec *Security
 		}
 		s.hsInit = init
 		s.hsMsg1 = wire.EncodeHandshakeInit(nil, msg1)
-		s.sub.WriteTo(s.hsMsg1, nil) // first attempt; tickLoop retries until established
+		_ = writeDatagram(s.sub, s.hsMsg1, nil) // first attempt; tickLoop retries until established
 	}
 	go s.recvLoop()
 	go s.tickLoop()
@@ -267,6 +317,13 @@ func (s *Sender) Stats() flow.SenderStats {
 	return s.flow.Stats()
 }
 
+// EncoderControl returns Meld's current advisory encoder-control request.
+func (s *Sender) EncoderControl() flow.EncoderControl {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.flow.EncoderControl()
+}
+
 // Close flushes the tail, stops the goroutines, and closes the substrate. With pacing,
 // the tail repair is drained to the wire (flushClose) before the substrate is shut, so
 // end-of-stream protection is not lost to teardown.
@@ -291,7 +348,7 @@ func (s *Sender) sendOut(out [][]byte) error {
 
 func (s *Sender) transmit(out [][]byte) error {
 	for _, d := range out {
-		if _, err := s.sub.WriteTo(d, nil); err != nil {
+		if err := writeDatagram(s.sub, d, nil); err != nil {
 			return err
 		}
 	}
@@ -299,7 +356,7 @@ func (s *Sender) transmit(out [][]byte) error {
 }
 
 func (s *Sender) recvLoop() {
-	buf := make([]byte, 2048)
+	buf := make([]byte, recvBufferSize(s.cfg))
 	for {
 		n, _, err := s.sub.ReadFrom(buf)
 		if err != nil {
@@ -355,7 +412,7 @@ func (s *Sender) recvLoop() {
 			echo, ok := s.ctl.seal(wire.EncodeClockEcho(nil, wire.ClockEcho{T0: p.T0, T1: recv, T2: int64(s.clk.Now())}))
 			s.mu.Unlock()
 			if ok {
-				s.sub.WriteTo(echo, nil)
+				_ = writeDatagram(s.sub, echo, nil)
 			}
 		case wire.IsMTUProbeAck(t):
 			// A DPLPMTUD probe was confirmed by the peer. Authenticate it, then feed the
@@ -418,7 +475,7 @@ func (s *Sender) handleCookieReply(datagram []byte) {
 	}
 	msg := s.hsMsg1
 	s.mu.Unlock()
-	s.sub.WriteTo(msg, nil)
+	_ = writeDatagram(s.sub, msg, nil)
 }
 
 func (s *Sender) tickLoop() {
@@ -433,7 +490,7 @@ func (s *Sender) tickLoop() {
 			if s.sec != nil && s.sendSecret == nil {
 				msg := s.hsMsg1 // snapshot under the lock; handleCookieReply may rewrite it
 				s.mu.Unlock()
-				s.sub.WriteTo(msg, nil) // resend handshake message 1 until established
+				_ = writeDatagram(s.sub, msg, nil) // resend handshake message 1 until established
 				continue
 			}
 			now := s.clk.Now()
@@ -446,7 +503,7 @@ func (s *Sender) tickLoop() {
 				// candidate size and sealed/authenticated like the other control datagrams.
 				if size, send := s.mtu.tick(now); send {
 					s.mtuNonce++
-					if p, ok := s.ctl.seal(wire.EncodeMTUProbe(nil, s.mtuNonce, size)); ok {
+					if p, ok := s.ctl.seal(wire.EncodeMTUProbe(nil, s.mtuNonce, mtuProbeBodySize(size, s.ctl))); ok {
 						probe = p
 					}
 				}
@@ -459,7 +516,7 @@ func (s *Sender) tickLoop() {
 				s.transmit(out)
 			}
 			if probe != nil {
-				s.sub.WriteTo(probe, nil) // control plane: bypass the pacer
+				_ = writeDatagram(s.sub, probe, nil) // control plane: bypass the pacer
 			}
 		}
 	}
@@ -545,6 +602,9 @@ func NewReceiverOver(sub Substrate, cfg flow.Config, sec *SecurityConfig) (*Rece
 // goroutines. The clock seam lets a test inject an offset clock to exercise the
 // cross-host handshake (N4) without two machines.
 func newReceiver(sub Substrate, cfg flow.Config, clk clock.Clock, sec *SecurityConfig) (*Receiver, error) {
+	if err := validateSubstrate(sub); err != nil {
+		return nil, err
+	}
 	if err := sec.validate(cfg.SymbolSize); err != nil {
 		return nil, err
 	}
@@ -561,7 +621,9 @@ func newReceiver(sub Substrate, cfg flow.Config, clk clock.Clock, sec *SecurityC
 		done:      make(chan struct{}),
 		openState: os,
 	}
-	_ = setECN(sub) // enable per-datagram TOS reception so the CE codepoint reaches FeedSymbolECN
+	if usesECNReceive(cfg) {
+		_ = setECN(sub) // enable per-datagram TOS reception so the CE codepoint reaches FeedSymbolECN
+	}
 	go r.recvLoop()
 	go r.tickLoop()
 	return r, nil
@@ -636,7 +698,7 @@ func (r *Receiver) Close() error {
 }
 
 func (r *Receiver) recvLoop() {
-	buf := make([]byte, 2048)
+	buf := make([]byte, recvBufferSize(r.cfg))
 	oob := make([]byte, 128) // per-datagram TOS/traffic-class control message (the ECN codepoint)
 	for {
 		n, addr, ecn, err := readECN(r.sub, buf, oob)
@@ -667,22 +729,23 @@ func (r *Receiver) recvLoop() {
 		case wire.IsMTUProbe(t):
 			// Echo a DPLPMTUD probe back to its source so the sender learns the path passed it.
 			// Stateless (no core involvement), authenticated/sealed like the clock echo. The
-			// acked size is what ACTUALLY arrived (DecodeMTUProbe returns len), so the sender
-			// confirms the real on-wire size.
+			// The ACK reports what ACTUALLY arrived on the wire. On encrypted flows the opened
+			// body is shorter than buf[:n] by the control trailer, so use n after DecodeMTUProbe
+			// validates the nonce/type.
 			r.mu.Lock()
 			d, ok := r.ctl.open(buf[:n])
 			if !ok {
 				r.mu.Unlock()
 				continue
 			}
-			nonce, size, e := wire.DecodeMTUProbe(d)
+			nonce, _, e := wire.DecodeMTUProbe(d)
 			var ack []byte
 			if e == nil {
-				ack, ok = r.ctl.seal(wire.EncodeMTUProbeAck(nil, nonce, uint16(size)))
+				ack, ok = r.ctl.seal(wire.EncodeMTUProbeAck(nil, nonce, uint16(n)))
 			}
 			r.mu.Unlock()
 			if e == nil && ok {
-				r.sub.WriteTo(ack, addr)
+				_ = writeDatagram(r.sub, ack, addr)
 			}
 		case wire.IsSymbol(t):
 			r.feedSymbol(buf[:n], addr, ecn)
@@ -730,7 +793,7 @@ func (r *Receiver) handleHandshakeInit(datagram []byte, addr net.Addr) {
 	}
 	r.mu.Unlock()
 	if res.send != nil && to != nil {
-		r.sub.WriteTo(res.send, to)
+		_ = writeDatagram(r.sub, res.send, to)
 	}
 }
 
@@ -772,18 +835,18 @@ func (r *Receiver) feedSymbol(datagram []byte, addr net.Addr, ecn flow.ECN) {
 	r.flow.FeedSymbolECN(r.coreNow(), datagram, ecn) // sender-frame time; ecn is the CE signal for the CC
 	out := r.openAll(drainDeliver(r.flow))
 	// Adopt the source as the feedback endpoint. A cleartext flow has no auth to gate on. An
-	// encrypted flow at BOOTSTRAP (no peer learned yet) binds on the first authentic delivery:
-	// len(out)>0 means at least one symbol opened under the live keys, the condition a repair-only
-	// recovery (every systematic lost — exactly what FEC exists for) still satisfies, so the
-	// receiver can ACK rather than wedging under sustained systematic loss. Once a peer is set, a
-	// ROAM rebinds only when THIS specific systematic opens under the live keys — never on the
-	// global delivery signal, which a forged cursor-id symbol from a spoofed source could ride to
-	// hijack feedback (an at-bootstrap misbinding self-heals on the first authentic systematic).
+	// encrypted flow at BOOTSTRAP (no peer learned yet) binds on either an authenticated
+	// systematic (even if it is out of order and not yet deliverable) or the first authentic
+	// delivery. Waiting only for delivery can deadlock generation-mode recovery: a lost cursor
+	// symbol blocks delivery, feedback has no peer, and reactive repair never starts. Once a peer
+	// is set, a ROAM rebinds only when THIS specific systematic opens under the live keys — never
+	// on the global delivery signal, which a forged cursor-id symbol from a spoofed source could
+	// ride to hijack feedback.
 	switch {
 	case r.sec == nil:
 		r.peer = addr
 	case r.peer == nil:
-		if len(out) > 0 {
+		if len(out) > 0 || (sysSym && r.authenticates(sym)) {
 			r.peer = addr
 		}
 	case !sameAddr(addr, r.peer) && sysSym && r.authenticates(sym):
@@ -832,7 +895,7 @@ func (r *Receiver) tickLoop() {
 			r.emit(out)
 			r.sendFeedback(fbs, peer)
 			if probe != nil {
-				r.sub.WriteTo(probe, peer)
+				_ = writeDatagram(r.sub, probe, peer)
 			}
 		}
 	}
@@ -857,7 +920,7 @@ func (r *Receiver) sendFeedback(sealed [][]byte, peer net.Addr) {
 		return
 	}
 	for _, fb := range sealed {
-		r.sub.WriteTo(fb, peer)
+		_ = writeDatagram(r.sub, fb, peer)
 	}
 }
 
