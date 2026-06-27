@@ -7,6 +7,20 @@ coverage.*
 /dist/
 /scratchpad/
 
+# LaTeX build artifacts
+/docs/spec/*.aux
+/docs/spec/*.bbl
+/docs/spec/*.bcf
+/docs/spec/*.blg
+/docs/spec/*.fdb_latexmk
+/docs/spec/*.fls
+/docs/spec/*.log
+/docs/spec/*.out
+/docs/spec/*.pdf
+/docs/spec/*.run.xml
+/docs/spec/*.synctex.gz
+/docs/spec/*.toc
+
 # editors / OS
 .DS_Store
 *.swp

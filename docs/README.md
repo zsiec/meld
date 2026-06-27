@@ -11,6 +11,8 @@ point; these files are the deeper references.
   attach media descriptors, enable encryption, and read stats.
 - [Benchmarking](bench.md): the macro frontier methodology and the current
   SRT/RIST comparison results.
+- [Specification](spec/README.md): LaTeX working specification for the Meld
+  protocol and wire version 1.
 
 ## Protocol Components
 

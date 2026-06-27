@@ -28,6 +28,9 @@ byte0 = (Version << 4) | type      // Version = 1 (high nibble), type (low nibbl
 | `0x6` | Handshake message 1 (initiator → responder) — encryption (below) |
 | `0x7` | Handshake message 2 (responder → initiator) |
 | `0x8` | Cookie reply (responder → initiator) — mac2 anti-amplification, under load |
+| `0x9` | MTU probe (sender → receiver): padded DPLPMTUD probe |
+| `0xA` | MTU probe acknowledgement (receiver → sender) |
+| `0xB` | Sparse repair symbol (repair over explicit source ids) |
 
 A decoder checks the version nibble **first**: a datagram whose version it does not
 understand returns `ErrVersion` rather than misparsing — so a field added in a later
@@ -71,7 +74,7 @@ offset itself.
 
 | off | size | field | meaning |
 |----:|----:|---|---|
-| 0 | 1 | `ver\|type` | version nibble + `0x1`/`0x2` |
+| 0 | 1 | `ver\|type` | version nibble + `0x1`/`0x2`/`0xB` |
 | 1 | 4 | `Flow` | flow id |
 | 5 | 2 | `Epoch` | flow generation; bumps on flow reset / key update (reserved; 0) |
 | 7 | 1 | `PathID` | host-stamped path the symbol was sent on (0 = single path / path 0; N5) |
@@ -84,6 +87,7 @@ offset itself.
 | 29 | 1 | `Flags` | bit 0 `flagSendTS` ⇒ send-timestamp ext; bit 1 `flagDesc` ⇒ frame-descriptor ext |
 | +8 | 8 | `SendTimestamp` | ext, present iff `flagSendTS` — sender clock µs at emission (N4) |
 | ext | 8 + 4·`nRefs` | frame descriptor | ext, present iff `flagDesc` — head `FrameStart`(4) `FrameLen`(2) `descFlags`(1) `nRefs`(1), then `nRefs`×`RefStart`(4); WP6 |
+| ext | 4·`N` | sparse source ids | present iff type is `0xB`: `N`×`SparseID`(4), before payload |
 | … | — | `Payload` | coded bytes, sized to the validated path MTU |
 
 The two extensions follow the 30-byte base in a **fixed order** (send timestamp, then frame
@@ -91,7 +95,8 @@ descriptor), each gated by its Flags bit, so the decoder walks them by flag. The
 descriptor** (WP6) is stamped on SYSTEMATIC symbols only and lets the receiver compute loss
 propagation parse-free: `FrameStart` is the access unit's first source id (its identity, and
 with `FrameLen` its exact id range `[FrameStart, FrameStart+FrameLen)`); `descFlags` bit 0 =
-RAP (keyframe), bit 1 = discardable, bit 2 = non-picture metadata/parameter material;
+RAP (keyframe), bit 1 = discardable, bit 2 = non-picture metadata/parameter material, bit 3 =
+recovery-refresh;
 `nRefs` (≤ 15) is the number of dependency frames, each a `RefStart` (a referenced frame's first source id). The references are **exact and
 variable-length** — a B-picture carries its two bracketing anchors, a P-picture one — so the
 receiver tracks the dependency tree the shaper resolved (POC bracketing / AV1's reference
@@ -101,7 +106,9 @@ the receiver infers frames it did not directly receive (`internal/flow` FrameSta
 A **Systematic** symbol carries one source symbol verbatim (`N`/`RepairKey` unused);
 a **Repair** symbol carries a random linear combination, where `WindowBase`+`N`
 delimit the spanned window and `RepairKey` regenerates the coefficients
-(`internal/code.GenCoeffs`). `PathID` is set by the multipath scheduler
+(`internal/code.GenCoeffs`). A **SparseRepair** symbol carries a random linear
+combination over explicit source ids listed after the optional header extensions;
+`N` is the number of ids and is capped at 64 by the decoder. `PathID` is set by the multipath scheduler
 (`internal/flow.pathScheduler`); the host transmits the symbol on that path and the
 receiver attributes its arrival/loss to that path for the co-loss estimate.
 

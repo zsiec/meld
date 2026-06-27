@@ -1,0 +1,703 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{hyperref}
+\usepackage{longtable}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{amsmath}
+\usepackage{amssymb}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!55!black,
+  citecolor=blue!55!black,
+  urlcolor=blue!55!black,
+  pdftitle={Meld Protocol Specification},
+  pdfauthor={Meld Project}
+}
+
+\newcommand{\meld}{Meld}
+\newcommand{\wireversion}{1}
+\newcommand{\code}[1]{\ifmmode\text{\texttt{#1}}\else\texttt{#1}\fi}
+\newcommand{\field}[1]{\code{#1}}
+\newcommand{\usec}{\ensuremath{\mu\mathrm{s}}}
+\newcommand{\gf}{\ensuremath{\mathrm{GF}(2^8)}}
+
+\title{\meld{} Protocol Specification\\
+\large Working Specification for Wire Version \wireversion}
+\author{Meld Project}
+\date{June 27, 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\meld{} is a low-latency coded media transport for live video. It sends
+systematic source symbols plus random-linear repair symbols so that a receiver can
+recover erasures before a named-packet retransmission can complete a round trip.
+The protocol is designed as one deployable adaptive profile, \code{meld-auto},
+rather than a collection of static profiles. This document specifies the wire
+format, recovery model, feedback loop, media descriptor, security placement, and
+implementation requirements for wire version \wireversion.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+\section{Status of This Document}
+
+This is a working specification for the current Meld prototype. It is intended to
+be precise enough for independent implementation review, internal conformance
+tests, and future publication as a formal specification. It is not an Internet
+Standards Track document.
+
+Wire version \wireversion{} is the first explicitly versioned Meld wire format.
+Earlier prototype headers were not shipped and have no compatibility obligation.
+Base-layout changes require a future version nibble. Additive fields are appended
+under the extension policy in Section~\ref{sec:versioning}.
+
+\section{Terminology and Conventions}
+
+The key words ``MUST'', ``MUST NOT'', ``REQUIRED'', ``SHALL'', ``SHALL NOT'',
+``SHOULD'', ``SHOULD NOT'', ``RECOMMENDED'', ``NOT RECOMMENDED'', ``MAY'', and
+``OPTIONAL'' in this document are to be interpreted as described in BCP 14
+\cite{rfc2119,rfc8174} when, and only when, they appear in all capitals.
+
+All multi-byte integer fields on the wire are big-endian. Unless explicitly
+stated otherwise, clock values and deadlines are signed 64-bit microsecond
+timestamps in the sender's clock domain. Fixed-point loss and ECN fractions are
+reported as unsigned 16-bit values in parts per 65535.
+
+The following terms are used throughout:
+
+\begin{description}[leftmargin=2.3cm,style=nextline]
+\item[Source symbol]
+  One fixed-size application chunk after any encryption transform and zero
+  padding to \field{SymbolSize}.
+\item[Systematic symbol]
+  A wire symbol carrying one source symbol verbatim.
+\item[Repair symbol]
+  A \gf{} linear combination of source symbols.
+\item[Sparse repair]
+  A repair symbol over an explicit set of source identifiers rather than a
+  contiguous coding window.
+\item[Flow]
+  One logical media stream, identified by a 32-bit \field{Flow} value.
+\item[Deadline]
+  The latest clock time at which a source symbol can still contribute to
+  delivery under the playout budget.
+\item[Dependency island]
+  A media dependency neighborhood whose loss can damage multiple displayed
+  frames, such as a random-access anchor, early reference chain, parameter
+  material, or recovery-refresh slice interval.
+\end{description}
+
+\section{Design Goals}
+
+\meld{} is optimized for media completion under a playout deadline. The protocol
+does not try to beat SRT or RIST at every buffer depth. Its current measured
+frontier is iid or tail-erasure loss at tight latency budgets, especially when
+the playout budget is less than one RTT. In that region, coded repair can arrive
+before ARQ can return a retransmission.
+
+The design goals are:
+
+\begin{enumerate}
+\item Recover erased media chunks without waiting for a named-packet ARQ round
+      trip when the latency budget is tighter than RTT.
+\item Keep one adaptive deployable behavior, \code{meld-auto}; expose latency and
+      bitrate budgets, not multiple recovery profiles.
+\item Keep source symbols mostly FIFO. Adapt repair timing and rate first.
+\item Keep proactive repair inside the configured rate budget unless explicitly
+      configured otherwise by an implementation.
+\item Use codec-blind transport mechanics, but accept generic media descriptors
+      so the transport can estimate decode damage.
+\item Prefer conservative behavior when channel classification is uncertain.
+\end{enumerate}
+
+SRT and RIST are useful reference points because they are widely deployed
+low-latency contribution transports. They primarily recover by retransmission
+within a configured latency window, while Meld makes proactive coded recovery the
+default low-latency mechanism and uses feedback to tune future repair
+\cite{srt-rfc,rist-tr061,rist-tr062}.
+
+\section{Layering Model}
+
+\meld{} has three layers:
+
+\begin{enumerate}
+\item The application or media layer writes fixed-size media chunks. It MAY attach
+      a generic frame descriptor describing priority, access-unit boundaries,
+      references, random-access points, recovery-refresh markers, temporal layer,
+      and discardability.
+\item The sans-I/O flow core emits source and repair symbols, tracks deadlines,
+      estimates loss and burstiness, decodes from any sufficient rank, and emits
+      feedback reports. The core does not open sockets and does not read wall
+      clocks directly.
+\item The session host owns UDP or a caller-provided datagram substrate, pacing,
+      timers, optional encryption, DPLPMTUD probes, and goroutines.
+\end{enumerate}
+
+The wire waist between implementations is the \field{Symbol} and \field{Feedback}
+encoding defined in Section~\ref{sec:wire-format}.
+
+\section{Transport Model}
+
+\meld{} runs over an unreliable datagram substrate. The substrate MAY drop,
+duplicate, reorder, or ECN-mark datagrams. The receiver MUST treat corruption as
+erasure; corrupted authenticated payloads fail the AEAD check when encryption is
+enabled.
+
+Peers are configured with the same \field{SymbolSize}. A coded symbol payload
+MUST be exactly \field{SymbolSize} bytes after decoding the Meld header. A
+receiver MUST reject a symbol whose payload length differs from its configured
+\field{SymbolSize}. Application chunks shorter than \field{SymbolSize} are
+zero-padded before coding. Applications that need exact media lengths MUST carry
+that length in their media/container format or framing layer.
+
+\section{Protocol Overview}
+
+The sender assigns each source symbol a monotonically increasing 32-bit
+\field{SrcIndex}. It emits a systematic symbol immediately, inserts the source
+symbol into the live coding window, and emits repair symbols according to its
+adaptive controller. Repair symbols are independent equations over the live
+source set.
+
+The receiver inserts systematic and repair symbols into an incremental decoder.
+Whenever the decoder can recover the next in-order source symbol before its
+deadline, the receiver delivers it. If a missing symbol reaches its deadline, the
+receiver skips it and advances the delivery cursor so later decoded symbols can
+be delivered.
+
+Feedback reports are cumulative state, not events. A lost feedback report is
+superseded by the next report. Reports carry delivery progress, rank deficit,
+pre-recovery channel loss, burstiness, optional multipath statistics, and optional
+media decodability counters.
+
+\section{Versioning and Extension Policy}
+\label{sec:versioning}
+
+Every Meld datagram begins with one byte:
+
+\[
+  \field{byte0} = (\field{Version} \ll 4) \;|\; \field{Type}
+\]
+
+For this specification, \field{Version} MUST be \wireversion. The high nibble
+carries the version and the low nibble carries the message type. A decoder MUST
+check the version before interpreting the type. If the version is not understood,
+the decoder MUST reject the datagram as an unsupported version rather than
+attempting to parse it as a different type.
+
+Additive optional fields are appended to the tail of an existing message and
+guarded by either a symbol flags bit or a length check. Moving or resizing an
+existing base field is an incompatible base-layout change and requires a future
+version nibble.
+
+\section{Wire Format}
+\label{sec:wire-format}
+
+\subsection{Message Types}
+
+\begin{longtable}{>{\raggedright\arraybackslash}p{0.15\linewidth}
+                  >{\raggedright\arraybackslash}p{0.29\linewidth}
+                  >{\raggedright\arraybackslash}p{0.45\linewidth}}
+\toprule
+Type & Message & Description \\
+\midrule
+\endhead
+\code{0x1} & Systematic symbol & One source symbol, verbatim. \\
+\code{0x2} & Repair symbol & Random linear combination over a contiguous window. \\
+\code{0x3} & Feedback report & Receiver-to-sender cumulative recovery state. \\
+\code{0x4} & Clock probe & Receiver-to-sender probe carrying \field{T0}. \\
+\code{0x5} & Clock echo & Sender-to-receiver echo carrying \field{T0}, \field{T1}, and \field{T2}. \\
+\code{0x6} & Handshake message 1 & Initiator-to-responder encrypted-session handshake payload. \\
+\code{0x7} & Handshake message 2 & Responder-to-initiator encrypted-session handshake payload. \\
+\code{0x8} & Cookie reply & Responder-to-initiator anti-amplification cookie payload. \\
+\code{0x9} & MTU probe & Sender-to-receiver padded DPLPMTUD probe. \\
+\code{0xA} & MTU probe acknowledgement & Receiver-to-sender probe acknowledgement. \\
+\code{0xB} & Sparse repair symbol & Random linear combination over an explicit source-id set. \\
+\bottomrule
+\end{longtable}
+
+\subsection{Symbol Header}
+
+Systematic, repair, and sparse repair messages share a 30-byte base header. The
+base header is followed by optional extensions, any sparse repair source-id list,
+and finally the coded payload.
+
+\begin{longtable}{>{\raggedleft\arraybackslash}p{0.08\linewidth}
+                  >{\raggedleft\arraybackslash}p{0.08\linewidth}
+                  >{\raggedright\arraybackslash}p{0.22\linewidth}
+                  >{\raggedright\arraybackslash}p{0.50\linewidth}}
+\toprule
+Offset & Size & Field & Meaning \\
+\midrule
+\endhead
+0 & 1 & \field{ver|type} & Version nibble plus symbol type \code{0x1}, \code{0x2}, or \code{0xB}. \\
+1 & 4 & \field{Flow} & Flow identifier. \\
+5 & 2 & \field{Epoch} & Flow generation and encryption key epoch. \\
+7 & 1 & \field{PathID} & Host-stamped path identifier; zero on single-path flows. \\
+8 & 4 & \field{WindowBase} & Low edge of the contiguous coding window. \\
+12 & 4 & \field{SrcIndex} & Systematic: source id. Repair: repair counter or key-related sequence. \\
+16 & 2 & \field{N} & Repair width or sparse-id count. \\
+18 & 2 & \field{RepairKey} & Seed for coefficient generation. \\
+20 & 1 & \field{Priority} & Protection tier; zero is most disposable. \\
+21 & 8 & \field{Deadline} & Decode-by time in sender-clock microseconds. \\
+29 & 1 & \field{Flags} & Bit 0: send timestamp extension. Bit 1: frame descriptor extension. \\
+\bottomrule
+\end{longtable}
+
+If bit 0 of \field{Flags} is set, an 8-byte signed \field{SendTimestamp} follows
+the base header. If bit 1 is set, a frame descriptor follows the send timestamp
+extension if present, otherwise it follows the base header directly. Extensions
+MUST appear in this fixed order.
+
+The frame descriptor extension layout is:
+
+\begin{longtable}{>{\raggedleft\arraybackslash}p{0.10\linewidth}
+                  >{\raggedleft\arraybackslash}p{0.10\linewidth}
+                  >{\raggedright\arraybackslash}p{0.22\linewidth}
+                  >{\raggedright\arraybackslash}p{0.46\linewidth}}
+\toprule
+Offset & Size & Field & Meaning \\
+\midrule
+\endhead
+0 & 4 & \field{FrameStart} & Source id of the first chunk in the access unit. \\
+4 & 2 & \field{FrameLen} & Number of chunks in the access unit. \\
+6 & 1 & \field{DescFlags} & Bit 0 RAP, bit 1 discardable, bit 2 non-picture, bit 3 recovery-refresh. \\
+7 & 1 & \field{nRefs} & Number of referenced access units. \\
+8 & 4 each & \field{RefStart[]} & Source id of each referenced access unit's first chunk. \\
+\bottomrule
+\end{longtable}
+
+A sender SHOULD attach the frame descriptor only to systematic symbols. Coding
+recovers payload bytes, not headers, so a recovered source symbol does not carry
+the descriptor extension. Receivers compute frame decodability from directly
+observed descriptors and source-id ranges.
+
+\subsection{Systematic Symbols}
+
+A systematic symbol uses type \code{0x1}. It carries one source symbol verbatim.
+\field{SrcIndex} is the source identifier. \field{N} SHOULD describe the width of
+the current generation or be one on the sliding path. \field{RepairKey} is unused
+by the systematic equation and SHOULD be zero.
+
+\subsection{Contiguous Repair Symbols}
+
+A contiguous repair symbol uses type \code{0x2}. \field{WindowBase} and \field{N}
+identify the source ids covered by the repair equation:
+
+\[
+  [\field{WindowBase}, \field{WindowBase} + \field{N})
+\]
+
+\field{RepairKey} seeds the deterministic coefficient generator. The resulting
+payload is the byte-wise \gf{} linear combination of the covered source-symbol
+payloads.
+
+\subsection{Sparse Repair Symbols}
+
+A sparse repair symbol uses type \code{0xB}. It carries a repair equation over an
+explicit list of source ids. After the optional symbol extensions and before the
+payload, the datagram carries \field{N} unsigned 32-bit source identifiers in
+coefficient order. \field{N} MUST be greater than zero and MUST NOT exceed 64.
+
+Sparse repair is intended for protected dependency neighborhoods where a
+contiguous window would spend repair pressure on unrelated disposable symbols.
+It is still part of \code{meld-auto}; it is not a separate profile.
+
+\subsection{Feedback Report}
+
+A feedback report uses type \code{0x3}. The base report is 53 bytes. Additional
+tail groups are length-gated.
+
+\begin{longtable}{>{\raggedleft\arraybackslash}p{0.08\linewidth}
+                  >{\raggedleft\arraybackslash}p{0.08\linewidth}
+                  >{\raggedright\arraybackslash}p{0.24\linewidth}
+                  >{\raggedright\arraybackslash}p{0.48\linewidth}}
+\toprule
+Offset & Size & Field & Meaning \\
+\midrule
+\endhead
+0 & 1 & \field{ver|type} & Version nibble plus \code{0x3}. \\
+1 & 4 & \field{Flow} & Flow identifier. \\
+5 & 2 & \field{Epoch} & Flow generation, mirroring symbol epoch. \\
+7 & 4 & \field{DecodedLowEdge} & All source ids below this value are delivered or skipped. \\
+11 & 4 & \field{HighestSeen} & Highest observed source-id edge. \\
+15 & 2 & \field{Deficit} & Extra independent symbols needed at the cursor. \\
+17 & 2 & \field{EcnCE} & CE-marked fraction this interval, parts per 65535. \\
+19 & 2 & \field{LossRate} & Smoothed pre-recovery erasure estimate, parts per 65535. \\
+21 & 32 & \field{Deficits[32]} & Rank deficits for the next 32 generations or windows, saturating at 255. \\
+53 & 2 & \field{CongestionLoss} & Pre-recovery wire-loss count since the last report. \\
+55 & 2 & \field{Burstiness} & Mean loss-run length in Q8; 256 denotes iid. \\
+57 & 1 & \field{nPaths} & Number of paths in the multipath tail; zero means absent or single path. \\
+\bottomrule
+\end{longtable}
+
+When \field{nPaths} is non-zero, it MUST be at most 8. It is followed by
+\field{PathLoss[nPaths]} as uint16 fractions and \field{SlotDist[nPaths+1]} as a
+histogram of aligned-slot erasure counts. \field{SlotDist[j]} is the fraction of
+slots in which exactly \(j\) of \(n\) paths erased their symbol.
+
+After the per-path section, a 16-byte media-damage tail MAY be present. It
+contains four uint32 counters: \field{Frames}, \field{DecodableFrames},
+\field{Keyframes}, and \field{Decodable\allowbreak{}Keyframes}. A sender uses
+these counters to distinguish ordinary packet loss from dependency damage.
+
+Feedback is cumulative. A sender MUST treat absent tail fields as zero or unknown,
+not as protocol failure.
+
+\subsection{Clock Probe and Echo}
+
+A clock probe uses type \code{0x4} and has length 9 bytes:
+\field{ver|type} followed by \field{T0} as a signed 64-bit timestamp.
+
+A clock echo uses type \code{0x5} and has length 25 bytes:
+\field{ver|type}, \field{T0}, \field{T1}, and \field{T2}. With receiver receive
+time \field{T3}, the receiver estimates offset and RTT using:
+
+\[
+  \mathrm{offset} = \frac{(T1 - T0) + (T2 - T3)}{2}
+\]
+\[
+  \mathrm{rtt} = (T3 - T0) - (T2 - T1)
+\]
+
+\subsection{DPLPMTUD Probes}
+
+An MTU probe uses type \code{0x9}. It carries a 4-byte nonce and zero padding so
+the whole datagram has the candidate size under test. An MTU probe acknowledgement
+uses type \code{0xA} and carries the nonce plus the observed datagram size as a
+uint16. This follows the datagram packetization-layer PMTUD model of RFC 8899
+\cite{rfc8899}.
+
+\subsection{Handshake Payload Framing}
+
+Handshake messages are framed by the Meld version/type byte followed by a
+suite-specific crypto payload. The wire package treats the payload as opaque; the
+current encrypted-session suite pins the following payload lengths:
+
+\begin{longtable}{>{\raggedright\arraybackslash}p{0.12\linewidth}
+                  >{\raggedright\arraybackslash}p{0.18\linewidth}
+                  >{\raggedleft\arraybackslash}p{0.16\linewidth}
+                  >{\raggedright\arraybackslash}p{0.42\linewidth}}
+\toprule
+Type & Direction & Payload bytes & Payload layout \\
+\midrule
+\endhead
+\code{0x6} & Init to resp & 1248 & X25519 public key (32), ML-KEM-768 encapsulation key (1184), \field{mac1} (16), \field{mac2} (16). \\
+\code{0x7} & Resp to init & 1152 & X25519 public key (32), ML-KEM-768 ciphertext (1088), confirmation tag (16), \field{mac1} (16). \\
+\code{0x8} & Resp to init & 56 & Cookie nonce (24), encrypted cookie body (32). \\
+\bottomrule
+\end{longtable}
+
+\section{Coding Semantics}
+
+\meld{} uses random linear network coding over \gf{}. A source symbol is a unit
+vector equation. A repair symbol is an equation whose coefficient vector is
+derived deterministically from \field{RepairKey} and the covered source ids.
+
+For contiguous repair, the covered ids are the consecutive ids named by
+\field{WindowBase} and \field{N}. For sparse repair, the covered ids are the
+explicit \field{SparseIDs} list. A receiver MUST treat a repair symbol as useful
+only if its equation is innovative relative to the receiver's current linear
+system.
+
+The default low-latency path is sliding-window coding. The implementation MAY
+retain a generation-mode fallback, but peers MUST interoperate through the same
+symbol and feedback waist. A receiver follows the sender-stamped
+\field{WindowBase} and \field{N}; it MUST NOT assume a fixed generation width
+when stamped widths vary.
+
+\section{Sender Requirements}
+
+A conforming sender:
+
+\begin{enumerate}
+\item MUST assign source ids monotonically within an epoch.
+\item MUST emit source symbols in source-id order except when an implementation
+      intentionally sheds a discardable media layer before source assignment.
+\item MUST NOT depend on full emitted-stream lookahead for sender-realizable
+      placement. Repair timing decisions are limited to symbols already created
+      or safely releasable before deadline risk.
+\item SHOULD size proactive repair from measured erasure rate, burstiness, and a
+      target decode-failure probability.
+\item SHOULD send reactive top-up repair when feedback reports a live rank
+      deficit and the repair can still arrive before the relevant deadline.
+\item MUST cap or throttle repair when a configured aggregate rate budget would
+      otherwise be exceeded, unless an operator has explicitly disabled that cap.
+\item SHOULD preserve source FIFO under congestion and reduce repair before
+      delaying non-discardable source past deadline.
+\end{enumerate}
+
+When uncertainty increases, for example after missing feedback, high reorder, or
+unstable loss estimates, the sender SHOULD bias conservative: keep source FIFO,
+avoid speculative placement, and rely on feedback-driven repair that can still
+land in time.
+
+\section{Receiver Requirements}
+
+A conforming receiver:
+
+\begin{enumerate}
+\item MUST reject unknown wire versions.
+\item MUST reject symbols for the wrong flow.
+\item MUST reject coded payloads whose length differs from configured
+      \field{SymbolSize}.
+\item MUST bound decode state so a forged source id or window cannot force
+      unbounded allocation or cursor walking.
+\item MUST deliver source symbols in source-id order.
+\item MUST skip a missing source symbol when its deadline expires, so later
+      recovered symbols are not blocked indefinitely.
+\item SHOULD report feedback periodically and after meaningful recovery-state
+      changes.
+\end{enumerate}
+
+Receivers SHOULD count pre-recovery wire loss from systematic source-id gaps
+before successful decoding hides those gaps. This preserves an honest congestion
+and repair-sizing signal.
+
+\section{Adaptive Control Loop}
+
+\code{meld-auto} is the only deployable profile. It classifies the current
+frontier online using:
+
+\begin{itemize}
+\item RTT and one-way delay variation from clock exchange and timestamps,
+\item playout budget and slack after RTT,
+\item pre-recovery loss rate,
+\item loss-run burstiness,
+\item reorder behavior,
+\item optional multipath erasure correlation, and
+\item optional media decodability damage.
+\end{itemize}
+
+The sender uses those signals to choose repair aggressiveness, sparse repair
+eligibility, reactive repair timing, rate-budget throttling, temporal-layer
+shedding if enabled, and an optional encoder recovery-cadence request. The
+control loop is continuous; changing network conditions should move the sender
+between regimes without requiring a named user profile.
+
+\section{Media Descriptor}
+
+The media descriptor is generic and codec-blind. It carries enough structure for
+the receiver to compute decode damage without parsing AVC, HEVC, AV1, JPEG XS, or
+container-specific syntax.
+
+The descriptor fields are:
+
+\begin{description}[leftmargin=3.0cm,style=nextline]
+\item[\field{Priority}]
+  Protection tier. Higher tiers receive tighter decode-failure targets.
+\item[\field{FrameStart}]
+  First source id of the access unit.
+\item[\field{FrameLen}]
+  Number of chunks in the access unit.
+\item[\field{RefStart[]}]
+  First source ids of dependency access units.
+\item[RAP]
+  Random-access point or equivalent recovery anchor.
+\item[Recovery-refresh]
+  Reference slice or access unit participating in a bounded intra-refresh or
+  recovery interval.
+\item[Discardable]
+  Unit that no later unit depends on.
+\item[Non-picture]
+  Parameter, metadata, or other non-displayed coded material.
+\end{description}
+
+The descriptor does not mandate a codec structure. A media shaper maps codec or
+container facts into this generic form.
+
+\section{Encoder Recovery-Cadence Actuator}
+
+\meld{} MAY expose an advisory encoder-control output. When feedback indicates
+that long bursts are damaging dependency islands, the sender MAY request a
+bounded maximum recovery interval from an attached encoder. An encoder can satisfy
+that request with bounded intra-refresh, recovery-point signaling, keyframes, or
+another codec-native mechanism.
+
+This actuator is advisory. It MUST NOT create multiple deployed Meld profiles. If
+the encoder cannot comply, Meld continues with the same transport loop and
+configured repair budget.
+
+\section{Multipath}
+
+The \field{PathID} field identifies the path on which a symbol was sent. In a
+single-path session it is zero. In a multipath session, systematic and repair
+symbols are spread across paths and decoded from their union. The receiver reports
+per-path marginal loss and an aligned-slot erasure-count histogram. The sender
+uses this histogram to size repair against the joint erasure tail rather than
+assuming independent paths.
+
+Path count and path layout are deployment configuration, not wire-negotiated in
+version \wireversion. A receiver SHOULD stop reporting multipath correlation
+statistics if observed \field{PathID} stamps show that peers disagree about the
+path layout.
+
+\section{Pacing and Deadlines}
+
+The session host SHOULD pace datagrams to the configured aggregate rate budget.
+Pacing MUST be release-constrained: it can only send datagrams that already exist
+and are safe to hold until the release time. A sender MUST NOT model pacer
+reordering as if it had full future-stream lookahead.
+
+\field{Deadline} is per symbol. Repair stamped with a deadline is useful only if
+it can arrive before the source symbols it protects expire. A receiver MAY clamp
+unreasonable peer-stamped deadlines to a sane window around local time to protect
+against forged timestamps.
+
+\section{Security}
+
+Encryption is optional. When enabled, it lives in the session host and the flow
+core remains crypto-blind.
+
+\subsection{Handshake}
+
+The encrypted session handshake uses an Argon2id-stretched passphrase as a PSK,
+an NNpsk0-style Noise pattern, X25519, ML-KEM-768, HKDF-SHA256, and
+ChaCha20-Poly1305. Handshake message bytes are carried as opaque payloads behind
+message types \code{0x6}, \code{0x7}, and \code{0x8}. The cookie reply is an
+anti-amplification mechanism used under load.
+
+\subsection{Encrypt-then-code}
+
+The host AEAD-seals each source symbol before the coder sees it. The coder then
+treats ciphertext plus tag as opaque payload bytes. Repair symbols are linear
+combinations of ciphertext bytes. The receiver solves the linear system, recovers
+source ciphertexts, and then authenticates and decrypts each source symbol.
+
+This preserves end-to-end confidentiality and integrity while allowing a relay to
+route or recode without plaintext access. The symbol header remains visible. In
+encrypted mode, source-symbol identity fields are authenticated as AEAD associated
+data.
+
+\subsection{Control Authentication}
+
+On encrypted flows, feedback, clock, and MTU control datagrams are authenticated
+with a trailer carrying an 8-byte sequence number and a 16-byte HMAC-SHA256 tag.
+Receivers drop replayed or stale control datagrams using a bounded replay window.
+
+\subsection{Limitations}
+
+Version \wireversion{} does not provide anonymity, metadata confidentiality,
+group keying, or per-hop pollution detection for untrusted recoding relays.
+Cleartext headers reveal flow id, window structure, priority, deadlines, frame
+boundaries, and dependency hints.
+
+\section{Congestion and Rate Budget}
+
+\meld{} distinguishes pre-recovery wire loss from post-recovery media delivery.
+Coding MUST NOT hide congestion signals from the sender. The receiver reports
+pre-recovery loss and ECN CE fraction; the sender uses those signals to size
+repair and, when congestion control is enabled, to adjust its budget.
+
+The sender SHOULD keep proactive repair inside \field{MaxBitrate}. If the budget
+cannot carry both source and repair, source and non-discardable base media take
+priority over repair. Optional media shedding is limited to discardable temporal
+layers and occurs before source-id assignment so it does not create transport
+holes.
+
+\section{Benchmarking Requirements}
+
+Meld performance claims SHOULD be evaluated at the glass-to-glass level:
+decoded frames, decodable frame percentage, decodable keyframe percentage, same
+source bytes and packets across transports, RTT, playout budget relative to RTT,
+loss model, and oracle rows.
+
+The current curated frontier evidence is non-normative but important:
+
+\begin{itemize}
+\item At 10\% iid loss with a 0.75x RTT playout budget across 50, 100, and
+      200 ms RTT cells, \code{meld-auto} reached 144.0 decoded frames while the
+      best ARQ row, RIST, reached 121.1 frames, a +22.9 frame delta.
+\item At 5\% iid loss with the same 0.75x RTT budget, \code{meld-auto} reached
+      143.8--144.0 frames and held a roughly +10 frame advantage.
+\item At 1x RTT and 1.5x RTT budgets, ARQ catches up and the Meld advantage
+      compresses.
+\item Burst48 and Burst96 experiments did not produce a stable deployable Meld
+      target under the current source structure and repair budget.
+\end{itemize}
+
+New optimizations SHOULD be judged by movement of the \code{meld-auto} macro
+frontier against SRT, RIST, and oracle rows rather than isolated packet-level
+improvements.
+
+\section{Interoperability Checklist}
+
+An independent implementation of wire version \wireversion{} should verify:
+
+\begin{enumerate}
+\item Version/type nibble parsing rejects unknown versions before unknown types.
+\item Symbol, feedback, clock, handshake, and MTU message types round-trip.
+\item Systematic and repair payloads are exactly \field{SymbolSize}.
+\item Contiguous and sparse repair equations use identical coefficient generation
+      for the same source ids and \field{RepairKey}.
+\item Feedback tails are decoded only when present and absent tails default to
+      zero or unknown.
+\item Frame descriptors preserve source-id ranges and reference starts.
+\item Deadlines skip missing source ids without blocking later recovered ids.
+\item Encrypted flows seal before coding and open after decoding.
+\end{enumerate}
+
+\appendix
+
+\section{Relationship to Existing Protocols}
+
+SRT specifies a UDP-based reliable transport with data and control packet types,
+latency-window behavior, ACK/NAK feedback, and retransmission-oriented recovery
+\cite{srt-rfc}. RIST profiles specify interoperable reliable internet streaming
+over RTP/RTCP mechanisms with retransmission and optional features layered by
+profile \cite{rist-tr061,rist-tr062}. Meld borrows the discipline of precise
+packet formats, cumulative feedback, and deployment-oriented control surfaces,
+but uses random-linear coded recovery as the primary low-latency loss recovery
+tool.
+
+The Meld coding format follows the same broad lineage as the RLC FEC scheme in
+RFC 8681: compact repair identifiers regenerate coding coefficients, and repair
+symbols can be consumed as soon as they arrive \cite{rfc8681}. Meld differs by
+embedding the coding waist directly into a media transport with deadlines,
+media-damage feedback, and an adaptive single-profile controller.
+
+\begin{thebibliography}{99}
+
+\bibitem{rfc2119}
+S. Bradner, ``Key words for use in RFCs to Indicate Requirement Levels,''
+BCP 14, RFC 2119, March 1997. \url{https://www.rfc-editor.org/rfc/rfc2119}
+
+\bibitem{rfc8174}
+B. Leiba, ``Ambiguity of Uppercase vs Lowercase in RFC 2119 Key Words,''
+BCP 14, RFC 8174, May 2017. \url{https://www.rfc-editor.org/rfc/rfc8174}
+
+\bibitem{rfc8681}
+V. Roca, B. Teibi, and C. Burdinat, ``Sliding Window Random Linear Code
+(RLC) Forward Erasure Correction (FEC) Scheme for FECFRAME,'' RFC 8681,
+January 2020. \url{https://www.rfc-editor.org/rfc/rfc8681}
+
+\bibitem{rfc8899}
+G. Fairhurst, T. Jones, M. Tuexen, I. Ruengeler, and T. Voelker, ``Packetization
+Layer Path MTU Discovery for Datagram Transports,'' RFC 8899, September 2020.
+\url{https://www.rfc-editor.org/rfc/rfc8899}
+
+\bibitem{srt-rfc}
+SRT Alliance, ``The SRT Protocol,'' Internet-Draft style technical
+specification. \url{https://haivision.github.io/srt-rfc/draft-sharabayko-srt.html}
+
+\bibitem{rist-tr061}
+Video Services Forum, ``Technical Recommendation TR-06-1:2020 Reliable Internet
+Stream Transport (RIST) Simple Profile.'' \url{https://vsf.tv/technical-recommendations/}
+
+\bibitem{rist-tr062}
+Video Services Forum, ``Technical Recommendation TR-06-2:2024 Reliable Internet
+Stream Transport (RIST) Main Profile.'' \url{https://vsf.tv/technical-recommendations/}
+
+\end{thebibliography}
+
+\end{document}

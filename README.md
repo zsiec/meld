@@ -333,6 +333,7 @@ Start here:
 
 - [Documentation Index](docs/README.md)
 - [Protocol](docs/protocol.md)
+- [Specification](docs/spec/README.md)
 - [Integration](docs/integration.md)
 - [Benchmarking](docs/bench.md)
 - [Coding](docs/coding.md)
@@ -369,5 +370,5 @@ coding trick." It is:
 4. preserve oracle rows so we know whether the protocol, the source structure, or
    the benchmark ceiling is responsible for a gap
 
-The next formal artifact should be a protocol specification. A LaTeX spec is a
-good fit once the docs and wire/control terminology settle.
+The formal protocol artifact now lives in [docs/spec](docs/spec/README.md). It
+should track the implementation closely as the wire/control terminology settles.
