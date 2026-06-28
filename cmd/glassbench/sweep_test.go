@@ -412,3 +412,80 @@ func TestMacroDecisionTreatsParityAsNonDeficit(t *testing.T) {
 		t.Fatalf("parity should not be reported as a deficit:\n%s", got)
 	}
 }
+
+func TestPublishSuiteSmokeIncludesPrimaryArms(t *testing.T) {
+	suite, ok := publishSuiteByName("smoke")
+	if !ok {
+		t.Fatal("smoke suite not found")
+	}
+	for _, arm := range []string{"oracle-source", "oracle-ideal", "meld-auto", "libsrt", "librist"} {
+		if !slices.Contains(suite.Arms, arm) {
+			t.Fatalf("smoke suite missing arm %q: %v", arm, suite.Arms)
+		}
+	}
+	if len(suite.Losses) == 0 || len(suite.RTTs) == 0 || len(suite.Mults) == 0 {
+		t.Fatalf("smoke suite has empty grid: %+v", suite)
+	}
+}
+
+func TestPublishSuiteFallbackCheckExists(t *testing.T) {
+	suite, ok := publishSuiteByName("fallback-check")
+	if !ok {
+		t.Fatal("fallback-check suite not found")
+	}
+	if !slices.Contains(suite.Mults, 2) || !slices.Contains(suite.Mults, 3) {
+		t.Fatalf("fallback-check should cover generous buffers: %+v", suite.Mults)
+	}
+	for _, arm := range []string{"meld-auto", "libsrt", "librist"} {
+		if !slices.Contains(suite.Arms, arm) {
+			t.Fatalf("fallback-check missing arm %q: %v", arm, suite.Arms)
+		}
+	}
+}
+
+func TestMacroChartsWriteSVGs(t *testing.T) {
+	dir := t.TempDir()
+	rows := []macroFrontierRow{
+		{Case: "iid_loss5_rtt100_0p75x_b75", Loss: 0.05, Burst: 0, RTT: 100, Mult: 0.75, Budget: 75, Arm: "oracle-source", FFMean: 144, Seeds: 1},
+		{Case: "iid_loss5_rtt100_0p75x_b75", Loss: 0.05, Burst: 0, RTT: 100, Mult: 0.75, Budget: 75, Arm: "oracle-ideal", FFMean: 144, Seeds: 1},
+		{Case: "iid_loss5_rtt100_0p75x_b75", Loss: 0.05, Burst: 0, RTT: 100, Mult: 0.75, Budget: 75, Arm: "meld-auto", FFMean: 144, Seeds: 1},
+		{Case: "iid_loss5_rtt100_0p75x_b75", Loss: 0.05, Burst: 0, RTT: 100, Mult: 0.75, Budget: 75, Arm: "libsrt", FFMean: 130, Seeds: 1},
+		{Case: "iid_loss5_rtt100_0p75x_b75", Loss: 0.05, Burst: 0, RTT: 100, Mult: 0.75, Budget: 75, Arm: "librist", FFMean: 135, Seeds: 1},
+	}
+	gaps := macroGapRows(rows, macroFrontierOptions{ChunkSize: 1316, Mbps: 8, TotalPics: 144})
+	if err := writeMacroCharts(dir, rows, gaps, macroFrontierOptions{TopN: 8}); err != nil {
+		t.Fatalf("writeMacroCharts: %v", err)
+	}
+	for _, name := range []string{"delta-bars.svg", "frontier-heatmap.svg", "arm-frames.svg", "cost-gain.svg", "README.md"} {
+		path := filepath.Join(dir, "charts", name)
+		b, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("missing chart %s: %v", name, err)
+		}
+		if strings.HasSuffix(name, ".svg") && !strings.Contains(string(b), "<svg") {
+			t.Fatalf("chart %s is not svg:\n%s", name, b)
+		}
+	}
+}
+
+func TestFairnessRowsCatchSourceMismatch(t *testing.T) {
+	rows := []macroFrontierRow{
+		{Case: "c", Arm: "oracle-source", SourcePackets: 10, SourceBytes: 100, FFMean: 3, Seeds: 1},
+		{Case: "c", Arm: "oracle-ideal", SourcePackets: 10, SourceBytes: 100, FFMean: 3, Seeds: 1},
+		{Case: "c", Arm: "meld-auto", SourcePackets: 11, SourceBytes: 110, FFMean: 3, Seeds: 1},
+		{Case: "c", Arm: "libsrt", SourcePackets: 10, SourceBytes: 100, FFMean: 2, Seeds: 1},
+	}
+	got := fairnessRows(rows, nil, macroFrontierOptions{
+		Arms:           []string{"oracle-source", "oracle-ideal", "meld-auto", "libsrt"},
+		SourceFFFrames: 3,
+	})
+	if len(got) != 1 {
+		t.Fatalf("fairness rows = %d, want 1", len(got))
+	}
+	if got[0].SameSourcePackets || got[0].SameSourceBytes {
+		t.Fatalf("source mismatch not detected: %+v", got[0])
+	}
+	if !got[0].SourceCeilingOK {
+		t.Fatalf("source ceiling should pass: %+v", got[0])
+	}
+}

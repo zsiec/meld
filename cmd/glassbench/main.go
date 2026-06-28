@@ -20,11 +20,14 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/zsiec/meld"
@@ -340,9 +343,97 @@ var meldNoAuto bool
 var meldNoReorder bool
 var jitterDur time.Duration
 
-// relayEnq/relaySent instrument the forward path of the relay (enqueued vs actually written) to
-// isolate relay drops from receiver behavior under GLASSDBG.
+// Relay counters instrument what the impairment relay actually observes. Forward
+// means sender-side UDP traffic toward the receiver-side endpoint; reverse means
+// receiver feedback toward the live sender address.
 var relayEnq, relaySent atomic.Int64
+var relayDropped atomic.Int64
+var relayEnqBytes, relaySentBytes, relayDroppedBytes atomic.Int64
+var relayReverseEnq, relayReverseSent atomic.Int64
+var relayReverseEnqBytes, relayReverseSentBytes atomic.Int64
+
+type relayMetrics struct {
+	ForwardEnqueued  int64
+	ForwardSent      int64
+	ForwardDropped   int64
+	ForwardEnqueuedB int64
+	ForwardSentB     int64
+	ForwardDroppedB  int64
+	ReverseEnqueued  int64
+	ReverseSent      int64
+	ReverseEnqueuedB int64
+	ReverseSentB     int64
+}
+
+func resetRelayMetrics() {
+	relayEnq.Store(0)
+	relaySent.Store(0)
+	relayDropped.Store(0)
+	relayEnqBytes.Store(0)
+	relaySentBytes.Store(0)
+	relayDroppedBytes.Store(0)
+	relayReverseEnq.Store(0)
+	relayReverseSent.Store(0)
+	relayReverseEnqBytes.Store(0)
+	relayReverseSentBytes.Store(0)
+}
+
+func snapshotRelayMetrics() relayMetrics {
+	return relayMetrics{
+		ForwardEnqueued:  relayEnq.Load(),
+		ForwardSent:      relaySent.Load(),
+		ForwardDropped:   relayDropped.Load(),
+		ForwardEnqueuedB: relayEnqBytes.Load(),
+		ForwardSentB:     relaySentBytes.Load(),
+		ForwardDroppedB:  relayDroppedBytes.Load(),
+		ReverseEnqueued:  relayReverseEnq.Load(),
+		ReverseSent:      relayReverseSent.Load(),
+		ReverseEnqueuedB: relayReverseEnqBytes.Load(),
+		ReverseSentB:     relayReverseSentBytes.Load(),
+	}
+}
+
+var benchProcUserMicros, benchProcSystemMicros, benchProcMaxRSSKB atomic.Int64
+
+type processMetrics struct {
+	UserMs   float64
+	SystemMs float64
+	MaxRSSKB int64
+}
+
+func resetBenchProcMetrics() {
+	benchProcUserMicros.Store(0)
+	benchProcSystemMicros.Store(0)
+	benchProcMaxRSSKB.Store(0)
+}
+
+func snapshotBenchProcMetrics() processMetrics {
+	return processMetrics{
+		UserMs:   float64(benchProcUserMicros.Load()) / 1000,
+		SystemMs: float64(benchProcSystemMicros.Load()) / 1000,
+		MaxRSSKB: benchProcMaxRSSKB.Load(),
+	}
+}
+
+func recordBenchProcMetrics(ps *os.ProcessState) {
+	if ps == nil {
+		return
+	}
+	benchProcUserMicros.Add(ps.UserTime().Microseconds())
+	benchProcSystemMicros.Add(ps.SystemTime().Microseconds())
+	if ru, ok := ps.SysUsage().(*syscall.Rusage); ok {
+		rss := int64(ru.Maxrss)
+		if runtime.GOOS == "darwin" {
+			rss /= 1024
+		}
+		for {
+			cur := benchProcMaxRSSKB.Load()
+			if rss <= cur || benchProcMaxRSSKB.CompareAndSwap(cur, rss) {
+				break
+			}
+		}
+	}
+}
 
 // sldWindow is the Meld sliding CodingWindow used by runMeld when sliding is on
 // (0 = the coder's default). A package global so the sweep/probe can vary it
@@ -461,6 +552,10 @@ func relayOn(listenPort int, downstream string, drop func() bool, owd time.Durat
 							out.WriteToUDP(p.b, to)
 							if fixedTo != nil {
 								relaySent.Add(1)
+								relaySentBytes.Add(int64(len(p.b)))
+							} else {
+								relayReverseSent.Add(1)
+								relayReverseSentBytes.Add(int64(len(p.b)))
 							}
 						}
 						continue
@@ -503,9 +598,12 @@ func relayOn(listenPort int, downstream string, drop func() bool, owd time.Durat
 				trace.recordRelay(b[:n], dropped, d)
 			}
 			if dropped {
+				relayDropped.Add(1)
+				relayDroppedBytes.Add(int64(n))
 				continue
 			}
 			relayEnq.Add(1)
+			relayEnqBytes.Add(int64(n))
 			fwdCh <- delayed{at: time.Now().Add(d), b: append([]byte(nil), b[:n]...)}
 		}
 	}()
@@ -521,6 +619,8 @@ func relayOn(listenPort int, downstream string, drop func() bool, owd time.Durat
 			a := client.a
 			client.Unlock()
 			if a != nil {
+				relayReverseEnq.Add(1)
+				relayReverseEnqBytes.Add(int64(n))
 				revCh <- delayed{at: time.Now().Add(owd), b: append([]byte(nil), b[:n]...), to: a}
 			}
 		}
@@ -667,6 +767,7 @@ func runMeldArm(c *chunked, arm meldArmConfig, loss float64, rttMs, budgetMs int
 		cfg.Redundancy = 1.0
 		cfg.RepairWithinBudget = false
 	}
+	resetRelayMetrics()
 	rx, err := meld.NewReceiver("127.0.0.1:0", cfg)
 	if err != nil {
 		if os.Getenv("GLASSDBG") != "" {
@@ -674,8 +775,6 @@ func runMeldArm(c *chunked, arm meldArmConfig, loss float64, rttMs, budgetMs int
 		}
 		return meldRunResult{}
 	}
-	relayEnq.Store(0)
-	relaySent.Store(0)
 	port, stop := relayOn(0, rx.LocalAddr(), dropper(loss, seed), owd, seed, trace)
 	defer stop()
 	tx, err := meld.NewSender(fmt.Sprintf("127.0.0.1:%d", port), cfg)
@@ -731,6 +830,7 @@ func runMeldArm(c *chunked, arm meldArmConfig, loss float64, rttMs, budgetMs int
 	tx.Flush()
 	time.Sleep(owd + time.Duration(budgetMs+400)*time.Millisecond)
 	txStats, rxStats := tx.Stats(), rx.Stats()
+	relayStats := snapshotRelayMetrics()
 	tx.Close()
 	rx.Close()
 	<-done
@@ -745,10 +845,10 @@ func runMeldArm(c *chunked, arm meldArmConfig, loss float64, rttMs, budgetMs int
 		fmt.Fprintf(os.Stderr, "[dbg arm=%s frame=%v uep=%v atomic=%v noframepolicy=%v sld=%v] tx src=%d repair=%d(reactive=%d throttled=%d) | relay enq=%d sent=%d | rx deliv=%d recov=%d lost=%d evicted=%d | got=%d/%d | miss-by-decile=%v\n",
 			arm.name, arm.frame, arm.uep, cfg.FrameAtomic, arm.disableFramePolicy, cfg.Sliding,
 			txStats.Source, txStats.Repair, txStats.ReactiveRepair, txStats.Throttled,
-			relayEnq.Load(), relaySent.Load(),
+			relayStats.ForwardEnqueued, relayStats.ForwardSent,
 			rxStats.Delivered, rxStats.Recovered, rxStats.Lost, rxStats.Evicted, len(got), total, miss)
 	}
-	return meldRunResult{got: got, txStats: txStats, rxStats: rxStats, relayEnq: relayEnq.Load(), relaySent: relaySent.Load()}
+	return meldRunResult{got: got, txStats: txStats, rxStats: rxStats, relayEnq: relayStats.ForwardEnqueued, relaySent: relayStats.ForwardSent}
 }
 
 // --- C-stack arms (real subprocess + relay) — cref-identical drive ---
@@ -803,6 +903,7 @@ func startBenchProc(cmd *exec.Cmd) (*benchProc, error) {
 	p := &benchProc{cmd: cmd, done: make(chan struct{})}
 	go func() {
 		err := cmd.Wait()
+		recordBenchProcMetrics(cmd.ProcessState)
 		p.mu.Lock()
 		p.err = err
 		p.mu.Unlock()
@@ -954,9 +1055,10 @@ type score struct {
 }
 
 type benchRun struct {
-	seqs  map[uint32]bool
-	meld  *meldRunResult
-	trace *seedTrace
+	seqs    map[uint32]bool
+	meld    *meldRunResult
+	trace   *seedTrace
+	metrics armRunMetrics
 }
 
 func grade(c *chunked, seqs map[uint32]bool) (score, []byte, int) {
@@ -1029,8 +1131,100 @@ func printSeedDiag(c *chunked, arm string, rep int, seed int64, ff int, sc score
 		ms.firstMissingUnit, ms.firstMissingPicture, ms.firstMissingKey, ms.firstBrokenUnit, ms.firstBrokenRef)
 }
 
+type clipSummary struct {
+	TotalPics  int
+	TotalKey   int
+	Disposable int
+	FFFrames   int
+}
+
+func summarizeClip(c *chunked) clipSummary {
+	var s clipSummary
+	for _, u := range c.units {
+		if u.Picture {
+			s.TotalPics++
+		}
+		if u.RAP {
+			s.TotalKey++
+		}
+		if u.Discardable {
+			s.Disposable++
+		}
+	}
+	fullFF, err := ffprobeFrames(c.reassembleDelivered(allChunkSeqs(c)))
+	if err == nil {
+		s.FFFrames = fullFF
+	}
+	return s
+}
+
+func parseClipList(list, fallback string) []string {
+	list = strings.TrimSpace(list)
+	if list == "" {
+		return []string{fallback}
+	}
+	out := make([]string, 0)
+	seen := map[string]bool{}
+	for _, part := range strings.Split(list, ",") {
+		path := strings.TrimSpace(part)
+		if path == "" || seen[path] {
+			continue
+		}
+		seen[path] = true
+		out = append(out, path)
+	}
+	if len(out) == 0 {
+		return []string{fallback}
+	}
+	return out
+}
+
+func sourceIDForClip(path string) string {
+	base := filepath.Base(path)
+	ext := filepath.Ext(base)
+	if ext != "" {
+		base = strings.TrimSuffix(base, ext)
+	}
+	base = strings.ToLower(base)
+	var b strings.Builder
+	lastDash := false
+	for _, r := range base {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+			lastDash = false
+		default:
+			if !lastDash {
+				b.WriteByte('-')
+				lastDash = true
+			}
+		}
+	}
+	id := strings.Trim(b.String(), "-")
+	if id == "" {
+		return "source"
+	}
+	return id
+}
+
+func writePublishSourcesIndex(outDir string, suite publishSuite, clips []string) error {
+	var b strings.Builder
+	fmt.Fprintf(&b, "# Publish Source Matrix\n\n")
+	fmt.Fprintf(&b, "Suite: `%s`\n\n", suite.Name)
+	fmt.Fprintf(&b, "Each source runs in its own subdirectory so source-specific raw artifacts remain independent.\n\n")
+	fmt.Fprintf(&b, "| source | clip | artifacts |\n")
+	fmt.Fprintf(&b, "| --- | --- | --- |\n")
+	for _, clip := range clips {
+		id := sourceIDForClip(clip)
+		fmt.Fprintf(&b, "| `%s` | `%s` | [`%s/FRONTIER.md`](%s/FRONTIER.md), [`%s/FAIRNESS.md`](%s/FAIRNESS.md) |\n",
+			id, clip, id, id, id, id)
+	}
+	return os.WriteFile(filepath.Join(outDir, "SOURCES.md"), []byte(b.String()), 0o644)
+}
+
 func main() {
 	clip := flag.String("clip", "internal/shape/testdata/bbb_bframes.h264", "Annex-B H.264 clip")
+	publishClips := flag.String("publishclips", "", "comma-separated Annex-B H.264 clips for -publishsuite; each source gets its own report subdirectory")
 	loss := flag.Float64("loss", 0.2, "forward loss fraction")
 	rtt := flag.Int("rtt", 100, "RTT ms")
 	mult := flag.Int("rttmult", 1, "budget = max(floor, mult*rtt)")
@@ -1045,6 +1239,7 @@ func main() {
 	rtts := flag.String("rtts", "20,50,100,200,400", "RTTs (ms) to sweep (sweep mode)")
 	streamK := flag.Int("streamk", 4, "stream-length multiplier so delivery%% resolves a tight bar (sweep mode)")
 	macroFrontier := flag.Bool("macrofrontier", false, "macro frontier mode: sweep ffprobe-decoded frames across loss/burst/RTT/latency")
+	publishSuite := flag.String("publishsuite", "", "named publication benchmark suite: "+strings.Join(publishSuiteNames(), ", "))
 	frontierLosses := flag.String("frontierlosses", "0.05,0.10", "macro frontier forward loss fractions")
 	frontierBursts := flag.String("frontierbursts", "0,24", "macro frontier GE mean burst lengths in packets (0=i.i.d.)")
 	frontierMults := flag.String("frontiermults", "1,1.5,2,3", "macro frontier latency budgets as RTT multipliers")
@@ -1086,28 +1281,15 @@ func main() {
 		fmt.Fprintln(os.Stderr, "clip:", err)
 		os.Exit(1)
 	}
-	totalPics := 0
-	totalKey := 0
-	disposable := 0
-	for _, u := range c.units {
-		if u.Picture {
-			totalPics++
-		}
-		if u.RAP {
-			totalKey++
-		}
-		if u.Discardable {
-			disposable++
-		}
-	}
+	clipStats := summarizeClip(c)
 	budgetMs := arqLatencyMs(*rtt, *mult, *floorMs)
 	paceUs := int64(float64((*chunkSize+seqHdr)*8) / (*mbps * 1e6) * 1e6)
 	if paceUs < 1 {
 		paceUs = 1
 	}
 	meldMax := int64(*maxMbps * 1e6)
-	if *macroFrontier {
-		if err := runMacroFrontier(c, macroFrontierOptions{
+	macroOptsFor := func(path string, stats clipSummary, outDir string) macroFrontierOptions {
+		return macroFrontierOptions{
 			Losses:              parseFloatList(*frontierLosses),
 			Bursts:              parseFloatList(*frontierBursts),
 			RTTs:                parseRTTs(*rtts),
@@ -1119,16 +1301,62 @@ func main() {
 			MeldMax:             meldMax,
 			Mbps:                *mbps,
 			ChunkSize:           *chunkSize,
-			TotalPics:           totalPics,
-			OutDir:              *reportDir,
+			TotalPics:           stats.TotalPics,
+			OutDir:              outDir,
 			TopN:                *frontierTop,
-			SourceClip:          clipPath,
+			JitterMs:            *jitterMs,
+			SourceID:            sourceIDForClip(path),
+			SourceClip:          path,
+			SourceFFFrames:      stats.FFFrames,
 			AVCOpts:             avcOpts,
 			AutoEncoderCadence:  *autoEncoderCadence,
 			AutoEncoderInterval: *autoEncoderInterval,
 			AutoEncoderByteCap:  *autoEncoderByteCap,
 			AutoEncoderPSNRMin:  *autoEncoderPSNRMin,
-		}); err != nil {
+		}
+	}
+	if *publishSuite != "" {
+		suite, ok := publishSuiteByName(*publishSuite)
+		if !ok {
+			fmt.Fprintf(os.Stderr, "unknown publish suite %q (known: %s)\n", *publishSuite, strings.Join(publishSuiteNames(), ", "))
+			os.Exit(1)
+		}
+		clips := parseClipList(*publishClips, clipPath)
+		if len(clips) > 1 || clips[0] != clipPath {
+			if *reportDir == "" {
+				fmt.Fprintln(os.Stderr, "publish suite: -publishclips requires -reportdir")
+				os.Exit(1)
+			}
+			if err := os.MkdirAll(*reportDir, 0o755); err != nil {
+				fmt.Fprintln(os.Stderr, "publish suite:", err)
+				os.Exit(1)
+			}
+			for _, path := range clips {
+				pc, err := chunkClip(path, *chunkSize, avcOpts)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "clip %s: %v\n", path, err)
+					os.Exit(1)
+				}
+				outDir := filepath.Join(*reportDir, sourceIDForClip(path))
+				if err := runPublishSuite(pc, suite, macroOptsFor(path, summarizeClip(pc), outDir)); err != nil {
+					fmt.Fprintf(os.Stderr, "publish suite %s: %v\n", path, err)
+					os.Exit(1)
+				}
+			}
+			if err := writePublishSourcesIndex(*reportDir, suite, clips); err != nil {
+				fmt.Fprintln(os.Stderr, "publish suite:", err)
+				os.Exit(1)
+			}
+			return
+		}
+		if err := runPublishSuite(c, suite, macroOptsFor(clipPath, clipStats, *reportDir)); err != nil {
+			fmt.Fprintln(os.Stderr, "publish suite:", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if *macroFrontier {
+		if err := runMacroFrontier(c, macroOptsFor(clipPath, clipStats, *reportDir)); err != nil {
 			fmt.Fprintln(os.Stderr, "macro frontier:", err)
 			os.Exit(1)
 		}
@@ -1194,7 +1422,7 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Printf("# glassbench: %s — %d units, %d pictures, %d keyframes, %d DISPOSABLE units, %d chunks (%dB)\n",
-		*clip, len(c.units), totalPics, totalKey, disposable, len(c.chunks), *chunkSize)
+		*clip, len(c.units), clipStats.TotalPics, clipStats.TotalKey, clipStats.Disposable, len(c.chunks), *chunkSize)
 	fmt.Printf("# ffprobe(full clip) = %d frames (decodable-set model predicts %d)\n", fullFF, fullPics)
 	fmt.Printf("# loss %.0f%%, RTT %dms, budget %dms (%dxRTT), %.0f Mbps, %d seeds; arbiter=ffprobe\n",
 		*loss*100, *rtt, budgetMs, *mult, *mbps, *reps)

@@ -11,6 +11,9 @@ point; these files are the deeper references.
   attach media descriptors, enable encryption, and read stats.
 - [Benchmarking](bench.md): the macro frontier methodology and the current
   SRT/RIST comparison results.
+- [Publishable Benchmarks](publishing-benchmarks.md): benchmark battery,
+  fairness guards, cost/gain metrics, suites, artifacts, and publication
+  criteria.
 - [Specification](spec/README.md): LaTeX working specification for the Meld
   protocol and wire version 1.
 
@@ -44,6 +47,7 @@ longer active.
 - [Burst48 source thesis](decisions/2026-06-27-burst48-source-thesis.md)
 - [Macro frontier discovery](decisions/2026-06-27-macro-frontier-discovery.md)
 - [Cleanup after frontier discovery](decisions/2026-06-27-cleanup-after-frontier.md)
+- [Publish benchmark battery](decisions/2026-06-27-publish-benchmark-battery.md)
 
 ## Generated Output
 

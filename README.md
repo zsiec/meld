@@ -336,6 +336,7 @@ Start here:
 - [Specification](docs/spec/README.md)
 - [Integration](docs/integration.md)
 - [Benchmarking](docs/bench.md)
+- [Publishable Benchmarks](docs/publishing-benchmarks.md)
 - [Coding](docs/coding.md)
 - [Media Awareness](docs/media-awareness.md)
 - [Wire Format](docs/wireformat.md)
