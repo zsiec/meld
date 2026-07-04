@@ -32,3 +32,16 @@ coverage.*
 /PLAN.md
 /ORCHESTRATION.md
 /tovalidate.md
+docs/decisions/2026-06-27-burst48-source-thesis.md
+docs/decisions/2026-06-27-cleanup-after-frontier.md
+docs/decisions/2026-06-27-macro-frontier-discovery.md
+docs/decisions/2026-06-27-publish-benchmark-battery.md
+docs/decisions/2026-06-27-refresh-island-repair.md
+docs/decisions/2026-07-01-ltr-resync.md
+docs/decisions/2026-07-02-outage-composure-highrate.md
+docs/decisions/2026-07-02-outage-composure.md
+docs/decisions/2026-07-02-path-failover.md
+docs/decisions/2026-07-03-all-regimes.md
+docs/decisions/2026-07-03-equal-deadline-arbiter.md
+docs/decisions/2026-07-03-wire-cost.md
+docs/research-2026-07-complementary.md

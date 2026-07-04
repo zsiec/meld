@@ -33,11 +33,12 @@ func TestProactiveDecayUnit(t *testing.T) {
 		t.Fatalf("ProactiveDecay dropped below the mean-sufficient repair: on=%d mean=%d (would chronically under-decode)", on, mean)
 	}
 
-	// High RTT: 150 ms RTT, 200 ms budget ⇒ 2·rtt+fb > budget ⇒ reactiveRounds 0 ⇒ exact no-op.
-	hiOff := mk(false, 150_000).repairCountFor(n)
-	hiOn := mk(true, 150_000).repairCountFor(n)
+	// High RTT: 170 ms RTT, 200 ms budget ⇒ one honest cycle (≈ 217.5 ms) does not fit
+	// ⇒ reactiveRounds 0 ⇒ exact no-op.
+	hiOff := mk(false, 170_000).repairCountFor(n)
+	hiOn := mk(true, 170_000).repairCountFor(n)
 	if hiOn != hiOff {
-		t.Fatalf("ProactiveDecay must be a no-op at reactiveRounds=0 (RTT≥budget): on=%d off=%d", hiOn, hiOff)
+		t.Fatalf("ProactiveDecay must be a no-op at reactiveRounds=0 (budget below one cycle): on=%d off=%d", hiOn, hiOff)
 	}
 }
 
@@ -45,6 +46,7 @@ func TestProactiveDecayUnit(t *testing.T) {
 // link ProactiveDecay holds full delivery and the four invariants while sending materially less
 // repair than the default full-set-point sizing.
 func TestProactiveDecayHoldsDeliveryLowerOverhead(t *testing.T) {
+	t.Parallel()
 	const (
 		budget = 200_000 // 200 ms
 		owd    = 20_000  // 40 ms RTT ⇒ ~2 reactive rounds in budget

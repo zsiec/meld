@@ -10,6 +10,14 @@ type EncoderControl struct {
 	// points, in displayed frames. 0 means no active request. An encoder can satisfy
 	// this with keyframes, recovery-point SEI, or intra-refresh, depending on codec.
 	RecoveryCadenceFrames uint16
+	// Resync asks the encoder to code its next frame referencing ResyncRefFrameID —
+	// a long-term-reference frame (one the application marked FrameDesc.LTR) that
+	// the receiver has CONFIRMED decodable — because the live reference chain is
+	// broken. Honoring it resurrects the stream at P-frame cost instead of waiting
+	// for the next scheduled IDR (the LTR-resync mechanism; see the resyncController
+	// doc). An encoder that no longer retains that LTR simply ignores the request.
+	Resync           bool
+	ResyncRefFrameID uint32
 }
 
 const (

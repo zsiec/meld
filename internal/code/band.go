@@ -22,9 +22,22 @@ import "github.com/zsiec/meld/internal/gf"
 // delay product at only memory cost. Recovery span is b symbols: a loss not repaired
 // within b newer symbols is unrecoverable and skipped at its deadline. It is pure
 // and deterministic; the host drives time via Skip.
+//
+// Row-span invariant: every STORED row spans at most spanCap = 2b columns, and every
+// neighbor scan (back-substitution, harvest, eliminateKnown, dropColumn) looks spanCap
+// back — the pair is what makes the incremental elimination COMPLETE. Elimination
+// chains can legitimately extend a row past b (repair windows need not share an
+// anchor: the retrospective reactive tier emits windows anchored at a stuck delivery
+// cursor while proactive repair keeps sliding with the frontier, and one back-
+// substitution step over such mixed anchors reaches 2b). A row that would exceed
+// spanCap is DISCARDED instead of stored — dropping an equation only forgoes rank,
+// never corrupts — because a stored row wider than the scan radius is silently
+// invisible to later eliminations: the window then reports full rank while its rows
+// never collapse for delivery (the stranded-row premature-drop bug the no-premature-
+// drop oracle caught when retrospective repair first mixed anchors).
 type BandDecoder struct {
 	symSize int
-	b       int    // coding-window band width (decode cost ~ O(b²)/symbol)
+	b       int    // coding-window band width (decode cost ~ O((2b)²)/symbol)
 	maxWin  int    // delivery-window cap: the cursor may lag the frontier by this much
 	cursor  uint32 // next source id to deliver (window base)
 	highest uint32 // one past the highest source id any symbol has covered
@@ -34,7 +47,50 @@ type BandDecoder struct {
 	recent map[uint32][]byte // last <=b DELIVERED source values, [cursor-b, cursor); lets a repair
 	out    []Recovered       // that starts below the cursor but still covers it be reduced and used
 	lost   uint64
+	// droppedRows counts equations DISCARDED by the span cap (reduce/back-substitution
+	// rows that would exceed spanCap): rank deliberately forgone to keep elimination
+	// complete. Telemetry for the deep-burst autopsy — a high discarded count in a
+	// stuck-window regime means covering repair is arriving but being binned, and
+	// recovery waits for luckier equation geometry.
+	droppedRows uint64
 }
+
+// Rank reports the decoder's current information rank above the cursor: solved
+// symbols awaiting delivery plus independent stored equations. Diagnostic (the
+// burst-autopsy replay tracks per-ingest rank growth with it).
+func (d *BandDecoder) Rank() int { return len(d.known) + len(d.rows) }
+
+// MissingIn returns a NACK bitmap over the source ids [base, base+64): bit k set
+// means id base+k is neither delivered nor solved, masked to ids BELOW the decode
+// frontier (an id no arrival has covered yet is unsent-or-in-flight, not missing).
+// The receiver reports this for base = cursor so the sender can answer with unit
+// repairs, which close instantly (no coupled-span closure wait).
+func (d *BandDecoder) MissingIn(base uint32) uint64 {
+	var m uint64
+	for k := uint32(0); k < 64; k++ {
+		id := base + k
+		if id >= d.highest {
+			break // beyond covered frontier: unknown, not missing
+		}
+		if id < d.cursor {
+			continue // already delivered/skipped
+		}
+		if _, ok := d.known[id]; ok {
+			continue // solved, awaiting in-order delivery
+		}
+		m |= 1 << k
+	}
+	return m
+}
+
+// DroppedRows reports how many equations the span cap has discarded (see the
+// droppedRows field doc).
+func (d *BandDecoder) DroppedRows() uint64 { return d.droppedRows }
+
+// spanCap returns the maximum stored-row span (and the scan radius that keeps
+// elimination complete against it): one back-substitution step of growth over the
+// band width.
+func (d *BandDecoder) spanCap() int { return 2 * d.b }
 
 // brow is one equation in band-form RREF: coeffs[i] is the coefficient of source id
 // start+i, with start == pivot (the leading column) and coeffs[0] == 1.
@@ -128,14 +184,15 @@ func (d *BandDecoder) AddSystematic(id uint32, data []byte) {
 	d.deliverReady()
 }
 
-// eliminateKnown folds the now-known source symbol at column id out of the <=b earlier rows whose
-// span reaches it, cascading any row that thereby collapses to a unit vector into a further solved
-// symbol (the same harvest cascade reduce() runs). Used by the AddSystematic fast path.
+// eliminateKnown folds the now-known source symbol at column id out of the earlier rows
+// (within the spanCap scan radius) whose span reaches it, cascading any row that thereby
+// collapses to a unit vector into a further solved symbol (the same harvest cascade
+// reduce() runs). Used by the AddSystematic fast path.
 func (d *BandDecoder) eliminateKnown(id uint32) {
 	val := d.known[id]
 	lo := uint32(0)
-	if id > uint32(d.b) {
-		lo = id - uint32(d.b)
+	if cap := uint32(d.spanCap()); id > cap {
+		lo = id - cap
 	}
 	if lo < d.cursor {
 		lo = d.cursor
@@ -365,13 +422,23 @@ func (d *BandDecoder) reduce(eq *beq) {
 		gf.MulSlice(eq.coeffs, eq.coeffs, inv)
 		gf.MulSlice(eq.pay, eq.pay, inv)
 	}
-	nr := &brow{start: lead, pivot: lead, coeffs: eq.coeffs[lead-eq.start:], pay: eq.pay}
+	coeffs := eq.coeffs[lead-eq.start:]
+	for len(coeffs) > 1 && coeffs[len(coeffs)-1] == 0 {
+		coeffs = coeffs[:len(coeffs)-1] // trim the zero tail before judging the span
+	}
+	if len(coeffs) > d.spanCap() {
+		d.droppedRows++
+		return // would exceed the stored-row span cap: discard (rank forgone, never corrupted)
+	}
+	nr := &brow{start: lead, pivot: lead, coeffs: coeffs, pay: eq.pay}
 	d.rows[lead] = nr
-	// Back-substitute lead out of the at most b earlier rows whose span reaches it.
+	// Back-substitute lead out of the earlier rows (within the scan radius) whose span
+	// reaches it. A row whose growth would exceed the span cap is discarded whole —
+	// keeping it un-substituted would strand it wider than the scan radius instead.
 	seeds := []uint32{lead}
 	lo := uint32(0)
-	if lead > uint32(d.b) {
-		lo = lead - uint32(d.b)
+	if cap := uint32(d.spanCap()); lead > cap {
+		lo = lead - cap
 	}
 	if lo < d.cursor {
 		lo = d.cursor
@@ -382,6 +449,11 @@ func (d *BandDecoder) reduce(eq *beq) {
 			continue
 		}
 		if off := int(lead - r.start); off < len(r.coeffs) && r.coeffs[off] != 0 {
+			if need := int(nr.start-r.start) + len(nr.coeffs); need > d.spanCap() {
+				d.droppedRows++
+				delete(d.rows, p)
+				continue
+			}
 			rowSubRow(r, nr, r.coeffs[off])
 			seeds = append(seeds, p)
 		}
@@ -390,8 +462,8 @@ func (d *BandDecoder) reduce(eq *beq) {
 }
 
 // harvest promotes rows that have collapsed to a unit vector to solved symbols,
-// eliminating each solved column from the at most b earlier rows that reference it,
-// cascading within the band.
+// eliminating each solved column from the earlier rows (within the spanCap scan
+// radius) that reference it, cascading within the band.
 func (d *BandDecoder) harvest(work []uint32) {
 	for len(work) > 0 {
 		p := work[len(work)-1]
@@ -403,8 +475,8 @@ func (d *BandDecoder) harvest(work []uint32) {
 		d.known[p] = r.pay
 		delete(d.rows, p)
 		lo := uint32(0)
-		if p > uint32(d.b) {
-			lo = p - uint32(d.b)
+		if cap := uint32(d.spanCap()); p > cap {
+			lo = p - cap
 		}
 		if lo < d.cursor {
 			lo = d.cursor
@@ -439,8 +511,8 @@ func (d *BandDecoder) harvest(work []uint32) {
 // since RREF leaves id referenced only there.
 func (d *BandDecoder) dropColumn(id uint32) {
 	lo := uint32(0)
-	if id > uint32(d.b) {
-		lo = id - uint32(d.b)
+	if cap := uint32(d.spanCap()); id > cap {
+		lo = id - cap
 	}
 	if lo < d.cursor {
 		lo = d.cursor

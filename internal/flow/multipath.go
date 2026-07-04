@@ -1,5 +1,7 @@
 package flow
 
+import "math/bits"
+
 // This file is N5's correlation-aware multipath sizing: when a generation is split
 // across N paths and the receiver decodes from the union (RLNC combines symbols from
 // all of them), the failure probability is governed by the TOTAL erasure count — and
@@ -16,12 +18,39 @@ package flow
 // proportion to its delivered-innovation rate (1−loss) by a weighted-round-robin
 // accumulator, so the better path carries more of the redundancy and fewer repair
 // bytes are spent only to be dropped. Pure and deterministic; quality enters as data.
+//
+// Failover: when the receiver reports a path DEAD (Feedback.DeadPaths — a per-path
+// outage beyond the recovery horizon), systematic placement shifts each symbol to
+// the next live path (source stops feeding the outage) and repair runs its WRR over
+// the live set, except that every probeRepairEvery-th repair is sent to a dead path
+// as a droppable PROBE — the revival signal (any arrival clears the receiver's bit)
+// that doubles as free rank if the path comes back mid-flight. A report that would
+// mark every path dead is ignored: with no live path, round-robin is as good as
+// anything.
 type pathScheduler struct {
-	paths  int
-	rr     int   // round-robin cursor for systematic symbols
-	weight []int // per-path delivered-innovation weight (∝ 1−loss)
-	acc    []int // weighted-round-robin accumulators for repair placement
+	paths            int
+	weight           []int // per-path delivered-innovation weight (∝ 1−loss)
+	acc              []int // weighted-round-robin accumulators for repair placement
+	dead             uint8 // receiver-reported outage bitmap (bit i = path i)
+	probeCount       int   // repair emissions since the last dead-path probe
+	probeRR          int   // rotates probes across multiple dead paths
+	probeArmed       bool  // backstop: force the next repair to probe (see probeOwed)
+	closesSinceProbe int   // generation closes since the last probe (backstop cadence)
+	failoverOff      bool  // test seam: pin the pre-failover behavior for paired A/B runs
 }
+
+// probeRepairEvery is the dead-path probe cadence: one repair in this many goes to a
+// dead path. Cheap (droppable redundancy), frequent enough that revival is observed
+// within a few feedback intervals at media rates. probeGenEvery is the BACKSTOP
+// cadence in generation closes: revival must never depend on repair volume — on a
+// clean surviving path the sizer (rightly) decays repair to zero, and with zero
+// repair the every-16th-repair diversion never fires, latching the dead path dead
+// forever. One dedicated probe repair every probeGenEvery closes costs at most
+// 1/(2·GenSize) overhead while a path is dead, and only then.
+const (
+	probeRepairEvery = 16
+	probeGenEvery    = 2
+)
 
 // newPathScheduler returns a scheduler over n paths with equal initial weights.
 func newPathScheduler(n int) *pathScheduler {
@@ -48,26 +77,101 @@ func (s *pathScheduler) setQuality(deliveredPpm []int) {
 	}
 }
 
-// systematicPath returns the next path for a systematic symbol (round-robin).
-func (s *pathScheduler) systematicPath() int {
-	p := s.rr % s.paths
-	s.rr++
-	return p
+// setDead adopts the receiver's outage bitmap. All-dead (or an out-of-range mask) is
+// clamped to none-dead: failover needs a live path to fail over TO.
+func (s *pathScheduler) setDead(mask uint8) {
+	if s.failoverOff {
+		return
+	}
+	mask &= uint8(1)<<s.paths - 1
+	if bits.OnesCount8(mask) >= s.paths {
+		mask = 0
+	}
+	s.dead = mask
 }
 
-// repairPath returns the path for the next repair symbol, weighted toward the
-// higher-delivery paths (the standard weighted-round-robin accumulator step).
+// anyDead reports whether failover placement is active.
+func (s *pathScheduler) anyDead() bool { return s.dead != 0 }
+
+// systematicPath returns the path for the systematic symbol carrying source id:
+// id mod paths — the exact mapping the receiver mirrors for co-loss attribution —
+// shifted forward to the next live path while failover is active. Placement is
+// DERIVED FROM THE ID, never from a free-running cursor: a cursor that advanced per
+// skipped dead path drifted out of phase with the receiver's id-mod-paths model
+// after an odd-length failover, so every post-revival stamp mismatched and the
+// layout kill-switch permanently disabled co-loss estimation. Deriving from the id
+// makes revival restore the exact pre-failover placement immediately, whatever the
+// failover's length.
+func (s *pathScheduler) systematicPath(id uint32) int {
+	for i := uint32(0); i < uint32(s.paths); i++ {
+		p := int((id + i) % uint32(s.paths))
+		if s.dead&(uint8(1)<<p) == 0 {
+			return p
+		}
+	}
+	return int(id % uint32(s.paths)) // unreachable while setDead clamps all-dead to none-dead
+}
+
+// repairPath returns the path for the next repair symbol: the weighted round-robin
+// over live paths, with every probeRepairEvery-th repair (or an armed backstop
+// probe) diverted to a dead path.
 func (s *pathScheduler) repairPath() int {
-	total, best := 0, 0
+	if s.dead != 0 {
+		s.probeCount++
+		if s.probeArmed || s.probeCount >= probeRepairEvery {
+			return s.probePath()
+		}
+	}
+	total, best := 0, -1
 	for i := 0; i < s.paths; i++ {
+		if s.dead&(uint8(1)<<i) != 0 {
+			continue
+		}
 		s.acc[i] += s.weight[i]
 		total += s.weight[i]
-		if s.acc[i] > s.acc[best] {
+		if best < 0 || s.acc[i] > s.acc[best] {
 			best = i
 		}
 	}
+	if best < 0 {
+		return 0 // unreachable while setDead clamps all-dead to none-dead
+	}
 	s.acc[best] -= total
 	return best
+}
+
+// probePath returns the next dead path to probe (rotating across multiple) and
+// resets both probe cadences. Called only with dead != 0.
+func (s *pathScheduler) probePath() int {
+	s.probeArmed, s.probeCount, s.closesSinceProbe = false, 0, 0
+	for i := 0; i < s.paths; i++ {
+		p := s.probeRR % s.paths
+		s.probeRR++
+		if s.dead&(uint8(1)<<p) != 0 {
+			return p
+		}
+	}
+	return 0 // unreachable: callers check dead != 0
+}
+
+// probeOwed advances the backstop cadence by one generation close and reports
+// whether a dedicated probe repair is owed: dead paths exist and no probe (WRR
+// diversion or backstop) has gone out for probeGenEvery closes. The caller answers
+// true by emitting one ordinary repair — the armed flag makes repairPath route it
+// to the dead path. This keeps revival independent of repair VOLUME: with the
+// surviving path clean the sizer decays repair to zero, and without the backstop
+// the dead path would never be probed again (revival is observed only through an
+// arrival on the dead path, so no probe means dead forever).
+func (s *pathScheduler) probeOwed() bool {
+	if s.dead == 0 || s.failoverOff {
+		return false
+	}
+	s.closesSinceProbe++
+	if s.closesSinceProbe < probeGenEvery {
+		return false
+	}
+	s.probeArmed = true
+	return true
 }
 
 // coLossWindow is the number of aligned N-path slots the co-loss estimator averages

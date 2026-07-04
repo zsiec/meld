@@ -47,23 +47,27 @@ type simLink struct {
 	// point — the variance the deterministic sim cannot show.
 	timingJitterMicros int64
 	timingSeed         int64
+	// tap, when set, observes every forward datagram after the drop decision — placement
+	// and channel-behavior observability for tests (e.g. failover placement assertions).
+	tap func(sym wire.Symbol, dropped bool)
 }
 
 // simResult is the observed outcome of a simLink run.
 type simResult struct {
-	n             int // source chunks offered (== simLink.n)
-	delivered     int
-	deliveredIDs  []uint32
-	stats         ReceiverStats
-	sstats        SenderStats
-	peakGens      int // max len(receiver.gens) over the run — the receiver resource-bound witness
-	peakRetained  int // max len(sender.retained) — the sender resource-bound witness
-	lateDeliv     bool
-	corrupt       bool    // a delivered payload did not match its source id (false recovery)
-	latencyMicros []int64 // per-delivered-symbol latency (now - write time), for p50/p99
-	finalPEst     float64 // the sender's loss estimate at end of run (feedback-driven; for diagnostics)
-	finalBurstQ8  int     // the sender's burstiness estimate at end of run (Q8; 256 == i.i.d.)
-	finalCliff    bool    // whether the sender detected an unsatisfiable one-way-delay budget
+	n               int // source chunks offered (== simLink.n)
+	delivered       int
+	deliveredIDs    []uint32
+	stats           ReceiverStats
+	sstats          SenderStats
+	peakGens        int // max len(receiver.gens) over the run — the receiver resource-bound witness
+	peakRetained    int // max len(sender.retained) — the sender resource-bound witness
+	deliveredInTime int // deliveries within each chunk's own deadline — the ARBITERED count, the honest live metric (delivered includes late ones)
+	lateDeliv       bool
+	corrupt         bool    // a delivered payload did not match its source id (false recovery)
+	latencyMicros   []int64 // per-delivered-symbol latency (now - write time), for p50/p99
+	finalPEst       float64 // the sender's loss estimate at end of run (feedback-driven; for diagnostics)
+	finalBurstQ8    int     // the sender's burstiness estimate at end of run (Q8; 256 == i.i.d.)
+	finalCliff      bool    // whether the sender detected an unsatisfiable one-way-delay budget
 }
 
 // pctlMicros returns the p-th percentile (0..1) of the latency samples in microseconds, or 0 if empty.
@@ -106,6 +110,12 @@ func (sl simLink) run() simResult {
 	} else {
 		s, r = NewSender(sl.cfg), NewReceiver(sl.cfg)
 	}
+	return sl.runCores(s, r)
+}
+
+// runCores is run with caller-constructed halves, so a test can reach white-box state
+// (a scheduler switch, receiver verdicts) while reusing the sim loop.
+func (sl simLink) runCores(s coreSenderT, r coreReceiverT) simResult {
 	step := sl.stepMicros
 	if step <= 0 {
 		step = 1_000
@@ -141,7 +151,14 @@ func (sl simLink) run() simResult {
 				break
 			}
 			sym, err := wire.DecodeSymbol(d)
-			if err != nil || sl.drop(sym) {
+			if err != nil {
+				continue
+			}
+			dropped := sl.drop(sym)
+			if sl.tap != nil {
+				sl.tap(sym, dropped)
+			}
+			if dropped {
 				continue
 			}
 			extra := int64(0)
@@ -189,6 +206,8 @@ func (sl simLink) run() simResult {
 				res.latencyMicros = append(res.latencyMicros, int64(now.Sub(dl))+sl.cfg.BufferMicros)
 				if now.After(dl) {
 					res.lateDeliv = true // delivered past its deadline
+				} else {
+					res.deliveredInTime++
 				}
 			}
 		}
@@ -248,6 +267,9 @@ func (sl simLink) run() simResult {
 	if gs, ok := s.(*Sender); ok {
 		res.finalPEst, res.finalBurstQ8 = gs.pEst, gs.burstQ8
 		res.finalCliff = gs.delayCliff
+	}
+	if ss, ok := s.(*SlidingSender); ok {
+		res.finalPEst, res.finalBurstQ8 = ss.pEst, ss.burstQ8
 	}
 	return res
 }

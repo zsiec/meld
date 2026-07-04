@@ -33,6 +33,7 @@ func TestMeasuredGenWidth(t *testing.T) {
 // or strand delivery, so the four invariants holding under a varying width is the alignment proof;
 // the lower overhead vs a fixed GenSize-16 run confirms it actually widened.
 func TestAutoGenSize(t *testing.T) {
+	t.Parallel()
 	const (
 		budget = 200_000 // generous (budget >> RTT)
 		owd    = 20_000  // 40 ms RTT

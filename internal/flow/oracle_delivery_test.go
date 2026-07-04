@@ -262,6 +262,7 @@ func oracleBaseConfig() Config {
 // receiver carries the per-id stamped-deadline fix (symDL) and the careful refDL
 // backstop, so it holds the guarantee — this locks that.
 func TestOracleNoPrematureDropGeneration(t *testing.T) {
+	t.Parallel()
 	if testing.Short() {
 		t.Skip("oracle sweep is slow; run without -short")
 	}
@@ -302,6 +303,7 @@ func TestOracleNoPrematureDropGeneration(t *testing.T) {
 // reach it — a band-SIZING limit, not a receiver-avoidable premature drop. The loose bound still
 // trips if late-repair recovery regresses (the residuals would jump back to ~18 and ~11).
 func TestOracleSlidingPrematureDrop(t *testing.T) {
+	t.Parallel()
 	if testing.Short() {
 		t.Skip("oracle sweep is slow; run without -short")
 	}

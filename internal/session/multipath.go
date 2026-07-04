@@ -467,10 +467,17 @@ func (s *MultipathSender) tickLoop() {
 // docs/encryption.md) run on path 0. The per-symbol open (embedded openState) is
 // path-agnostic.
 type MultipathReceiver struct {
-	subs      []Substrate
-	clk       clock.Clock
-	mu        sync.Mutex
-	flow      coreReceiver
+	subs []Substrate
+	clk  clock.Clock
+	mu   sync.Mutex
+	flow coreReceiver
+	// emitQ + emitting hand drained delivery batches to deliverCh in DRAIN order (see
+	// the single-path Receiver.emitQ doc): with one recvLoop PER PATH plus the tickLoop
+	// all draining the shared core, batches are queued under mu and one elected emitter
+	// flushes FIFO holding no lock across the blocking sends, so a slow app can neither
+	// reorder delivery nor freeze the paths' intake, feedback, or Stats().
+	emitQ     [][][]byte
+	emitting  bool
 	peers     []net.Addr // learned peer per path
 	cs        clockSync
 	probeTick int
@@ -800,8 +807,7 @@ func (r *MultipathReceiver) feedSymbol(datagram []byte, addr net.Addr, path int,
 	}
 	peers := append([]net.Addr(nil), r.peers...)
 	fbs := r.ctl.sealBatch(drainSend(r.flow))
-	r.mu.Unlock()
-	r.emit(out)
+	r.enqueueEmit(out) // releases mu; delivers in drain order, no lock held across the send
 	r.sendFeedback(fbs, peers)
 }
 
@@ -837,14 +843,37 @@ func (r *MultipathReceiver) tickLoop() {
 			if r.probeTick%cookieRotateEvery == 0 {
 				r.rotateCookie()
 			}
-			r.mu.Unlock()
-			r.emit(out)
+			r.enqueueEmit(out) // releases mu; delivers in drain order, no lock held across the send
 			r.sendFeedback(fbs, peers)
 			if probe != nil {
 				_ = writeDatagram(r.subs[probePath], probe, peers[probePath])
 			}
 		}
 	}
+}
+
+// enqueueEmit queues one drained batch for in-order delivery and, unless another
+// drainer already owns the emitter role, flushes the queue itself. Called with mu
+// HELD; returns with mu released. See the single-path Receiver.enqueueEmit doc.
+func (r *MultipathReceiver) enqueueEmit(out [][]byte) {
+	if len(out) > 0 {
+		r.emitQ = append(r.emitQ, out)
+	}
+	if r.emitting || len(r.emitQ) == 0 {
+		r.mu.Unlock()
+		return
+	}
+	r.emitting = true
+	for len(r.emitQ) > 0 {
+		batch := r.emitQ[0]
+		r.emitQ[0] = nil
+		r.emitQ = r.emitQ[1:]
+		r.mu.Unlock()
+		r.emit(batch)
+		r.mu.Lock()
+	}
+	r.emitQ, r.emitting = nil, false
+	r.mu.Unlock()
 }
 
 // emit delivers already-opened chunks to the application (opening happens under the lock

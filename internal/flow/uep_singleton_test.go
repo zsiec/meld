@@ -22,7 +22,7 @@ func u32sEqual(a, b []uint32) bool {
 }
 
 func TestHighPrioritySystematicGetsDeferredSingletonRepair(t *testing.T) {
-	cfg := Config{Flow: 1, SymbolSize: testSym, GenSize: 16, BufferMicros: 80_000}
+	cfg := Config{Flow: 1, SymbolSize: testSym, GenSize: 16, BufferMicros: 60_000}
 	s := NewSender(cfg)
 	s.WriteUnit(clock.Timestamp(0), makeChunkN(7), uepCenterTier+1)
 
@@ -58,8 +58,8 @@ func TestHighPrioritySystematicGetsDeferredSingletonRepair(t *testing.T) {
 			continue
 		}
 		found = true
-		if sym.WindowBase != 0 || sym.N != 1 || sym.Priority != uepCenterTier+1 || sym.Deadline != 80_000 {
-			t.Fatalf("singleton repair = base %d n %d priority %d deadline %d, want base 0 n 1 priority %d deadline 80000",
+		if sym.WindowBase != 0 || sym.N != 1 || sym.Priority != uepCenterTier+1 || sym.Deadline != 60_000 {
+			t.Fatalf("singleton repair = base %d n %d priority %d deadline %d, want base 0 n 1 priority %d deadline 60000",
 				sym.WindowBase, sym.N, sym.Priority, sym.Deadline, uepCenterTier+1)
 		}
 	}
@@ -69,7 +69,7 @@ func TestHighPrioritySystematicGetsDeferredSingletonRepair(t *testing.T) {
 }
 
 func TestSlidingHighPrioritySystematicGetsDeferredSingletonRepair(t *testing.T) {
-	cfg := Config{Flow: 1, SymbolSize: testSym, Sliding: true, CodingWindow: 16, BufferMicros: 80_000}
+	cfg := Config{Flow: 1, SymbolSize: testSym, Sliding: true, CodingWindow: 16, BufferMicros: 60_000}
 	s := NewSlidingSender(cfg)
 	s.WriteUnit(clock.Timestamp(0), makeChunkN(7), uepCenterTier+1)
 
@@ -108,8 +108,8 @@ func TestSlidingHighPrioritySystematicGetsDeferredSingletonRepair(t *testing.T) 
 			continue
 		}
 		found = true
-		if sym.Priority != uepCenterTier+1 || sym.Deadline != 80_000 {
-			t.Fatalf("sliding singleton priority/deadline = %d/%d, want %d/80000",
+		if sym.Priority != uepCenterTier+1 || sym.Deadline != 60_000 {
+			t.Fatalf("sliding singleton priority/deadline = %d/%d, want %d/60000",
 				sym.Priority, sym.Deadline, uepCenterTier+1)
 		}
 	}
@@ -119,7 +119,7 @@ func TestSlidingHighPrioritySystematicGetsDeferredSingletonRepair(t *testing.T) 
 }
 
 func TestSlidingProtectedFeedbackGetsSparseRepair(t *testing.T) {
-	cfg := Config{Flow: 1, SymbolSize: testSym, Sliding: true, CodingWindow: 8, BufferMicros: 80_000, Redundancy: 0}
+	cfg := Config{Flow: 1, SymbolSize: testSym, Sliding: true, CodingWindow: 8, BufferMicros: 60_000, Redundancy: 0}
 	s := NewSlidingSender(cfg)
 	for i := 0; i < 20; i++ {
 		fd := FrameDesc{Priority: uepCenterTier, FrameID: uint32(i), Chunks: 1}
@@ -136,25 +136,27 @@ func TestSlidingProtectedFeedbackGetsSparseRepair(t *testing.T) {
 		Burstiness:     burstQ8One,
 	})
 
+	// Consolidated protected GROUPS also travel as SparseRepair now, so the
+	// assertion filters for the feedback-driven retry's exact id set.
 	wantIDs := []uint32{2, 3, 4, 5, 6, 7, 8, 9}
 	sparse := 0
 	for _, sym := range drainSlidingSymbols(t, s) {
-		if sym.Kind != wire.SparseRepair {
+		if sym.Kind != wire.SparseRepair || !u32sEqual(sym.SparseIDs, wantIDs) {
 			continue
 		}
 		sparse++
-		if !u32sEqual(sym.SparseIDs, wantIDs) || sym.N != uint16(len(wantIDs)) || sym.Priority != uepCenterTier+1 {
+		if sym.N != uint16(len(wantIDs)) || sym.Priority != uepCenterTier+1 {
 			t.Fatalf("sparse repair = ids %v n %d priority %d, want %v/%d/%d",
 				sym.SparseIDs, sym.N, sym.Priority, wantIDs, len(wantIDs), uepCenterTier+1)
 		}
 	}
 	if sparse != 1 {
-		t.Fatalf("sparse repairs = %d, want 1", sparse)
+		t.Fatalf("feedback sparse repairs = %d, want 1", sparse)
 	}
 }
 
 func TestSlidingProtectedSparseRepairGetsDelayedRetry(t *testing.T) {
-	cfg := Config{Flow: 1, SymbolSize: testSym, Sliding: true, CodingWindow: 8, BufferMicros: 80_000, Redundancy: 0}
+	cfg := Config{Flow: 1, SymbolSize: testSym, Sliding: true, CodingWindow: 8, BufferMicros: 60_000, Redundancy: 0}
 	s := NewSlidingSender(cfg)
 	for i := 0; i < 20; i++ {
 		fd := FrameDesc{Priority: uepCenterTier, FrameID: uint32(i), Chunks: 1}
@@ -171,18 +173,17 @@ func TestSlidingProtectedSparseRepairGetsDelayedRetry(t *testing.T) {
 		Burstiness:     burstQ8One,
 	})
 
+	// Group-consolidation sparse repairs share the wire kind; count only the
+	// retry's exact id set.
 	wantIDs := []uint32{2, 3, 4, 5, 6, 7, 8, 9}
 	immediate := 0
 	for _, sym := range drainSlidingSymbols(t, s) {
-		if sym.Kind == wire.SparseRepair {
+		if sym.Kind == wire.SparseRepair && u32sEqual(sym.SparseIDs, wantIDs) {
 			immediate++
-			if !u32sEqual(sym.SparseIDs, wantIDs) {
-				t.Fatalf("immediate sparse ids = %v, want %v", sym.SparseIDs, wantIDs)
-			}
 		}
 	}
 	if immediate != 1 {
-		t.Fatalf("immediate sparse repairs = %d, want 1", immediate)
+		t.Fatalf("immediate feedback sparse repairs = %d, want 1", immediate)
 	}
 
 	for i := 20; i <= 20+int(cfg.singletonRepairGap()); i++ {
@@ -192,20 +193,17 @@ func TestSlidingProtectedSparseRepairGetsDelayedRetry(t *testing.T) {
 
 	delayed := 0
 	for _, sym := range drainSlidingSymbols(t, s) {
-		if sym.Kind == wire.SparseRepair {
+		if sym.Kind == wire.SparseRepair && u32sEqual(sym.SparseIDs, wantIDs) {
 			delayed++
-			if !u32sEqual(sym.SparseIDs, wantIDs) {
-				t.Fatalf("delayed sparse ids = %v, want %v", sym.SparseIDs, wantIDs)
-			}
 		}
 	}
 	if delayed != 1 {
-		t.Fatalf("delayed sparse repairs = %d, want 1", delayed)
+		t.Fatalf("delayed feedback sparse repairs = %d, want 1", delayed)
 	}
 }
 
 func TestSlidingReceiverSparseRepairRecoversProtectedGap(t *testing.T) {
-	cfg := Config{Flow: 1, SymbolSize: testSym, Sliding: true, CodingWindow: 8, BufferMicros: 80_000}
+	cfg := Config{Flow: 1, SymbolSize: testSym, Sliding: true, CodingWindow: 8, BufferMicros: 60_000}
 	r := NewSlidingReceiver(cfg)
 	enc := code.NewEncoder(testSym)
 	src := make([][]byte, 6)
@@ -253,7 +251,7 @@ func TestSlidingReceiverSparseRepairRecoversProtectedGap(t *testing.T) {
 
 func TestSlidingRAPAnchorClosureQueuesSpacedSparseRepair(t *testing.T) {
 	const gap = 8
-	cfg := Config{Flow: 1, SymbolSize: testSym, Sliding: true, CodingWindow: 64, BufferMicros: 80_000, Redundancy: 0, SingletonRepairGap: gap, ProtectedRepairPhasing: true}
+	cfg := Config{Flow: 1, SymbolSize: testSym, Sliding: true, CodingWindow: 64, BufferMicros: 60_000, Redundancy: 0, SingletonRepairGap: gap, ProtectedRepairPhasing: true}
 	s := NewSlidingSender(cfg)
 
 	for i := 0; i < gap; i++ {
@@ -300,7 +298,7 @@ func TestSlidingRAPAnchorClosureQueuesSpacedSparseRepair(t *testing.T) {
 }
 
 func TestSlidingRAPAnchorClosureSkipsDisposablePrefix(t *testing.T) {
-	cfg := Config{Flow: 1, SymbolSize: testSym, Sliding: true, CodingWindow: 64, BufferMicros: 80_000, Redundancy: 0, SingletonRepairGap: 2, ProtectedRepairPhasing: true}
+	cfg := Config{Flow: 1, SymbolSize: testSym, Sliding: true, CodingWindow: 64, BufferMicros: 60_000, Redundancy: 0, SingletonRepairGap: 2, ProtectedRepairPhasing: true}
 	s := NewSlidingSender(cfg)
 
 	for i := 0; i < 4; i++ {
@@ -333,6 +331,14 @@ func TestSlidingRAPAnchorClosureSkipsDisposablePrefix(t *testing.T) {
 	t.Fatal("did not emit anchor sparse repair")
 }
 
+// NOTE (all-regimes pass, 2026-07-02): these singleton/anchor mechanism tests run at
+// BufferMicros 60 ms — BELOW the honest reactive cycle at the pre-sample 50 ms RTT
+// estimate (reactiveCycleMicros = 67.5 ms) — because the dedicated per-chunk extras
+// are now deliberately gated to the reactive-INCAPABLE regime: where a reactive cycle
+// fits the budget, retrospective repair reaches a reference hole on demand and the
+// extras would be double coverage. The dormancy of the extras in the capable regime
+// is pinned by TestSingletonExtrasDormantWhenReactiveReachable (resync_test.go's
+// sibling in reactive_retro_test.go).
 func TestConfiguredSingletonRepairGap(t *testing.T) {
 	const gap = 3
 	cases := []struct {
@@ -343,12 +349,12 @@ func TestConfiguredSingletonRepairGap(t *testing.T) {
 		{
 			name: "generation",
 			new:  func(cfg Config) unitWriter { return NewSender(cfg) },
-			cfg:  Config{Flow: 1, SymbolSize: testSym, GenSize: 16, BufferMicros: 80_000, SingletonRepairGap: gap},
+			cfg:  Config{Flow: 1, SymbolSize: testSym, GenSize: 16, BufferMicros: 60_000, SingletonRepairGap: gap},
 		},
 		{
 			name: "sliding",
 			new:  func(cfg Config) unitWriter { return NewSlidingSender(cfg) },
-			cfg:  Config{Flow: 1, SymbolSize: testSym, Sliding: true, CodingWindow: 16, BufferMicros: 80_000, SingletonRepairGap: gap},
+			cfg:  Config{Flow: 1, SymbolSize: testSym, Sliding: true, CodingWindow: 16, BufferMicros: 60_000, SingletonRepairGap: gap},
 		},
 	}
 	for _, tc := range cases {
@@ -374,7 +380,7 @@ func TestConfiguredSingletonRepairGap(t *testing.T) {
 
 func TestSlidingSingletonProtectedRepairsArePhased(t *testing.T) {
 	const gap = 4
-	cfg := Config{Flow: 1, SymbolSize: testSym, Sliding: true, CodingWindow: 16, BufferMicros: 80_000, SingletonRepairGap: gap, Redundancy: 0, ProtectedRepairPhasing: true}
+	cfg := Config{Flow: 1, SymbolSize: testSym, Sliding: true, CodingWindow: 16, BufferMicros: 60_000, SingletonRepairGap: gap, Redundancy: 0, ProtectedRepairPhasing: true}
 	s := NewSlidingSender(cfg)
 	s.WriteUnit(clock.Timestamp(0), makeChunkN(0), uepCenterTier+1)
 	s.WriteUnit(clock.Timestamp(1), makeChunkN(1), uepCenterTier+1)
@@ -419,8 +425,11 @@ func TestDefaultSingletonRepairGapDependsOnCoder(t *testing.T) {
 }
 
 func TestSlidingProtectedRepairGapColdStartsForLongBurst(t *testing.T) {
+	// A high RTT estimate keeps the sender in the reactive-INCAPABLE regime at this
+	// generous budget, so the singleton path (whose gap policy is under test) is active.
 	cfg := Config{Flow: 1, SymbolSize: testSym, Sliding: true, CodingWindow: 64, BufferMicros: 200_000, Redundancy: 0, ProtectedRepairPhasing: true}
 	s := NewSlidingSender(cfg)
+	s.rttMicros = 200_000
 
 	s.WriteUnit(clock.Timestamp(0), makeChunkN(0), uepCenterTier+1)
 	if len(s.singletons) != 1 {
@@ -434,6 +443,7 @@ func TestSlidingProtectedRepairGapColdStartsForLongBurst(t *testing.T) {
 func TestSlidingProtectedRepairGapUsesMeasuredBurst(t *testing.T) {
 	cfg := Config{Flow: 1, SymbolSize: testSym, Sliding: true, CodingWindow: 64, BufferMicros: 200_000, Redundancy: 0, ProtectedRepairPhasing: true}
 	s := NewSlidingSender(cfg)
+	s.rttMicros = 200_000 // reactive-incapable: the singleton gap policy under test stays active
 	s.fbCount = coldStartFeedbacks
 	s.burstQ8 = 64 * 256
 	s.interMicros = 1_000
@@ -465,7 +475,7 @@ func TestSlidingProtectedRepairGapCapsAtDeadline(t *testing.T) {
 }
 
 func TestHighPriorityTailFlushesSingletonRepair(t *testing.T) {
-	cfg := Config{Flow: 1, SymbolSize: testSym, GenSize: 16, BufferMicros: 80_000}
+	cfg := Config{Flow: 1, SymbolSize: testSym, GenSize: 16, BufferMicros: 60_000}
 	s := NewSender(cfg)
 	s.WriteUnit(clock.Timestamp(0), makeChunkN(7), uepCenterTier+1)
 	s.Flush(clock.Timestamp(1_000))
@@ -490,7 +500,7 @@ func TestHighPriorityTailFlushesSingletonRepair(t *testing.T) {
 }
 
 func TestPendingSingletonKeepsPayloadAfterGenerationRetire(t *testing.T) {
-	cfg := Config{Flow: 1, SymbolSize: testSym, GenSize: 1, BufferMicros: 80_000}
+	cfg := Config{Flow: 1, SymbolSize: testSym, GenSize: 1, BufferMicros: 60_000}
 	s := NewSender(cfg)
 	src := makeChunkN(7)
 	s.WriteUnit(clock.Timestamp(0), src, uepCenterTier+1)
@@ -545,7 +555,7 @@ func TestFlatSystematicGetsNoSingletonRepair(t *testing.T) {
 }
 
 func TestFrameReferenceGetsSingletonRepair(t *testing.T) {
-	cfg := Config{Flow: 1, SymbolSize: testSym, GenSize: 16, BufferMicros: 80_000}
+	cfg := Config{Flow: 1, SymbolSize: testSym, GenSize: 16, BufferMicros: 60_000}
 	s := NewSender(cfg)
 	fd := FrameDesc{Priority: uepCenterTier, FrameID: 1, Chunks: 1}
 	s.WriteFrame(clock.Timestamp(0), makeChunkN(7), fd)

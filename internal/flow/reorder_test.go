@@ -8,6 +8,7 @@ import "testing"
 // fill timing — so confirm the over-send cut and the invariants still hold with frame-burst writes
 // (burst=8) under reorder + loss, the way a real clip exercises the path.
 func TestReorderHoldoffFrameBurst(t *testing.T) {
+	t.Parallel()
 	const (
 		owd    = 50_000
 		budget = 400_000
@@ -99,6 +100,7 @@ func sqrtApprox(x float64) float64 {
 // TestAutoReorderHoldoffInvariants pins that the SELF-TUNING reorder window is also a soundness no-op:
 // the four invariants and completeness hold under heavy reorder + loss with AutoReorderHoldoff on.
 func TestAutoReorderHoldoffInvariants(t *testing.T) {
+	t.Parallel()
 	const (
 		owd    = 50_000
 		budget = 400_000
@@ -121,6 +123,7 @@ func TestAutoReorderHoldoffInvariants(t *testing.T) {
 // NO reorder, the gaps come from genuine loss (they never fill), so the window must stay ~0 and add no
 // proactive overhead vs off — it costs nothing where there is nothing to correct.
 func TestAutoReorderHoldoffSelfDisables(t *testing.T) {
+	t.Parallel()
 	const (
 		owd    = 50_000
 		budget = 400_000
@@ -161,6 +164,7 @@ func TestAutoReorderHoldoffSelfDisables(t *testing.T) {
 // path, so the four invariants must hold under heavy reorder + loss exactly as without it — no
 // duplicate, in-order, nothing past deadline, completeness under recoverable loss.
 func TestReorderHoldoffInvariants(t *testing.T) {
+	t.Parallel()
 	const (
 		owd    = 50_000  // RTT 100 ms
 		budget = 400_000 // 4×RTT — ample, so recoverable loss completes
@@ -186,6 +190,7 @@ func TestReorderHoldoffInvariants(t *testing.T) {
 // over-send materially WITHOUT losing delivery. Compares proactive repair (sstats.Repair) off vs on
 // at equal recoverable loss, with the paced+jittered sim (the reorder the deterministic sim hides).
 func TestReorderHoldoffCutsOverSend(t *testing.T) {
+	t.Parallel()
 	const (
 		owd    = 50_000
 		budget = 400_000

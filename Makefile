@@ -8,13 +8,21 @@ PKGS := $(shell $(GO) list ./... 2>/dev/null)
 build:
 	@$(GO) build ./... 2>/dev/null || echo "no packages yet"
 
+# gofmt sweeps the repo's OWN files (tracked + untracked-unignored): gitignored
+# scratch areas (.claude/worktrees checkouts at older commits) are not this repo's
+# lint surface and must not fail the gate.
 lint:
-	@out=$$(gofmt -l . 2>/dev/null); if [ -n "$$out" ]; then \
-		echo "gofmt needed:"; echo "$$out"; exit 1; fi
+	@files=$$(git ls-files -co --exclude-standard '*.go' 2>/dev/null); \
+	if [ -n "$$files" ]; then \
+		out=$$(gofmt -l $$files 2>/dev/null); if [ -n "$$out" ]; then \
+		echo "gofmt needed:"; echo "$$out"; exit 1; fi; fi
 	@if [ -n "$(PKGS)" ]; then $(GO) vet ./...; else echo "no packages to vet yet"; fi
 
+# 300s: internal/flow is a battery of deterministic sim sweeps; the heavy tests run
+# t.Parallel(), so wall time is well under this on a multicore box, but -race on a
+# loaded single CI core needs the headroom.
 test:
-	@if [ -n "$(PKGS)" ]; then $(GO) test -race -count=1 -timeout 120s ./...; \
+	@if [ -n "$(PKGS)" ]; then $(GO) test -race -count=1 -timeout 300s ./...; \
 		else echo "no packages to test yet"; fi
 
 bench:

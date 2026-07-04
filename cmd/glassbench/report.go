@@ -143,7 +143,40 @@ type seedTrace struct {
 	Source      []sourceTrace      `json:"source_timeline"`
 	MissingRuns []seqRun           `json:"missing_runs"`
 	Relay       []relayTraceEvent  `json:"relay_events,omitempty"`
-	Notes       []string           `json:"notes,omitempty"`
+	// Feedback and Arrivals are the burst-autopsy streams (2026-07): every reverse-
+	// path feedback report the relay carried, decoded (the bench runs cleartext), and
+	// the sink's first-arrival time per chunk seq — together with the forward relay
+	// events they reconstruct each GE burst's full recovery timeline: what was lost,
+	// what the receiver reported, what repair answered, and when each chunk landed
+	// against its deadline.
+	Feedback []feedbackTraceEvent `json:"feedback_events,omitempty"`
+	Arrivals []arrivalTraceEvent  `json:"arrivals,omitempty"`
+	// FeedStartMicros anchors the per-chunk send schedule (chunk seq s left the source
+	// at FeedStartMicros + s×PaceMicros; deadline = +BudgetMicros more).
+	FeedStartMicros int64    `json:"feed_start_micros,omitempty"`
+	PaceMicros      int64    `json:"pace_micros,omitempty"`
+	BudgetMicros    int64    `json:"budget_micros,omitempty"`
+	Notes           []string `json:"notes,omitempty"`
+}
+
+// feedbackTraceEvent is one decoded reverse-path feedback report seen at the relay.
+type feedbackTraceEvent struct {
+	RelayTimestamp     int64   `json:"relay_timestamp"`
+	HighestSeen        uint32  `json:"highest_seen"`
+	DecodedLowEdge     uint32  `json:"decoded_low_edge"`
+	Deficit            uint16  `json:"deficit"`
+	Deficits           []uint8 `json:"deficits,omitempty"`
+	LossRate           uint16  `json:"loss_rate"`
+	Burstiness         uint16  `json:"burstiness"`
+	CongestionLoss     uint16  `json:"congestion_loss"`
+	NewestDecodableLTR uint32  `json:"newest_decodable_ltr,omitempty"`
+	BrokenAnchors      uint16  `json:"broken_anchors,omitempty"`
+}
+
+// arrivalTraceEvent is one chunk's FIRST arrival at the receiver-side sink.
+type arrivalTraceEvent struct {
+	Seq      uint32 `json:"seq"`
+	AtMicros int64  `json:"at_micros"`
 }
 
 type seedTraceScore struct {
@@ -279,6 +312,60 @@ func (t *seedTrace) recordRelay(datagram []byte, dropped bool, delay time.Durati
 		FrameNonPicture:      sym.FrameNonPicture,
 		FrameRefs:            append([]uint32(nil), sym.FrameRefs...),
 	})
+}
+
+// recordFeedback decodes one reverse-path datagram as a feedback report (non-feedback
+// control datagrams are ignored) and appends it to the autopsy stream.
+func (t *seedTrace) recordFeedback(datagram []byte) {
+	if t == nil {
+		return
+	}
+	typ, err := wire.PeekType(datagram)
+	if err != nil || !wire.IsFeedback(typ) {
+		return
+	}
+	fb, err := wire.DecodeFeedback(datagram)
+	if err != nil {
+		return
+	}
+	var defs []uint8
+	for i := len(fb.Deficits); i > 0; i-- {
+		if fb.Deficits[i-1] != 0 {
+			defs = append([]uint8(nil), fb.Deficits[:i]...)
+			break
+		}
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.Feedback = append(t.Feedback, feedbackTraceEvent{
+		RelayTimestamp:     time.Now().UnixMicro(),
+		HighestSeen:        fb.HighestSeen,
+		DecodedLowEdge:     fb.DecodedLowEdge,
+		Deficit:            fb.Deficit,
+		Deficits:           defs,
+		LossRate:           fb.LossRate,
+		Burstiness:         fb.Burstiness,
+		CongestionLoss:     fb.CongestionLoss,
+		NewestDecodableLTR: fb.NewestDecodableLTR,
+		BrokenAnchors:      fb.BrokenAnchors,
+	})
+}
+
+// recordArrivals folds the sink's first-arrival map and the send-schedule anchor in.
+func (t *seedTrace) recordArrivals(at map[uint32]time.Time, feedStart time.Time, paceUs int64, budgetMs int) {
+	if t == nil || at == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.Arrivals = t.Arrivals[:0]
+	for seq, tm := range at {
+		t.Arrivals = append(t.Arrivals, arrivalTraceEvent{Seq: seq, AtMicros: tm.UnixMicro()})
+	}
+	sort.Slice(t.Arrivals, func(i, j int) bool { return t.Arrivals[i].Seq < t.Arrivals[j].Seq })
+	t.FeedStartMicros = feedStart.UnixMicro()
+	t.PaceMicros = paceUs
+	t.BudgetMicros = int64(budgetMs) * 1000
 }
 
 func (r *benchReport) addResult(row reportResult) {

@@ -114,6 +114,7 @@ func TestLeverSafetySweep(t *testing.T) {
 // correctly-narrow default — the budget<RTT completeness cliff. This is reported, not asserted as
 // a failure: it is the documented hazard the hint exists to avoid.
 func TestAdaptiveWrongHintFailureMode(t *testing.T) {
+	t.Parallel()
 	const n = 800
 	// Real path: RTT 150 ms, budget 100 ms ⇒ budget < RTT (all-proactive). A wrong hint claiming
 	// RTT 40 ms makes genWidth widen to 64 — exactly where wide hurts.

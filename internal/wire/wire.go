@@ -105,6 +105,7 @@ const (
 	descDiscardable     = 0x02
 	descNonPicture      = 0x04
 	descRecoveryRefresh = 0x08
+	descLTR             = 0x10
 )
 
 // MaxFeedbackGens is the number of consecutive generations (from the delivery
@@ -123,6 +124,7 @@ const (
 	feedbackLen           = 21 + MaxFeedbackGens
 	feedbackLenExt        = feedbackLen + 4
 	feedbackMediaStatsLen = 16
+	feedbackLTRLen        = 6 // NewestDecodableLTR (4) + BrokenAnchors (2), after the media stats
 	feedbackMaxPaths      = 8 // bound on the per-path section (a forged nPaths cannot allocate unboundedly)
 )
 
@@ -185,7 +187,9 @@ type Symbol struct {
 	// decodable only if all of them are; FrameRAP marks a random-access point;
 	// FrameRecoveryRefresh marks a reference slice participating in a signaled intra-refresh
 	// interval; FrameDiscardable marks a unit nothing references; FrameNonPicture marks
-	// metadata/parameter material that is not a displayed coded picture.
+	// metadata/parameter material that is not a displayed coded picture; FrameLTR marks a
+	// long-term-reference candidate the encoder retains, so the receiver can report the
+	// newest decodable one (Feedback.NewestDecodableLTR) as the LTR-resync anchor.
 	HasFrameDesc         bool
 	FrameStart           uint32
 	FrameLen             uint16
@@ -194,6 +198,7 @@ type Symbol struct {
 	FrameRecoveryRefresh bool
 	FrameDiscardable     bool
 	FrameNonPicture      bool
+	FrameLTR             bool
 
 	Payload []byte // coded bytes, sized to the validated path MTU
 }
@@ -252,6 +257,9 @@ func EncodeSymbol(dst []byte, s Symbol) []byte {
 		}
 		if s.FrameNonPicture {
 			head[6] |= descNonPicture
+		}
+		if s.FrameLTR {
+			head[6] |= descLTR
 		}
 		n := len(s.FrameRefs)
 		if n > 255 {
@@ -330,6 +338,7 @@ func DecodeSymbol(b []byte) (Symbol, error) {
 		s.FrameRecoveryRefresh = df&descRecoveryRefresh != 0
 		s.FrameDiscardable = df&descDiscardable != 0
 		s.FrameNonPicture = df&descNonPicture != 0
+		s.FrameLTR = df&descLTR != 0
 		n := int(b[off+7])
 		off += descHeadLen
 		if len(b) < off+n*4 {
@@ -426,6 +435,44 @@ type Feedback struct {
 	DecodableFrames    uint32
 	Keyframes          uint32
 	DecodableKeyframes uint32
+
+	// --- LTR-resync tail extension (appended, length-gated) ---
+
+	// NewestDecodableLTR is FrameStart+1 of the newest frame flagged FrameLTR that the
+	// receiver has RESOLVED decodable (delivered whole with its dependency closure
+	// intact) — the safe reference an encoder can resync against after a broken chain
+	// (EncoderControl.Resync). 0 = none yet. Cumulative and idempotent like the rest of
+	// feedback: frames resolve in cursor order, so the value is monotonic.
+	NewestDecodableLTR uint32
+	// BrokenAnchors counts REFERENCED pictures (non-discardable, so their loss cascades)
+	// that resolved undecodable at or after the newest decodable LTR — the reference-chain
+	// damage signal the resync controller acts on, distinct from DecodableFrames (whose
+	// deltas also count broken disposable leaves, which no resync can help). Cumulative,
+	// wrapping uint16: the consumer differences successive reports, so wrap is harmless.
+	BrokenAnchors uint16
+
+	// --- path-failover tail extension (appended, length-gated) ---
+
+	// DeadPaths is a bitmap of paths the receiver has classified as in OUTAGE (bit i =
+	// path i): a per-path consecutive lost-slot run beyond the recovery horizon while
+	// other paths delivered. The sender fails systematic placement over to the live
+	// paths and probes the dead ones with droppable repair; any admitted arrival on a
+	// dead path clears its bit (coding-native fast failover). 0 = all paths alive
+	// (always 0 on single-path flows).
+	DeadPaths uint8
+
+	// --- missing-ids tail extension (appended, length-gated) ---
+
+	// Missing is a NACK bitmap for the stuck neighborhood: bit k set means source id
+	// DecodedLowEdge+k is not yet producible at the receiver, masked to ids the
+	// receiver has seen COVERAGE for (below its decode frontier) so an unsent or
+	// merely in-flight id never reads as missing. The sender answers set bits with
+	// UNIT repairs — base=id, n=1, a literal retransmission of the retained source —
+	// because a unit vector closes at the decoder instantly, exempt from the
+	// coupled-span closure delay every wider coded window pays (the burst-autopsy
+	// law: rank arrives at need-rate, VALUES wait on full-rank closure). 0 = nothing
+	// missing / peer predates the extension.
+	Missing uint64
 }
 
 // EncodeFeedback appends the encoded Feedback to dst and returns the slice. It
@@ -471,7 +518,15 @@ func encodeFeedbackMediaStats(dst []byte, f Feedback) []byte {
 	binary.BigEndian.PutUint32(media[4:], f.DecodableFrames)
 	binary.BigEndian.PutUint32(media[8:], f.Keyframes)
 	binary.BigEndian.PutUint32(media[12:], f.DecodableKeyframes)
-	return append(dst, media[:]...)
+	dst = append(dst, media[:]...)
+	var ltr [feedbackLTRLen]byte
+	binary.BigEndian.PutUint32(ltr[0:], f.NewestDecodableLTR)
+	binary.BigEndian.PutUint16(ltr[4:], f.BrokenAnchors)
+	dst = append(dst, ltr[:]...)
+	dst = append(dst, f.DeadPaths)
+	var miss [8]byte
+	binary.BigEndian.PutUint64(miss[:], f.Missing)
+	return append(dst, miss[:]...)
 }
 
 // DecodeFeedback parses a Feedback datagram. The base fields require feedbackLen
@@ -525,6 +580,19 @@ func DecodeFeedback(b []byte) (Feedback, error) {
 			f.DecodableFrames = binary.BigEndian.Uint32(b[off+4:])
 			f.Keyframes = binary.BigEndian.Uint32(b[off+8:])
 			f.DecodableKeyframes = binary.BigEndian.Uint32(b[off+12:])
+			off += feedbackMediaStatsLen
+			if len(b) >= off+feedbackLTRLen {
+				f.NewestDecodableLTR = binary.BigEndian.Uint32(b[off:])
+				f.BrokenAnchors = binary.BigEndian.Uint16(b[off+4:])
+				off += feedbackLTRLen
+				if len(b) > off {
+					f.DeadPaths = b[off]
+					off++
+					if len(b) >= off+8 {
+						f.Missing = binary.BigEndian.Uint64(b[off:])
+					}
+				}
+			}
 		}
 	}
 	return f, nil

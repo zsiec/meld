@@ -68,6 +68,7 @@ func TestFloorDecayReclaimsCleanWaste(t *testing.T) {
 // TestFloorDecayOnsetSafeAcrossRTT — property (2). A clean prefix (to arm the decay) then i.i.d.
 // loss, swept across RTTs spanning the reactive-backstop boundary. Delivery must hold at every RTT.
 func TestFloorDecayOnsetSafeAcrossRTT(t *testing.T) {
+	t.Parallel()
 	const n = 6000
 	for _, owd := range []int64{10_000, 25_000, 50_000, 75_000} { // RTT 20, 50, 100, 150 ms
 		res := simLink{

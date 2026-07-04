@@ -1,6 +1,7 @@
 package flow
 
 import (
+	"math/bits"
 	"sort"
 
 	"github.com/zsiec/meld/internal/clock"
@@ -27,6 +28,14 @@ type ReceiverStats struct {
 	// frame delivers sooner. Distinct from Lost (a deadline/unrecoverable byte-loss):
 	// these were sacrificed deliberately because their picture could never decode.
 	Evicted uint64
+	// Outages counts loss runs classified as beyond the recovery horizon — runs so
+	// long that no repair for their interior could have arrived before deadline, so
+	// no redundancy setting could have recovered them (two-regime channel control;
+	// Config.OutageAware). OutageSymbols is their summed span. Both are TELEMETRY,
+	// counted whether or not OutageAware is enabled; only the estimator censoring is
+	// gated. WireLost/CongestionLoss always count the full runs (the honest signal).
+	Outages       uint64
+	OutageSymbols uint64
 }
 
 // FrameStats reports media-frame decodability the receiver computes parse-free from the
@@ -49,6 +58,8 @@ type frameInfo struct {
 	length    uint16   // chunk count: the frame's ids are [start, start+length)
 	rap       bool
 	nonPic    bool
+	disc      bool // discardable: nothing references it, so its loss never breaks the chain
+	ltr       bool // a long-term-reference candidate (FrameDesc.LTR): reportable as a resync anchor
 	broken    bool // a source id of this frame was lost (not recovered)
 	resolved  bool
 	decodable bool
@@ -92,6 +103,7 @@ type Receiver struct {
 	highestSeen uint32                     // one past the highest source id any symbol has covered
 	lastFB      clock.Timestamp
 	fedOnce     bool
+	fbDue       bool // loss-onset event: emit feedback now (rate-limited), don't wait the cadence
 	deliverQ    []deliveredSym
 	sendQ       [][]byte
 	stats       ReceiverStats
@@ -117,12 +129,10 @@ type Receiver struct {
 	// the stamps so a RECOVERED symbol (which never arrived to carry one) gets the same
 	// staggered deadline as its neighbors, and the cursor evicts per symbol, not per
 	// generation — a generation's already-received tail is no longer dropped when the
-	// cursor stalls on one unrecoverable symbol at the shared deadline.
-	haveRef    bool
-	refID      uint32
-	refDL      clock.Timestamp
-	intervalUs int64
-	refSamples int
+	// cursor stalls on one unrecoverable symbol at the shared deadline. intervalUs is
+	// the SLOPE over an anchor window (intervalFitSpanIDs), not a gap EWMA — see the
+	// deadlineFit doc (lossrun.go) for the batched-write failure a gap EWMA causes.
+	deadlineFit
 
 	// Channel-erasure-rate estimator (reported to the sender's redundancy
 	// controller): the fraction of the dense systematic source-id sequence not
@@ -141,22 +151,18 @@ type Receiver struct {
 	// were dropped on the wire — one loss RUN of that length. Assumes near-in-order
 	// arrival; reorder over-counts loss, which is conservative for sizing. Feeds the
 	// pre-recovery loss count and the mean burst length, independent of decode.
-	haveExpect  bool
-	expectNext  uint32 // next source id expected in order
-	clSinceFB   uint32 // pre-recovery loss since the last feedback (→ CongestionLoss)
-	meanBurstQ8 uint32 // smoothed mean loss-run length, Q8 (256 == i.i.d.; → Burstiness)
+	haveExpect bool
+	expectNext uint32 // next source id expected in order
 
-	// Reorder window for the loss estimate (ReorderHoldoffMicros): a small resequencer in front of
-	// observeLoss that settles a source id received-or-lost only after lower ids have had a holdoff to
-	// arrive, so a reordered-late id is counted RECEIVED (not a fictitious loss that over-sizes repair).
-	// reseqSeen holds arrived ids in (reseqNext, reseqHigh]; reseqGapAt is when reseqNext first became a
-	// gap (a higher id arrived while it was missing). Single-path only.
-	reseqStarted  bool
-	reseqNext     uint32
-	reseqHigh     uint32
-	reseqGapAt    clock.Timestamp
-	reseqSeen     map[uint32]uint8 // arrived-out-of-order ids → their stamped pathID (for multipath co-loss)
-	reorderHoldUs int64            // AutoReorderHoldoff: tracked reorder spread (max-hold of fill delays, grown by late arrivals, decayed)
+	// Shared loss-run machinery (lossrun.go): the honest congestion count, the burst
+	// EWMA, the recovery-horizon slack, and the outage censoring accumulator
+	// (two-regime control, Config.OutageAware).
+	lossRunObserver
+
+	// Reorder window for the loss estimate (lossrun.go): a small resequencer in front
+	// of observeLoss, so a reordered-late id is counted RECEIVED rather than as a
+	// fictitious loss that over-sizes repair.
+	reorder reorderWindow
 
 	// Multipath co-loss estimation (N5). When the sender spreads across N paths, systematic
 	// id k rides path k mod N, so each block of N consecutive ids forms one aligned slot. The
@@ -171,6 +177,25 @@ type Receiver struct {
 	mpLost     []bool // per-path lost flags for mpSlot (len paths)
 	mpHave     int    // path-positions filled in mpSlot
 	mpMismatch int    // arrived stamps disagreeing with the id-mod-paths model (path-layout cross-check)
+	mpMatchRun int    // consecutive on-model arrivals (decays mpMismatch; see mpMismatchDecayRun)
+
+	// Path-failover detection (coding-native fast failover; see the DeadPaths wire
+	// doc). pathRun[k] counts CONSECUTIVE completed slots in which path k lost while
+	// some other path delivered; crossing the per-path outage threshold marks the
+	// path dead (deadPaths bit) and the sender fails placement over. Any admitted
+	// arrival stamped with a dead PathID clears its bit (the sender's probes make
+	// revival observable). While any path is dead the id-mod-paths placement model is
+	// invalid, so the slot walk and the stamp cross-check SUSPEND. mpRevived extends
+	// that suspension past revival: the sender keeps failover placement until the
+	// cleared report reaches it one RTT + feedback interval later — a lag the receiver
+	// cannot time (it has no RTT estimate) but can OBSERVE END: the first systematic
+	// that arrives on the revived path at its id-mod-paths position proves placement
+	// is back on-model, and the cross-check resumes. mpGraceUntil caps the wait (in
+	// ids) so a sender that never resumes cannot suspend the layout check forever.
+	pathRun      []int
+	deadPaths    uint8
+	mpRevived    uint8  // paths cleared from deadPaths whose on-model return is not yet confirmed
+	mpGraceUntil uint32 // hard cap on the mpRevived suspension (id horizon)
 
 	// Frame-level loss propagation (WP6). Systematic symbols carry an access-unit
 	// descriptor (FrameStart = the frame's first source id + the dominant reference's
@@ -186,25 +211,31 @@ type Receiver struct {
 	haveCur     bool
 	idDelivered map[uint32]bool // recent id → delivered?, for resolving a reference frame
 	fstats      FrameStats      // that had no descriptor (fully recovered, no header)
+
+	// LTR resync feedback state (lossrun.go; the sender half is resyncController).
+	ltrResyncState
 }
 
 // NewReceiver constructs a Receiver for cfg.
 func NewReceiver(cfg Config) *Receiver {
 	r := &Receiver{
-		cfg:         cfg,
-		pool:        code.NewPool(cfg.SymbolSize),
-		gens:        make(map[uint32]*genState),
-		ready:       make(map[uint32][]byte),
-		symDL:       make(map[uint32]clock.Timestamp),
-		intervalUs:  1,
-		meanBurstQ8: burstQ8One, // start at the i.i.d. baseline (mean run length 1)
-		mpEnabled:   cfg.multipath(),
-		paths:       cfg.paths(),
+		cfg:             cfg,
+		pool:            code.NewPool(cfg.SymbolSize),
+		gens:            make(map[uint32]*genState),
+		ready:           make(map[uint32][]byte),
+		symDL:           make(map[uint32]clock.Timestamp),
+		deadlineFit:     deadlineFit{intervalUs: 1},
+		lossRunObserver: lossRunObserver{meanBurstQ8: burstQ8One}, // start at the i.i.d. baseline (mean run length 1)
+		mpEnabled:       cfg.multipath(),
+		paths:           cfg.paths(),
 	}
 	if r.mpEnabled {
 		r.coEst = newCoLossEstimator(r.paths)
 		r.mpLost = make([]bool, r.paths)
+		r.pathRun = make([]int, r.paths)
 	}
+	r.reorder = reorderWindow{cfgHoldoff: cfg.ReorderHoldoffMicros, auto: cfg.AutoReorderHoldoff,
+		budget: cfg.BufferMicros, sink: r.observeLoss}
 	return r
 }
 
@@ -243,6 +274,19 @@ func (r *Receiver) FeedSymbolECN(now clock.Timestamp, datagram []byte, ecn ECN) 
 	if ecn == CE {
 		r.ecnCE++
 	}
+	// Path revival: ANY admitted arrival stamped with a dead path's id proves the path
+	// delivers again — clear its bit and suspend the stamp cross-check until the
+	// sender's placement is observed back on-model (mpRevived; the cleared report
+	// takes one RTT + feedback interval to take effect at the sender), capped so the
+	// layout check cannot stay suspended forever.
+	if r.deadPaths != 0 && int(sym.PathID) < r.paths {
+		if bit := uint8(1) << sym.PathID; r.deadPaths&bit != 0 {
+			r.deadPaths &^= bit
+			r.pathRun[sym.PathID] = 0
+			r.mpRevived |= bit
+			r.mpGraceUntil = r.highestSeen + mpRevivalGraceCapIDs
+		}
+	}
 	// The channel-erasure estimate counts a systematic's arrival as a NETWORK delivery
 	// of its id, independent of whether it is in time to be delivered. A symbol
 	// received LATE — its generation's deadline already skipped the cursor past it —
@@ -253,8 +297,8 @@ func (r *Receiver) FeedSymbolECN(now clock.Timestamp, datagram []byte, ecn ECN) 
 	// before the cursor/deadline gates. Each id's systematic arrives once, so this
 	// counts each network delivery once.
 	if sym.Kind == wire.Systematic {
-		if r.reorderEnabled() {
-			r.reseqFeed(now, sym.SrcIndex, sym.PathID)
+		if r.reorder.enabled() {
+			r.reorder.feed(now, sym.SrcIndex, sym.PathID)
 		} else {
 			r.observeLoss(sym.SrcIndex, sym.PathID)
 		}
@@ -276,6 +320,7 @@ func (r *Receiver) FeedSymbolECN(now clock.Timestamp, datagram []byte, ecn ECN) 
 	switch sym.Kind {
 	case wire.Systematic:
 		r.updateRef(sym.SrcIndex, dl)
+		r.observeSlack(now, dl)
 		if sym.SrcIndex >= r.cursor {
 			r.symDL[sym.SrcIndex] = dl // gate this id by its own true deadline, not the fit
 		}
@@ -298,8 +343,8 @@ func (r *Receiver) FeedSymbolECN(now clock.Timestamp, datagram []byte, ecn ECN) 
 // Tick advances receiver time, enforcing deadline eviction and emitting periodic
 // feedback even when no symbol arrives.
 func (r *Receiver) Tick(now clock.Timestamp) {
-	if r.reorderEnabled() {
-		r.reseqDrain(now) // settle losses whose holdoff expired without a new arrival
+	if r.reorder.enabled() {
+		r.reorder.drain(now) // settle losses whose holdoff expired without a new arrival
 	}
 	r.pump(now)
 	r.maybeFeedback(now)
@@ -576,7 +621,7 @@ func (r *Receiver) noteFrame(sym wire.Symbol) {
 	}
 	r.frames[sym.FrameStart] = &frameInfo{
 		refs: sym.FrameRefs, length: sym.FrameLen, rap: sym.FrameRAP,
-		nonPic: sym.FrameNonPicture,
+		nonPic: sym.FrameNonPicture, disc: sym.FrameDiscardable, ltr: sym.FrameLTR,
 	}
 	i := sort.Search(len(r.frameStarts), func(i int) bool { return r.frameStarts[i] >= sym.FrameStart })
 	r.frameStarts = append(r.frameStarts, 0)
@@ -669,6 +714,7 @@ func (r *Receiver) resolveFrame(start uint32) {
 			}
 		}
 	}
+	r.noteResolvedLTR(start, fi, dec)
 	if len(r.frames) > frameMapCap {
 		r.pruneFrames(start)
 	}
@@ -793,10 +839,14 @@ func (r *Receiver) structuralGapHoldoff() int64 {
 }
 
 func (r *Receiver) maybeFeedback(now clock.Timestamp) {
-	if r.fedOnce && now.Sub(r.lastFB) < feedbackIntervalMicros {
-		return
+	if r.fedOnce {
+		since := now.Sub(r.lastFB)
+		if since < feedbackIntervalMicros && !(r.fbDue && since >= eventFeedbackMinMicros) {
+			return // not yet due: neither the cadence nor a rate-limited loss-onset event
+		}
 	}
 	r.fedOnce = true
+	r.fbDue = false
 	r.lastFB = now
 	// Report the rank deficit of each generation from the cursor, walking the ACTUAL
 	// generation boundaries (base += width) the sender stamped on every symbol — not a fixed
@@ -851,8 +901,16 @@ func (r *Receiver) maybeFeedback(now clock.Timestamp) {
 		DecodableFrames:    decFrames,
 		Keyframes:          keys,
 		DecodableKeyframes: decKeys,
+		NewestDecodableLTR: r.newestDecLTR,
+		BrokenAnchors:      r.brokenAnchors,
+		DeadPaths:          r.deadPaths,
 	}
 	r.ecnSeen, r.ecnCE = 0, 0 // per-interval; the CC integrates the reported fraction
+	// Deliberately NO "deficit still open" latch here: under sustained loss a deficit
+	// is open almost always, and latching on it degenerates into a permanent event-
+	// floor reverse flood that measurably costs delivery in the sub-cycle frontier
+	// regime. Loss ONSET (walkGap) is the only event trigger; the cadence covers the
+	// rest — the sender's convergence gates work on cadence-spaced reports.
 	if r.mpEnabled && r.coEst.primed {
 		// Per-path marginals (→ scheduler weighting) + the per-slot erasure-count histogram
 		// (→ joint-tail sizer), ppm → parts per 65535 (matching LossRate), so the sender sees
@@ -884,114 +942,16 @@ func ppmToP65535(ppm int) uint16 {
 	return uint16(v)
 }
 
-// maxReorderDepth bounds the resequencer's in-flight set: if this many ids pile up above the
-// still-missing low edge, the low edge is declared lost regardless of holdoff (a conservative
-// fallback that bounds memory and forces progress on a pathological reorder/loss burst).
-const maxReorderDepth = 1024
-
 // reorderMarginUs is how long a NOT-yet-arrived id whose deadline is only EXTRAPOLATED (no received
 // stamp) is given before the deadline path evicts it — the measured reorder spread, so a reordered-late
 // id is not dropped on a deadline computed (under reorder) from a skewed refID before it can arrive. A
 // genuinely lost id is still evicted one margin later; an id with its OWN received stamp is unaffected.
 func (r *Receiver) reorderMarginUs() int64 {
-	m := r.reorderHoldUs
+	m := r.reorder.holdUs
 	if r.cfg.ReorderHoldoffMicros > m {
 		m = r.cfg.ReorderHoldoffMicros
 	}
 	return m
-}
-
-// reorderEnabled reports whether the loss-estimate reorder window is active. Works on single-path and
-// multipath: each held id is replayed to observeLoss in order with its OWN stamped pathID, so the
-// multipath co-loss estimator sees the same arrived/lost facts it would without the window — only
-// with reordered-late ids correctly counted received rather than as fictitious per-path loss.
-func (r *Receiver) reorderEnabled() bool {
-	return r.cfg.ReorderHoldoffMicros > 0 || r.cfg.AutoReorderHoldoff
-}
-
-// holdoffMicros is the effective reorder window: the fixed config value, or — under
-// AutoReorderHoldoff — the measured reorder spread plus a quarter margin, capped at half the deadline
-// budget (holding longer than the budget would let the symbol miss its deadline regardless).
-func (r *Receiver) holdoffMicros() int64 {
-	if r.cfg.ReorderHoldoffMicros > 0 {
-		return r.cfg.ReorderHoldoffMicros
-	}
-	h := r.reorderHoldUs + r.reorderHoldUs/4
-	if cap := r.cfg.BufferMicros / 2; cap > 0 && h > cap {
-		h = cap
-	}
-	return h
-}
-
-// reseqFeed routes a first-arrival systematic id through the reorder window before the loss
-// estimators. It records the arrival, then drains every id whose verdict has now settled — RECEIVED
-// (it arrived) or LOST (still missing past the holdoff) — feeding observeLoss the received ids in
-// strict increasing order, so the gaps observeLoss infers between them are genuine losses, not reorder.
-func (r *Receiver) reseqFeed(now clock.Timestamp, id uint32, pathID uint8) {
-	if !r.reseqStarted {
-		r.reseqStarted, r.reseqNext, r.reseqHigh = true, id, id
-		r.reseqSeen = make(map[uint32]uint8)
-		r.observeLoss(id, pathID) // the first id is in order by definition
-		r.reseqNext = id + 1
-		return
-	}
-	if id < r.reseqNext {
-		// Arrived after it was already declared lost ⇒ the window was too short for this reorder. Grow
-		// it (a kickstart from zero plus a quarter), capped, so the next such reorder is held long enough.
-		if r.cfg.AutoReorderHoldoff && r.cfg.ReorderHoldoffMicros == 0 {
-			r.reorderHoldUs += r.reorderHoldUs/4 + 2_000
-			if cap := r.cfg.BufferMicros / 2; cap > 0 && r.reorderHoldUs > cap {
-				r.reorderHoldUs = cap
-			}
-		}
-		return // already settled — ignore for the loss estimate
-	}
-	r.reseqSeen[id] = pathID // remember the stamped path so the in-order replay carries the right one
-	if id > r.reseqHigh {
-		r.reseqHigh = id
-	}
-	r.reseqDrain(now)
-}
-
-// reseqDrain settles ids from reseqNext upward: an arrived id is fed to observeLoss in order; a
-// still-missing id with a higher id present is held until the holdoff expires (or the in-flight set
-// would exceed the depth cap), then skipped — the next received id's gap counts it lost. A contiguous
-// lost run shares one gap-open time, so it drains in one holdoff. Called on arrival and on Tick (the
-// holdoff can expire with no new arrival). Each received id is replayed with its OWN stamped pathID.
-func (r *Receiver) reseqDrain(now clock.Timestamp) {
-	if !r.reseqStarted {
-		return
-	}
-	holdoff := r.holdoffMicros()
-	for {
-		if pid, ok := r.reseqSeen[r.reseqNext]; ok {
-			if r.cfg.AutoReorderHoldoff && r.reseqGapAt != 0 { // a held gap that just FILLED — a reorder sample
-				if s := now.Sub(r.reseqGapAt); s > r.reorderHoldUs {
-					r.reorderHoldUs = s // max-hold up to cover the observed spread
-				} else {
-					r.reorderHoldUs -= r.reorderHoldUs / 8 // decay toward the recent spread
-				}
-			}
-			delete(r.reseqSeen, r.reseqNext)
-			r.observeLoss(r.reseqNext, pid)
-			r.reseqNext++
-			r.reseqGapAt = 0
-			continue
-		}
-		if r.reseqHigh > r.reseqNext { // reseqNext is a gap — a higher id has arrived
-			if r.reseqGapAt == 0 {
-				r.reseqGapAt = now
-			}
-			if now.Sub(r.reseqGapAt) >= holdoff || r.reseqHigh-r.reseqNext > maxReorderDepth {
-				if r.cfg.AutoReorderHoldoff {
-					r.reorderHoldUs -= r.reorderHoldUs / 16 // a confirmed loss is not reorder — let the window relax
-				}
-				r.reseqNext++ // lost; the next received id's gap will count it (keep reseqGapAt for the run)
-				continue
-			}
-		}
-		return
-	}
 }
 
 // observeLoss updates the channel-erasure-rate estimate from a first-arrival
@@ -1024,7 +984,14 @@ func (r *Receiver) observeLoss(id uint32, pathID uint8) {
 	if !r.lossBootstrapped && lossWindowMin < win {
 		win = lossWindowMin
 	}
-	span := int(r.lossHighest-r.lossBase) + 1
+	// Censored span: an outage's ids are excluded from the window — channel time
+	// pauses across it — so the reported rate reflects the RECOVERABLE regime the
+	// sizer can actually buy delivery in, AND the window does not close until it has
+	// accumulated a full width of recoverable-regime samples (a raw span check would
+	// let one outage close the window with almost no real samples in it). lossExcl
+	// is 0 unless OutageAware classified runs in this window, making this identical
+	// to the raw-span behavior when the mechanism is off.
+	span := int(r.lossHighest-r.lossBase) + 1 - r.lossExcl
 	if span < win {
 		return
 	}
@@ -1039,7 +1006,7 @@ func (r *Receiver) observeLoss(id uint32, pathID uint8) {
 	} else {
 		r.pHold = hold
 	}
-	r.lossBase, r.lossRecv = r.lossHighest+1, 0
+	r.lossBase, r.lossRecv, r.lossExcl = r.lossHighest+1, 0, 0
 }
 
 // walkGap advances the forward-gap walk for a first-arrival source id: a jump past
@@ -1047,6 +1014,15 @@ func (r *Receiver) observeLoss(id uint32, pathID uint8) {
 // that length. It accumulates the pre-recovery loss count (N1, never decremented on
 // decode) and smooths the mean loss-run length in Q8 (N2). Late/reorder arrivals
 // (id < expectNext) are already accounted and ignored.
+//
+// Two-regime classification: a run beyond the recovery horizon (outageThresholdSyms)
+// is counted as an OUTAGE in telemetry always; with Config.OutageAware it is also
+// CENSORED from the sizing estimators — the burst EWMA skips it and the loss window
+// excludes its span — because no redundancy setting could have recovered its
+// interior (repair for those symbols could only have been emitted inside the outage
+// itself), so folding it in only drives the sizer to spend the maxRepairFactor
+// ceiling on windows it cannot save. The honest congestion counters (WireLost,
+// CongestionLoss) are NEVER censored.
 func (r *Receiver) walkGap(id uint32, pathID uint8) {
 	r.mpCheckPath(id, pathID) // the arrived stamp validates the loss-attribution model (genBaseOf class)
 	if !r.haveExpect {
@@ -1058,25 +1034,8 @@ func (r *Receiver) walkGap(id uint32, pathID uint8) {
 		return
 	}
 	if run := id - r.expectNext; run > 0 {
-		r.stats.WireLost += uint64(run)
-		if cl := uint64(r.clSinceFB) + uint64(run); cl > 0xFFFF {
-			r.clSinceFB = 0xFFFF // saturate; the CC loop integrates deltas
-		} else {
-			r.clSinceFB = uint32(cl)
-		}
-		// EWMA the run length toward the new sample in Q8, in SIGNED arithmetic (the
-		// delta is negative when a short run follows a longer one — unsigned would
-		// underflow and explode). Cap the per-run sample so one long outage can't
-		// dominate the burst estimate (WireLost above still counts the full run).
-		s := int64(run)
-		if s > burstSampleCap {
-			s = burstSampleCap
-		}
-		mb := int64(r.meanBurstQ8) + ((s<<8)-int64(r.meanBurstQ8))>>burstEWMAShift
-		if mb < burstQ8One {
-			mb = burstQ8One
-		}
-		r.meanBurstQ8 = uint32(mb)
+		r.fbDue = true // loss onset: report now (rate-limited), the gap-triggered-NACK reflex
+		r.observeRun(run, r.intervalUs, r.cfg.OutageAware, &r.stats)
 	}
 	r.mpReplayLost(r.expectNext, id) // [expectNext, id) were dropped on the wire
 	r.mpFact(id, true)               // id itself arrived
@@ -1093,8 +1052,18 @@ const coLossMaxReplay = 256
 // (nearly) every id, so it trips within the first handful — long before the estimator primes
 // (coLossWindow slots) — while a few isolated disagreements (a corrupted or spoofed PathID:
 // it rides the cleartext header, outside the AEAD AAD) are tolerated rather than permanently
-// killing co-loss for the flow.
-const mpMaxPathMismatch = 4
+// killing co-loss for the flow. mpMismatchDecayRun clears the accumulated count after that
+// many CONSECUTIVE on-model arrivals: transient off-model debt (a failover catch-up edge)
+// must not add up across a session to a false layout verdict, while a real layout mismatch
+// can never produce a clean run that long. mpRevivalGraceCapIDs caps the post-revival
+// cross-check suspension: the sender's return to on-model placement normally ends it (see
+// mpRevived), but a sender that never resumes must not suspend the layout check forever —
+// the cap covers the report's round trip at live-media rates with a wide margin.
+const (
+	mpMaxPathMismatch    = 4
+	mpMismatchDecayRun   = 64
+	mpRevivalGraceCapIDs = 4096
+)
 
 // mpCheckPath validates the co-loss estimator's deterministic placement model against the
 // sender's PathID stamp on an arrived systematic. The estimator must attribute LOSSES — which
@@ -1111,9 +1080,30 @@ func (r *Receiver) mpCheckPath(id uint32, pathID uint8) {
 	if !r.mpEnabled {
 		return
 	}
-	if uint32(pathID) == id%uint32(r.paths) {
+	if r.deadPaths != 0 {
+		return // failover placement legitimately violates id-mod-paths; not a layout mismatch
+	}
+	onModel := uint32(pathID) == id%uint32(r.paths)
+	if r.mpRevived != 0 && id < r.mpGraceUntil {
+		// Revival catch-up: the sender keeps failover placement until the cleared
+		// report reaches it, so off-model arrivals are expected. The first on-model
+		// systematic ON a revived path proves placement has resumed there.
+		if onModel && r.mpRevived&(uint8(1)<<pathID) != 0 {
+			r.mpRevived &^= uint8(1) << pathID
+		}
 		return
 	}
+	r.mpRevived = 0 // cap passed (or nothing pending): the cross-check is live again
+	if onModel {
+		if r.mpMatchRun++; r.mpMatchRun >= mpMismatchDecayRun {
+			// A clean on-model run retires transient mismatch debt (failover catch-up
+			// stragglers, an isolated corrupted stamp) so it cannot accumulate across
+			// a session into a false layout verdict.
+			r.mpMismatch, r.mpMatchRun = 0, 0
+		}
+		return
+	}
+	r.mpMatchRun = 0
 	r.mpMismatch++
 	if r.mpMismatch >= mpMaxPathMismatch {
 		r.mpEnabled = false // the two ends disagree on the path layout; stop reporting misaligned stats
@@ -1124,9 +1114,15 @@ func (r *Receiver) mpCheckPath(id uint32, pathID uint8) {
 // co-loss estimator: id rides path id mod paths and slot id / paths (the sender's
 // round-robin). It accumulates a slot's per-path losses until all `paths` positions are
 // seen, then folds the slot in. A slot-index discontinuity (a capped replay jump, or
-// reorder) drops the partial slot rather than mis-aligning. No-op single-path.
+// reorder) drops the partial slot rather than mis-aligning. No-op single-path; SUSPENDED
+// while any path is dead (failover placement invalidates the id-mod-paths model — the
+// smoothed stats pause rather than absorb garbage).
 func (r *Receiver) mpFact(id uint32, arrived bool) {
 	if !r.mpEnabled {
+		return
+	}
+	if r.deadPaths != 0 || (r.mpRevived != 0 && id < r.mpGraceUntil) {
+		r.mpHave = 0 // failover (or its revival catch-up): placement is off-model, stats pause
 		return
 	}
 	slot := id / uint32(r.paths)
@@ -1145,8 +1141,53 @@ func (r *Receiver) mpFact(id uint32, arrived bool) {
 	r.mpHave++
 	if r.mpHave == r.paths {
 		r.coEst.observe(r.mpLost)
+		r.notePathSlot(r.mpLost)
 		r.mpHave = 0
 	}
+}
+
+// notePathSlot advances the per-path outage detector from one completed aligned slot:
+// a path that lost while some other path delivered extends its consecutive-loss run; a
+// delivering path resets. A run beyond the per-path threshold marks the path DEAD —
+// unless that would leave no live path (an all-paths outage is the aggregate outage
+// regime, not a failover case). Slots where every path lost extend nothing: they carry
+// no evidence about WHICH path is broken.
+func (r *Receiver) notePathSlot(lost []bool) {
+	someArrived := false
+	for _, l := range lost {
+		if !l {
+			someArrived = true
+			break
+		}
+	}
+	if !someArrived {
+		return
+	}
+	th := r.pathOutageSlotThreshold()
+	for k := range lost {
+		if !lost[k] {
+			r.pathRun[k] = 0
+			continue
+		}
+		r.pathRun[k]++
+		if bit := uint8(1) << k; r.pathRun[k] >= th && r.deadPaths&bit == 0 {
+			if live := r.paths - bits.OnesCount8(r.deadPaths) - 1; live >= 1 {
+				r.deadPaths |= bit
+			}
+		}
+	}
+}
+
+// pathOutageSlotThreshold is the per-path dead verdict in SLOTS: the aggregate
+// recovery-horizon threshold spread over the paths (one slot spans `paths` symbols),
+// floored so estimator noise cannot fail a merely-lossy path over.
+func (r *Receiver) pathOutageSlotThreshold() int {
+	const floorSlots = 8
+	th := int(outageThresholdSyms(r.slackUs, r.intervalUs)) / r.paths
+	if th < floorSlots {
+		th = floorSlots
+	}
+	return th
 }
 
 // mpReplayLost emits a wire-loss fact for each id in [lo, hi), bounded by
@@ -1198,28 +1239,6 @@ func (r *Receiver) genBaseContaining(id uint32) (uint32, bool) {
 		}
 	}
 	return best, found
-}
-
-// updateRef refines the per-symbol deadline fit from one stamped (id, deadline):
-// it anchors on the highest id seen and tracks the inter-symbol interval by EWMA, so
-// deadline(id) can be extrapolated for any id, including one only recovered (never
-// directly received). Stamps for ids at or below the anchor are ignored (stale).
-func (r *Receiver) updateRef(id uint32, dl clock.Timestamp) {
-	if !r.haveRef {
-		r.haveRef, r.refID, r.refDL = true, id, dl
-		return
-	}
-	if id > r.refID {
-		span := int64(id - r.refID)
-		if sample := dl.Sub(r.refDL) / span; sample > 0 {
-			r.intervalUs = r.intervalUs - r.intervalUs/4 + sample/4
-			if r.intervalUs > maxIntervalMicros {
-				r.intervalUs = maxIntervalMicros // bound the extrapolation multiplier (forged stamps)
-			}
-			r.refSamples++
-		}
-		r.refID, r.refDL = id, dl
-	}
 }
 
 // deadlineOf returns id's delivery deadline and whether it is known. A directly-received

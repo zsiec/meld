@@ -548,12 +548,22 @@ func (s *Sender) PathMTUBlackHoles() int {
 // Receiver is the UDP receive host. It binds a local address, runs a
 // flow.Receiver, returns feedback to the peer, and exposes a blocking Read.
 type Receiver struct {
-	sub       Substrate
-	clk       clock.Clock
-	cfg       flow.Config // retained so a re-handshake can rebuild the core for the new session
-	mu        sync.Mutex
-	flow      coreReceiver
-	peer      net.Addr
+	sub  Substrate
+	clk  clock.Clock
+	cfg  flow.Config // retained so a re-handshake can rebuild the core for the new session
+	mu   sync.Mutex
+	flow coreReceiver
+	peer net.Addr
+	// emitQ hands drained delivery batches to deliverCh in DRAIN ORDER without holding
+	// any lock across the blocking channel send: each drainer (recvLoop, tickLoop)
+	// appends its batch under mu — the same critical section that drained the core, so
+	// queue order is drain order — and a single elected emitter flushes the queue FIFO
+	// with NO lock held while it blocks on a slow app. (A dedicated emit mutex held
+	// across the send was tried first: with deliverCh full it froze every mu path
+	// behind the consumer, and deadlocked an app that calls Stats() from its Read
+	// goroutine — mu → emitMu → deliverCh → mu.)
+	emitQ     [][][]byte
+	emitting  bool
 	cs        clockSync // cross-host clock-offset estimate (N4)
 	probeTick int       // tick counter pacing the clock-offset probes
 	deliverCh chan []byte
@@ -854,8 +864,7 @@ func (r *Receiver) feedSymbol(datagram []byte, addr net.Addr, ecn flow.ECN) {
 	}
 	peer := r.peer
 	fbs := r.ctl.sealBatch(drainSend(r.flow))
-	r.mu.Unlock()
-	r.emit(out)
+	r.enqueueEmit(out) // releases mu; delivers in drain order, no lock held across the send
 	r.sendFeedback(fbs, peer)
 }
 
@@ -891,14 +900,40 @@ func (r *Receiver) tickLoop() {
 			if r.probeTick%cookieRotateEvery == 0 {
 				r.rotateCookie()
 			}
-			r.mu.Unlock()
-			r.emit(out)
+			r.enqueueEmit(out) // releases mu; delivers in drain order, no lock held across the send
 			r.sendFeedback(fbs, peer)
 			if probe != nil {
 				_ = writeDatagram(r.sub, probe, peer)
 			}
 		}
 	}
+}
+
+// enqueueEmit queues one drained batch for in-order delivery and, unless another
+// drainer already owns the emitter role, flushes the queue itself. Called with mu
+// HELD; returns with mu released. Exactly one goroutine flushes at a time, FIFO, so
+// delivery order matches drain order; the flusher holds no lock during the blocking
+// sends, so a slow app stalls only delivery — ticks, feedback, and Stats() keep
+// flowing, and the app may safely call Stats() from its Read goroutine.
+func (r *Receiver) enqueueEmit(out [][]byte) {
+	if len(out) > 0 {
+		r.emitQ = append(r.emitQ, out)
+	}
+	if r.emitting || len(r.emitQ) == 0 {
+		r.mu.Unlock()
+		return
+	}
+	r.emitting = true
+	for len(r.emitQ) > 0 {
+		batch := r.emitQ[0]
+		r.emitQ[0] = nil
+		r.emitQ = r.emitQ[1:]
+		r.mu.Unlock()
+		r.emit(batch)
+		r.mu.Lock()
+	}
+	r.emitQ, r.emitting = nil, false
+	r.mu.Unlock()
 }
 
 // emit delivers already-opened chunks to the application (opening happens under the lock

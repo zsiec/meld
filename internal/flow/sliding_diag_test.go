@@ -61,6 +61,7 @@ func slidingClassify(t *testing.T, cfg Config, n int, owd, src, jit int64, seed 
 // or a longer stream moves it — telling us whether genuineLoss is a warmup
 // under-provision and whether premature tracks it.
 func TestSlidingResidualDiag(t *testing.T) {
+	t.Parallel()
 	if testing.Short() {
 		t.Skip("diagnostic; run explicitly")
 	}

@@ -179,6 +179,27 @@ type Config struct {
 	// the overage as delay on media past the deadline. ON by default (DefaultConfig); sender-side
 	// (no both-ends agreement needed). Set false for the unbounded-repair behavior.
 	RepairWithinBudget bool
+	// OutageAware enables two-regime channel control: redundancy is provisioned for the
+	// RECOVERABLE loss regime only. A loss run far beyond the recovery horizon (an outage —
+	// longer than any repair could arrive within the deadline budget) is excluded from the
+	// loss/burst estimates that size repair, and reactive repair that provably cannot land
+	// in time is skipped — so an unrecoverable outage no longer drives the sender to spend
+	// maximum overhead on windows it cannot save, or to keep paying outage-scale overhead
+	// after the channel recovers. Delivery on recoverable loss is unchanged; the honest
+	// wire-loss counters are never censored. Payload-agnostic (no media metadata needed).
+	// ON by default (DefaultConfig); set false for the outage-blind estimators.
+	OutageAware bool
+	// SlidingReactiveShift (EXPERIMENTAL, off by default) enables the sliding profile's
+	// reactive-offload levers: confirmed-clean floor decay, the rounds-gated burst/variance
+	// margin discount, budget-conditional TargetFailure relief, and NACK-bitmap unit
+	// answering (the receiver's missing-ids bitmap answered with instant-closing unit
+	// retransmissions of retained sources; measured to collapse hole release latency
+	// 195-680ms → ~33-92ms in exact-stream replay, though the deep-burst glass cell's
+	// arbitered score is governed by direct-chunk shadow fates it only grazes). The
+	// permutation sweep measured positive means but per-seed breaches in deep-burst
+	// cells; off until a regime where release latency is the margin earns it more.
+	// Sender-side.
+	SlidingReactiveShift bool
 	// Passphrase enables encryption (docs/encryption.md): when non-empty, the Sender and
 	// Receiver run an X25519 + ML-KEM-768 hybrid post-quantum handshake before any media
 	// and AEAD-seal every chunk (encrypt-then-code, forward-secret, authenticated). Both
@@ -260,6 +281,7 @@ func DefaultConfig() Config {
 		RepairWithinBudget: c.RepairWithinBudget, // on by default (flow.DefaultConfig): repair within the rate budget
 		FrameAtomic:        c.FrameAtomic,        // opt-in: all-or-nothing picture delivery
 		AutoReorderHoldoff: c.AutoReorderHoldoff, // on by default (flow.DefaultConfig): self-tuning loss-estimate reorder window
+		OutageAware:        c.OutageAware,        // on by default (flow.DefaultConfig): two-regime outage composure
 	}
 }
 
@@ -290,6 +312,8 @@ func (c Config) toFlow() flow.Config {
 		FrameAtomic:            c.FrameAtomic,
 		ShedTopLayerOverBudget: c.ShedTopLayerOverBudget,
 		RepairWithinBudget:     c.RepairWithinBudget,
+		OutageAware:            c.OutageAware,
+		SlidingReactiveShift:   c.SlidingReactiveShift,
 	}
 }
 
@@ -322,6 +346,12 @@ type FrameDesc struct {
 	RecoveryRefresh bool
 	Discardable     bool
 	NonPicture      bool
+	// LTR marks a long-term-reference candidate the encoder retains in its DPB. The
+	// receiver reports the newest decodable one, and when the reference chain breaks
+	// Meld raises EncoderControl.Resync naming it — so the encoder can resync by
+	// coding its next frame against that LTR (P-frame cost) instead of waiting for
+	// the next scheduled keyframe. Mark sparingly (every few reference frames).
+	LTR bool
 }
 
 func (d FrameDesc) toFlow() flow.FrameDesc {
@@ -329,6 +359,7 @@ func (d FrameDesc) toFlow() flow.FrameDesc {
 		Priority: d.Priority, FrameID: d.FrameID, RefFrameIDs: d.RefFrameIDs,
 		Chunks: d.Chunks, TemporalID: d.TemporalID, RAP: d.RAP,
 		RecoveryRefresh: d.RecoveryRefresh, Discardable: d.Discardable, NonPicture: d.NonPicture,
+		LTR: d.LTR,
 	}
 }
 
@@ -357,6 +388,26 @@ type SenderStats struct {
 	ReactiveRepair        uint64 // the subset sent in response to a feedback rank deficit
 	Throttled             uint64 // repair symbols dropped by the aggregate rate ceiling
 	RecoveryCadenceFrames uint16 // encoder max recovery interval request; 0 means relaxed
+
+	// Per-mechanism attribution of Repair. The five counters below sum to Repair on
+	// the sliding profile (Config.Sliding); on the generation profile they read zero
+	// and Repair/ReactiveRepair carry the only split.
+
+	// RepairProactive counts band repair emitted from the warm proactive credit
+	// (write/flush/idle cadence). Sliding profile only; zero on the generation profile.
+	RepairProactive uint64
+	// RepairProactiveCold counts proactive band repair emitted under the cold-start
+	// floor, before feedback primes the channel estimate. Sliding profile only.
+	RepairProactiveCold uint64
+	// RepairSingleton counts dedicated per-chunk singleton repair for protected
+	// references where reactive repair cannot land in time. Sliding profile only.
+	RepairSingleton uint64
+	// RepairSparse counts sparse protected repair (UEP/anchor groups, scheduled or
+	// feedback-driven). Sliding profile only.
+	RepairSparse uint64
+	// RepairDeficit counts deficit-answering reactive window repair (the
+	// retrospective reactive tier). Sliding profile only.
+	RepairDeficit uint64
 }
 
 // EncoderControl is Meld's advisory source-control output for an attached encoder.
@@ -367,10 +418,21 @@ type EncoderControl struct {
 	// points, in displayed frames. 0 means no active request. Encoders may satisfy
 	// this with keyframes, recovery-point SEI, or intra-refresh.
 	RecoveryCadenceFrames uint16
+	// Resync asks the encoder to code its next frame referencing ResyncRefFrameID — a
+	// frame it marked FrameDesc.LTR that the receiver has confirmed decodable — because
+	// the live reference chain is broken. Honoring it resurrects the stream at P-frame
+	// cost instead of waiting out the GOP for the next keyframe. An encoder that no
+	// longer retains that LTR ignores the request.
+	Resync           bool
+	ResyncRefFrameID uint32
 }
 
 func encoderControlFromFlow(c flow.EncoderControl) EncoderControl {
-	return EncoderControl{RecoveryCadenceFrames: c.RecoveryCadenceFrames}
+	return EncoderControl{
+		RecoveryCadenceFrames: c.RecoveryCadenceFrames,
+		Resync:                c.Resync,
+		ResyncRefFrameID:      c.ResyncRefFrameID,
+	}
 }
 
 // ReceiverStats reports a Receiver's delivery outcomes.
@@ -382,6 +444,21 @@ type ReceiverStats struct {
 	WireLost   uint64 // pre-recovery wire loss (the honest congestion signal; never decremented on decode)
 	Rejected   uint64 // inbound symbols refused by the resource-safety admission cap
 	Evicted    uint64 // source ids dropped early as undecodable (Config.EvictBrokenFrames)
+	// Outages counts loss runs classified as beyond the recovery horizon — so long
+	// that no repair for their interior could have arrived before its deadline, at
+	// any redundancy setting. OutageSymbols is their summed span. Both are telemetry,
+	// counted whether or not Config.OutageAware censors the sizing estimators;
+	// WireLost always counts the full runs.
+	Outages       uint64
+	OutageSymbols uint64
+}
+
+func receiverStatsFromFlow(st flow.ReceiverStats) ReceiverStats {
+	return ReceiverStats{
+		Delivered: st.Delivered, Lost: st.Lost, Recovered: st.Recovered,
+		Duplicates: st.Duplicates, WireLost: st.WireLost, Rejected: st.Rejected, Evicted: st.Evicted,
+		Outages: st.Outages, OutageSymbols: st.OutageSymbols,
+	}
 }
 
 // Check returns advisory warnings about a Config whose options are set in a way that
@@ -476,8 +553,16 @@ func (s *Sender) Flush() { s.s.Flush() }
 
 // Stats returns emission counters.
 func (s *Sender) Stats() SenderStats {
-	st := s.s.Stats()
-	return SenderStats{Source: st.Source, Repair: st.Repair, ReactiveRepair: st.ReactiveRepair, Throttled: st.Throttled, RecoveryCadenceFrames: st.RecoveryCadenceFrames}
+	return senderStatsFromFlow(s.s.Stats())
+}
+
+func senderStatsFromFlow(st flow.SenderStats) SenderStats {
+	return SenderStats{
+		Source: st.Source, Repair: st.Repair, ReactiveRepair: st.ReactiveRepair,
+		Throttled: st.Throttled, RecoveryCadenceFrames: st.RecoveryCadenceFrames,
+		RepairProactive: st.RepairProactive, RepairProactiveCold: st.RepairProactiveCold,
+		RepairSingleton: st.RepairSingleton, RepairSparse: st.RepairSparse, RepairDeficit: st.RepairDeficit,
+	}
 }
 
 // EncoderControl returns Meld's current advisory encoder-control request.
@@ -532,9 +617,7 @@ func (r *Receiver) LocalAddr() string { return r.r.LocalAddr() }
 
 // Stats returns delivery counters.
 func (r *Receiver) Stats() ReceiverStats {
-	st := r.r.Stats()
-	return ReceiverStats{Delivered: st.Delivered, Lost: st.Lost, Recovered: st.Recovered,
-		Duplicates: st.Duplicates, WireLost: st.WireLost, Rejected: st.Rejected, Evicted: st.Evicted}
+	return receiverStatsFromFlow(r.r.Stats())
 }
 
 // FrameStats returns the parse-free media-frame decodability snapshot (populated only
@@ -583,8 +666,7 @@ func (s *MultipathSender) Flush() { s.s.Flush() }
 
 // Stats returns emission counters (aggregate across paths).
 func (s *MultipathSender) Stats() SenderStats {
-	st := s.s.Stats()
-	return SenderStats{Source: st.Source, Repair: st.Repair, ReactiveRepair: st.ReactiveRepair, Throttled: st.Throttled, RecoveryCadenceFrames: st.RecoveryCadenceFrames}
+	return senderStatsFromFlow(s.s.Stats())
 }
 
 // EncoderControl returns Meld's current advisory encoder-control request.
@@ -629,9 +711,7 @@ func (r *MultipathReceiver) LocalAddrs() []string { return r.r.LocalAddrs() }
 
 // Stats returns delivery counters.
 func (r *MultipathReceiver) Stats() ReceiverStats {
-	st := r.r.Stats()
-	return ReceiverStats{Delivered: st.Delivered, Lost: st.Lost, Recovered: st.Recovered,
-		Duplicates: st.Duplicates, WireLost: st.WireLost, Rejected: st.Rejected, Evicted: st.Evicted}
+	return receiverStatsFromFlow(r.r.Stats())
 }
 
 // FrameStats returns the parse-free media-frame decodability snapshot.

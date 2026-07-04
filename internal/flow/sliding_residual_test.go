@@ -18,6 +18,7 @@ import "testing"
 //
 // Which bucket the floor lands in tells us where to fix it.
 func TestSlidingResidual20pctIID(t *testing.T) {
+	t.Parallel()
 	if testing.Short() {
 		t.Skip("slow deterministic sweep; run without -short")
 	}

@@ -92,6 +92,7 @@ func TestGenWidthFillCap(t *testing.T) {
 // overhead is materially LOWER than the fixed-GenSize-16 run at the same loss and full delivery
 // — the bandwidth win the bench predicted, now through the real coder.
 func TestAdaptiveGenSizeFourInvariantsAndOverhead(t *testing.T) {
+	t.Parallel()
 	const (
 		budget   = 200_000 // 200 ms — a generous contribution budget
 		owd      = 20_000  // 40 ms RTT, well under budget

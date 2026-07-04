@@ -56,6 +56,8 @@ The near-term roadmap fields have all landed this way:
 | per-path loss + erasure-count histogram (N5, **N paths**) | Feedback | variable tail section (below) |
 | media damage counters (N6) | Feedback | tail append after the per-path section |
 | frame dependency (`FrameRefs`, WP6) | Symbol | `flagDesc` tail extension (below) |
+| `NewestDecodableLTR` + `BrokenAnchors` (LTR resync) | Feedback | tail append after the media counters |
+| LTR-candidate flag (`descFlags` bit 4, LTR resync) | Symbol | new bit in the existing `flagDesc` extension |
 
 `PathID` (N5) is the one exception that is **not** a tail extension: a path id is a
 structural property of every symbol (single path is just path 0), not an optional
@@ -96,7 +98,8 @@ descriptor** (WP6) is stamped on SYSTEMATIC symbols only and lets the receiver c
 propagation parse-free: `FrameStart` is the access unit's first source id (its identity, and
 with `FrameLen` its exact id range `[FrameStart, FrameStart+FrameLen)`); `descFlags` bit 0 =
 RAP (keyframe), bit 1 = discardable, bit 2 = non-picture metadata/parameter material, bit 3 =
-recovery-refresh;
+recovery-refresh, bit 4 = long-term-reference candidate (the encoder retains this frame; the
+receiver reports the newest decodable one in `NewestDecodableLTR` as the resync anchor);
 `nRefs` (≤ 15) is the number of dependency frames, each a `RefStart` (a referenced frame's first source id). The references are **exact and
 variable-length** — a B-picture carries its two bracketing anchors, a P-picture one — so the
 receiver tracks the dependency tree the shaper resolved (POC bracketing / AV1's reference
@@ -136,6 +139,9 @@ earlier-prefix peer ignores fields it does not know (no version bump).
 | +0 | 2·`nPaths` | `PathLoss[nPaths]` | per-path marginal erasure rates, parts per 65535 (weights the scheduler) |
 | +… | 2·(`nPaths`+1) | `SlotDist[nPaths+1]` | per-slot erasure-COUNT histogram: fraction of aligned N-path slots with exactly *j* of *N* paths erased, parts per 65535 (drives the joint-tail sizer) |
 | next | 16 | media stats | cumulative `Frames`, `DecodableFrames`, `Keyframes`, `DecodableKeyframes` as u32 counters (N6; zero when absent/no descriptors) |
+| next | 6 | LTR resync | `NewestDecodableLTR`(4): FrameStart+1 of the newest decodable LTR-candidate frame (0 = none) · `BrokenAnchors`(2): wrapping count of referenced pictures resolved undecodable at/after it (tail, length-gated) |
+| next | 1 | `DeadPaths` | bitmap of paths in receiver-detected OUTAGE (per-path lost-slot run beyond the recovery horizon while others deliver). The sender fails systematic placement to the live paths and probes dead ones with droppable repair; any arrival on a dead path clears its bit. 0 on single-path flows (tail, length-gated) |
+| next | 8 | `Missing` | NACK bitmap for the stuck neighborhood: bit k = source id `DecodedLowEdge`+k is covered-but-unproducible at the receiver, masked to ids below its decode frontier (an unsent or in-flight id never reads missing). The sender may answer set bits with unit repairs (`WindowBase=id, N=1, RepairKey=0` — the singleton shape), which close at the decoder instantly. 0 = nothing missing or peer predates the field (tail, length-gated) |
 
 The per-path section is **variable** and bound-gated (`nPaths ≤ 8`): a forged count can neither
 over-read nor over-allocate. `SlotDist` is the exact sufficient statistic the correlation-aware
@@ -148,6 +154,12 @@ decode-damaging dependency loss. Combined with `Burstiness`, it drives the advis
 recovery-cadence request (`EncoderControl.RecoveryCadenceFrames`) without introducing separate
 deployable profiles. A sender that cannot influence the encoder simply ignores that actuator and
 keeps the same transport loop.
+
+The LTR-resync tail closes the loop for the second encoder actuator (`EncoderControl.Resync`):
+`BrokenAnchors` deltas tell the sender the reference chain broke (distinct from the media
+counters, whose deltas also count broken disposable leaves that no resync can help), and
+`NewestDecodableLTR` names the safe anchor to resync against. Stragglers behind the safe anchor
+are known-dead history and are never counted, so a completed resync stops re-triggering.
 
 ## The generic media descriptor
 

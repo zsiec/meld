@@ -20,23 +20,65 @@ import (
 // SlidingSender is the band-form transmit half. Same methods as the generation
 // Sender; selected by Config.Sliding.
 type SlidingSender struct {
-	cfg           Config
-	b             int   // configured MAX band (decode-cost cap); the effective span adapts below it
-	interMicros   int64 // EWMA of the inter-write interval (source cadence)
-	enc           *code.Encoder
-	repairKey     uint16
-	credit        float64
-	pEst          float64
-	burstQ8       int // estimated mean loss-run length, Q8 (from feedback; 256 = i.i.d.)
-	fbCount       int // feedback reports received (for the cold-start proactive floor)
-	rttMicros     int64
+	cfg         Config
+	b           int   // configured MAX band (decode-cost cap); the effective span adapts below it
+	interMicros int64 // EWMA of the inter-write interval (source cadence)
+	enc         *code.Encoder
+	repairKey   uint16
+	credit      float64
+	pEst        float64
+	burstQ8     int // estimated mean loss-run length, Q8 (from feedback; 256 = i.i.d.)
+	fbCount     int // feedback reports received (for the cold-start proactive floor)
+	rttMicros   int64
+	// Windowed-min RTT filter state (updateRTT): rttMicros is the min over two
+	// rolling half-windows of samples, NOT an EWMA. The EWMA it replaces ratcheted
+	// under self-induced queueing (samples include the pacer queue and only ever
+	// pushed it up under load): a measured 60 ms path reported 2.9 s mid-flood,
+	// which deadline-clipped the band 64→8, saturated the set-point at the cap, and
+	// sustained the very queue inflating it — a self-locking flood (the holdoff-
+	// excursion root cause). The min filter reports the path's PROPAGATION-scale
+	// RTT — what band sizing and the reactive-cycle math actually need — and is
+	// immune to standing queues by construction; a genuine route/RTT change is
+	// adopted within one full window. Queue-INCLUSIVE delay is a different signal
+	// for a different consumer (a delay-cliff detector); if the sliding profile
+	// grows one it must be tracked separately, never folded back in here.
+	rttMinCur   int64
+	rttMinPrev  int64
+	rttWinStart clock.Timestamp
+	// Repair flood breaker: AIMD cap on the PROACTIVE code rate, driven by wire-
+	// overrun evidence in feedback — the receiver's source-arrival rate falling far
+	// below the offered rate in a way loss cannot explain. Without it a saturated
+	// sizer floods the pacer queue faster than the wire drains, and no estimator
+	// fix alone can recover (the queue outlives every estimation window: the
+	// holdoff-excursion post-mortem). Protective only: media and deficit-driven
+	// retro repair are never throttled. floodCap is the current rate ceiling
+	// (>= maxRepairFactor ⇒ inactive); floodClear counts consecutive clean reports.
+	floodCap      float64
+	floodClear    int
+	lastFBAt      clock.Timestamp
+	lastFBHighest uint32
+	lastFBSource  uint64 // stats.Source at the previous report (the exact offer)
+	arriveRatioQ8 int64  // EWMA of observed/offered source rate, Q8 (256 = keeping up)
 	lastWrite     clock.Timestamp
 	lastRepair    clock.Timestamp
 	lastReactive  clock.Timestamp
 	reactiveBase  uint32
 	reactiveSent  int
+	// wireLossBudget gates retrospective repair on EVIDENCE of wire loss: the
+	// receiver's CongestionLoss field counts pre-recovery loss from the forward-gap
+	// walk — arrivals-based, so symbols merely in flight can never inflate it (the
+	// failure mode of deficit-only gating; a same-cursor-twice "stuck" gate was
+	// built first and never fired at real timing, because per-symbol deadline skips
+	// make the cursor CREEP between reports). Each report's count adds to the
+	// budget; each retro round spends the deficit it addressed. Warmup and clean
+	// links report zero, so the retro tier stays silent there by construction.
+	wireLossBudget int
+	// unitSentAt dedups NACK-bitmap unit repairs: id → last unit emission, so an
+	// in-flight unit is not re-sent on every 10-20 ms report (see answerMissing).
+	unitSentAt    map[uint32]clock.Timestamp
 	deadlines     map[uint32]clock.Timestamp
 	singletons    []pendingSingletonRepair
+	protGroups    map[uint8]*protectedGroup // consolidated center-tier protection (one sparse repair per group)
 	protectedSlot map[uint8][]uint32
 	protected     map[uint32]clock.Timestamp
 	sparseBase    uint32
@@ -48,19 +90,26 @@ type SlidingSender struct {
 	anchorSent    bool
 	curFrameID    uint32
 	haveCurFrame  bool
+	ltrFidByStart map[uint32]uint32 // FrameStart+1 → frame id of FrameDesc.LTR candidates (resync translation)
+	resync        resyncController
+	cleanRun      int // consecutive feedbacks positively reporting zero loss (floor-decay confidence, as in the generation sender)
 	sendQ         [][]byte
 	stats         SenderStats
 	cadence       recoveryCadenceController
 
 	// codeRate memo: the proactive set-point depends only on (effectiveBand, pEst,
-	// burstQ8); recomputing the GE-tail search per source symbol made the controller
-	// O(symbols) instead of O(feedback) and detonated CPU/alloc under bursts. Cache it and
-	// recompute only when an input actually moves.
-	crBand    int
-	crPEst    float64
-	crBurstQ8 int
-	crRate    float64
-	crValid   bool
+	// burstQ8, and — with SlidingReactiveShift — the reactive-rounds credit and the
+	// floor-decay verdict); recomputing the GE-tail search per source symbol made the
+	// controller O(symbols) instead of O(feedback) and detonated CPU/alloc under
+	// bursts. Cache it and recompute only when an input actually moves.
+	crBand     int
+	crPEst     float64
+	crBurstQ8  int
+	crRounds   int
+	crFloorOff bool
+	crRelief   bool
+	crRate     float64
+	crValid    bool
 }
 
 // RateBudgetBitsPerSec returns the send-rate budget the host pacer should release within.
@@ -70,12 +119,14 @@ func (s *SlidingSender) RateBudgetBitsPerSec() int64 { return s.cfg.maxBitrate()
 
 func NewSlidingSender(cfg Config) *SlidingSender {
 	return &SlidingSender{
-		cfg:       cfg,
-		b:         cfg.codingWindow(),
-		enc:       code.NewEncoder(cfg.SymbolSize),
-		rttMicros: defaultRTTMicros,
-		burstQ8:   burstQ8One,
-		deadlines: make(map[uint32]clock.Timestamp),
+		cfg:           cfg,
+		b:             cfg.codingWindow(),
+		enc:           code.NewEncoder(cfg.SymbolSize),
+		rttMicros:     defaultRTTMicros,
+		floodCap:      maxRepairFactor, // breaker inactive until wire-overrun evidence
+		arriveRatioQ8: 256,
+		burstQ8:       burstQ8One,
+		deadlines:     make(map[uint32]clock.Timestamp),
 	}
 }
 
@@ -133,6 +184,7 @@ const (
 type pendingSparseRepair struct {
 	ids       []uint32
 	releaseAt uint32
+	reactive  bool // feedback-driven retry (counts toward ReactiveRepair) vs scheduled group protection
 }
 
 type senderFrameInfo struct {
@@ -208,14 +260,22 @@ func (s *SlidingSender) write(now clock.Timestamp, data []byte, priority uint8, 
 		if !s.haveCurFrame || fd.FrameID != s.curFrameID {
 			s.frameStart[fd.FrameID] = id
 			s.curFrameID, s.haveCurFrame = fd.FrameID, true
+			if fd.LTR {
+				if s.ltrFidByStart == nil {
+					s.ltrFidByStart = make(map[uint32]uint32)
+				}
+				s.ltrFidByStart[id+1] = fd.FrameID // +1: the wire's FrameStart+1 encoding (0 = none)
+			}
 			s.pruneFrameStarts(fd.FrameID)
 		}
+		noteResyncHonored(&s.resync, s.ltrFidByStart, fd)
 		sym.HasFrameDesc = true
 		sym.FrameStart = s.frameStart[fd.FrameID]
 		sym.FrameLen = fd.Chunks
 		sym.FrameRAP, sym.FrameDiscardable = fd.RAP, fd.Discardable
 		sym.FrameRecoveryRefresh = fd.RecoveryRefresh
 		sym.FrameNonPicture = fd.NonPicture
+		sym.FrameLTR = fd.LTR
 		for _, ref := range fd.RefFrameIDs {
 			if rs, ok := s.frameStart[ref]; ok {
 				sym.FrameRefs = append(sym.FrameRefs, rs)
@@ -233,20 +293,38 @@ func (s *SlidingSender) write(now clock.Timestamp, data []byte, priority uint8, 
 	}
 	if s.shouldSingletonProtect(priority, fd) {
 		lane := protectedLaneFor(priority, fd)
-		releaseAt := id + s.protectedRepairGap()
-		if s.cfg.ProtectedRepairPhasing {
-			releaseAt = s.singletonReleaseAt(id, lane)
-		}
 		s.noteProtectedSource(id, dl)
-		s.queueSingletonRepair(id, src, priority, dl, releaseAt, lane)
+		if band := s.effectiveBand(); priority == uepCenterTier && band >= 2*protectedGroupMaxIDs {
+			// Center-tier references consolidate into a per-lane protected GROUP,
+			// released as ONE sparse repair — attribution measured per-chunk
+			// singletons at 60% of ALL repair on the high-rate 1×RTT cell
+			// (PREREG-cost.md Amendment 1). One equation repairs any single loss
+			// among the group; multi-loss neighborhoods lean on the BAND rate,
+			// so consolidation requires a band wide enough to actually carry
+			// that cover (2× the group cap): at a deadline-clipped narrow band
+			// (the sub-RTT frontier, band ≈ 5) the per-chunk singletons are the
+			// only real multi-loss protection and stay (the 0.75×RTT guard
+			// measured 6-69 lost chunks per run without this condition —
+			// PREREG-cost.md Amendment 2).
+			s.appendProtectedGroup(id, lane, band)
+		} else {
+			// Tiers above center (parameter sets, RAP-lane anchors) keep the true
+			// per-chunk singleton: rare, and their per-chunk guarantee is cheap.
+			releaseAt := id + s.protectedRepairGap()
+			if s.cfg.ProtectedRepairPhasing {
+				releaseAt = s.singletonReleaseAt(id, lane)
+			}
+			s.queueSingletonRepair(id, src, priority, dl, releaseAt, lane)
+		}
 	}
 	if frame != nil {
 		s.maybeQueueAnchorClosure(frame, id)
 	}
 	s.flushSingletonRepairs(now, id, false)
+	s.flushProtectedGroups(id, false)
 	s.flushSparseRepairs(now, id, false)
 	for s.credit += s.codeRate(); s.credit >= 1; s.credit-- {
-		s.emitRepair(now, false)
+		s.emitRepair(now)
 	}
 }
 
@@ -270,6 +348,11 @@ func (s *SlidingSender) pruneFrameStarts(cur uint32) {
 	for fid := range s.frameStart {
 		if fid+senderFrameWindow < cur {
 			delete(s.frameStart, fid)
+		}
+	}
+	for start, fid := range s.ltrFidByStart {
+		if fid+senderFrameWindow < cur {
+			delete(s.ltrFidByStart, start)
 		}
 	}
 }
@@ -318,6 +401,9 @@ func (s *SlidingSender) maybeQueueAnchorClosure(fi *senderFrameInfo, highest uin
 	if s.cfg.MaxBitrate > 0 || s.cfg.Redundancy > referenceBoostMaxRedundancy {
 		return
 	}
+	if s.extrasReplaceableByReactive() {
+		return // retro-reactive reaches a broken anchor closure on demand
+	}
 	gap := s.protectedRepairGap()
 	if fi.start < gap {
 		return
@@ -352,9 +438,9 @@ func (s *SlidingSender) maybeQueueAnchorClosure(fi *senderFrameInfo, highest uin
 			if s.cfg.ProtectedRepairPhasing {
 				phase := protectedRepairPhaseSpacing(gap)
 				target := releaseAt + uint32(i)*phase
-				s.queueSparseRepair(ids, s.scheduleProtectedRelease(highest, target, protectedLaneRAP))
+				s.queueSparseRepair(ids, s.scheduleProtectedRelease(highest, target, protectedLaneRAP), false)
 			} else {
-				s.queueSparseRepair(ids, releaseAt)
+				s.queueSparseRepair(ids, releaseAt, false)
 			}
 		}
 	}
@@ -430,10 +516,102 @@ func (s *SlidingSender) Flush(now clock.Timestamp) {
 		r = floor
 	}
 	for ; r > 0; r-- {
-		s.emitRepair(now, false)
+		s.emitRepair(now)
 	}
 	s.flushSingletonRepairs(now, 0, true)
+	s.flushProtectedGroups(0, true)
 	s.flushSparseRepairs(now, 0, true)
+}
+
+// protectedGroupMaxIDs caps how many center-tier references one consolidated
+// sparse repair covers. One equation repairs any ONE loss among the group; the
+// cap (fixed in PREREG-cost.md before results) bounds the multi-loss exposure a
+// group shares, and the span cap below keeps the equation inside the receiver's
+// band. 12 ids ≈ one twelfth of the former per-chunk singleton mass.
+const protectedGroupMaxIDs = 12
+
+// protectedGroup accumulates center-tier protected chunk ids for consolidated
+// sparse release (per lane, so RAP-adjacent and base references phase apart).
+type protectedGroup struct {
+	ids       []uint32
+	releaseAt uint32
+}
+
+// appendProtectedGroup adds a center-tier protected chunk to its lane's open
+// group. A group that hits the id cap, or whose span would exceed half the
+// effective band (the sparse-repair reach), is SEALED — queued into the shared
+// sparse-release schedule at the phased releaseAt derived from its FIRST id, the
+// same source-separation the per-chunk singleton machinery used — and a fresh
+// group opens with the incoming id. Burst decorrelation is therefore preserved:
+// the equation never travels adjacent to the chunks it protects.
+func (s *SlidingSender) appendProtectedGroup(id uint32, lane uint8, band int) {
+	if s.protGroups == nil {
+		s.protGroups = make(map[uint8]*protectedGroup, 2)
+	}
+	g := s.protGroups[lane]
+	if g != nil && len(g.ids) > 0 {
+		spanCap := uint32(band / 2)
+		if spanCap < 2 {
+			spanCap = 2
+		}
+		if len(g.ids) >= protectedGroupMaxIDs || id-g.ids[0] >= spanCap {
+			s.sealProtectedGroup(lane)
+			g = nil
+		}
+	}
+	if g == nil {
+		releaseAt := id + s.protectedRepairGap()
+		if s.cfg.ProtectedRepairPhasing {
+			releaseAt = s.scheduleProtectedRelease(id, releaseAt, lane)
+		}
+		g = &protectedGroup{releaseAt: releaseAt, ids: make([]uint32, 0, protectedGroupMaxIDs)}
+		s.protGroups[lane] = g
+	}
+	g.ids = append(g.ids, id)
+}
+
+// flushProtectedGroups seals any open group whose scheduled release point the
+// write frontier has passed (or every group, on force); the shared sparse
+// schedule then emits it — this write for an already-due releaseAt.
+func (s *SlidingSender) flushProtectedGroups(highest uint32, force bool) {
+	for lane, g := range s.protGroups {
+		if g == nil || len(g.ids) == 0 {
+			continue
+		}
+		if force || highest >= g.releaseAt {
+			s.sealProtectedGroup(lane)
+		}
+	}
+}
+
+// sealProtectedGroup moves the lane's open group into the sparse-release queue
+// (scheduled, non-reactive) and closes it.
+func (s *SlidingSender) sealProtectedGroup(lane uint8) {
+	g := s.protGroups[lane]
+	if g == nil || len(g.ids) == 0 {
+		return
+	}
+	s.queueSparseRepair(g.ids, g.releaseAt, false)
+	delete(s.protGroups, lane)
+}
+
+// pruneProtectedGroups drops open-group members the receiver has already
+// delivered (below the feedback low edge); an emptied group is discarded.
+func (s *SlidingSender) pruneProtectedGroups(before uint32) {
+	for lane, g := range s.protGroups {
+		if g == nil {
+			continue
+		}
+		ids := g.ids[:0]
+		for _, id := range g.ids {
+			if id >= before {
+				ids = append(ids, id)
+			}
+		}
+		if g.ids = ids; len(g.ids) == 0 {
+			delete(s.protGroups, lane)
+		}
+	}
 }
 
 func (s *SlidingSender) queueSingletonRepair(id uint32, src []byte, priority uint8, deadline clock.Timestamp, releaseAt uint32, lane uint8) {
@@ -689,6 +867,20 @@ func (s *SlidingSender) emitSingletonRepair(now clock.Timestamp, p pendingSingle
 	s.emit(wire.Symbol{Flow: s.cfg.Flow, Kind: wire.Repair, WindowBase: p.id, SrcIndex: 0, N: uint16(n), RepairKey: 0, Priority: p.priority, Deadline: int64(p.deadline), SendTimestamp: int64(now), Payload: pay})
 	s.lastRepair = now
 	s.stats.Repair++
+	s.stats.RepairSingleton++
+}
+
+// reactiveReachable reports whether one honest reactive cycle fits the deadline
+// budget — the gate for the retrospective repair tier itself.
+func (s *SlidingSender) reactiveReachable() bool {
+	return s.cfg.BufferMicros > 0 && reactiveCycleMicros(s.rttMicros) <= s.cfg.BufferMicros
+}
+
+// extrasReplaceableByReactive is the shared capability predicate (extrasReplaceable)
+// with the sliding profile's cold-start stand-in: a band-length burst.
+func (s *SlidingSender) extrasReplaceableByReactive() bool {
+	return extrasReplaceable(s.cfg.BufferMicros, s.rttMicros, s.interMicros,
+		int64(s.effectiveBand()), s.fbCount, s.burstQ8)
 }
 
 func (s *SlidingSender) shouldSingletonProtect(priority uint8, fd *FrameDesc) bool {
@@ -698,10 +890,11 @@ func (s *SlidingSender) shouldSingletonProtect(priority uint8, fd *FrameDesc) bo
 	if fd != nil && fd.RecoveryRefresh {
 		return false
 	}
-	if priority > uepCenterTier {
-		return true
-	}
-	return fd != nil && priority == uepCenterTier && !fd.Discardable && !fd.RAP
+	protectable := priority > uepCenterTier ||
+		(fd != nil && priority == uepCenterTier && !fd.Discardable && !fd.RAP)
+	// The capability predicate runs last: most chunks fail the cheap tier gates above,
+	// and this is the per-write hot path.
+	return protectable && !s.extrasReplaceableByReactive()
 }
 
 func (s *SlidingSender) noteProtectedSource(id uint32, deadline clock.Timestamp) {
@@ -739,13 +932,14 @@ func (s *SlidingSender) protectedIDsIn(base uint32, width int) []uint32 {
 	return ids
 }
 
-func (s *SlidingSender) queueSparseRepair(ids []uint32, releaseAt uint32) {
+func (s *SlidingSender) queueSparseRepair(ids []uint32, releaseAt uint32, reactive bool) {
 	if len(ids) == 0 {
 		return
 	}
 	s.sparsePend = append(s.sparsePend, pendingSparseRepair{
 		ids:       append([]uint32(nil), ids...),
 		releaseAt: releaseAt,
+		reactive:  reactive,
 	})
 }
 
@@ -756,7 +950,7 @@ func (s *SlidingSender) flushSparseRepairs(now clock.Timestamp, highest uint32, 
 	keep := s.sparsePend[:0]
 	for _, p := range s.sparsePend {
 		if force || highest >= p.releaseAt {
-			s.emitSparseRepair(now, p.ids, true)
+			s.emitSparseRepair(now, p.ids, p.reactive)
 			continue
 		}
 		keep = append(keep, p)
@@ -803,11 +997,24 @@ func (s *SlidingSender) FeedFeedback(now clock.Timestamp, fb wire.Feedback) {
 	}
 	s.fbCount++
 	s.updateRTT(now, fb)
+	s.updateFloodBreaker(now, fb)
 	s.pEst = float64(fb.LossRate) / 65535
+	// Floor-decay confidence (see floorDecayed): count consecutive feedbacks that
+	// POSITIVELY report a clean link; snap to zero on the first loss observation.
+	// Keyed on the report, never on signal absence — a black hole or warmup delivers
+	// no feedback at all, so cleanRun stays 0 and the full floor is retained.
+	if fb.LossRate == 0 {
+		if s.cleanRun < cleanFloorConfirm {
+			s.cleanRun++
+		}
+	} else {
+		s.cleanRun = 0
+	}
 	if s.burstQ8 = int(fb.Burstiness); s.burstQ8 < burstQ8One {
 		s.burstQ8 = burstQ8One // mean loss-run length for the burst-aware sizer (N2)
 	}
 	s.cadence.observeFeedback(fb)
+	s.resync.observe(now, fb.BrokenAnchors, fb.NewestDecodableLTR, resyncHoldMicros(s.cfg.BufferMicros, s.rttMicros))
 	if fb.DecodedLowEdge > s.enc.Base() {
 		for id := s.enc.Base(); id < fb.DecodedLowEdge; id++ {
 			delete(s.deadlines, id)
@@ -815,20 +1022,128 @@ func (s *SlidingSender) FeedFeedback(now clock.Timestamp, fb wire.Feedback) {
 		s.enc.SlideTo(fb.DecodedLowEdge)
 		s.pruneSenderFrames(fb.DecodedLowEdge)
 		s.pruneProtected(fb.DecodedLowEdge)
+		s.pruneProtectedGroups(fb.DecodedLowEdge)
 		s.pruneSparseRepairs(fb.DecodedLowEdge)
 		s.reactiveBase, s.reactiveSent = 0, 0
 		s.sparseBase, s.sparseSent = 0, 0
 	}
+	if cl := int(fb.CongestionLoss); cl > 0 {
+		// Arm the retro-reactive tier with the reported pre-recovery wire loss,
+		// capped so a long outage cannot bank an unbounded repair debt. ARQ-mode
+		// raises the cap: the retro tier is the only burst recovery there.
+		capX := wireLossBudgetCap
+		if s.deltaReliefOn() {
+			capX = wireLossBudgetCapARQ
+		}
+		if s.wireLossBudget += cl; s.wireLossBudget > capX*s.effectiveBand() {
+			s.wireLossBudget = capX * s.effectiveBand()
+		}
+	}
 	if fb.Deficit > 0 {
 		s.reactiveSparseProtected(now, fb, int(fb.Deficit))
-		s.reactive(now, int(fb.Deficit))
 	}
+	answered := s.answerMissing(now, fb)
+	// The coded retro tier covers only the deficit BEYOND the unit-answered bits
+	// (its windows still span the same neighborhood, so residual overlap is fine
+	// and both spend from the shared wireLossBudget evidence).
+	if residual := int(fb.Deficit) - answered; residual > 0 {
+		s.reactive(now, fb.DecodedLowEdge, residual)
+	}
+}
+
+// answerMissing answers the receiver's stuck-neighborhood NACK bitmap
+// (wire.Feedback.Missing) with UNIT repairs — base=id, n=1, the retained source
+// itself — and reports how many it sent. A unit vector closes at the decoder the
+// moment it arrives: it is the only response type exempt from the coupled-span
+// closure delay the burst autopsy measured (rank arrives at need-rate; VALUES wait
+// on full-rank closure of pepper-coupled spans, 195-680 ms on the ge48 glass
+// cell). Gates: the reactive-capability cycle (units past the deadline are waste),
+// the shared wire-loss evidence budget, a per-id dedup within one honest cycle
+// (a unit in flight is not re-sent on every report), retention clipping, and the
+// provably-dead deadline arithmetic. An old peer never sets Missing → dormant.
+//
+// OPT-IN (SlidingReactiveShift), by measurement (2026-07-04): on the ge48@2.5×RTT
+// glass hole the units fire (156-410/run, all forwarded) and DO collapse hole
+// release latency exactly as predicted — 195-680 ms → 33/72/92 ms q25/50/75 in
+// exact-stream replay, hole on-time recovery up, never-recovered down — but the
+// ARBITERED delivery total is a WASH (16.4 vs 15.7% median, 16 paired seeds),
+// because the cell's score is governed by the DIRECT chunks queued behind each
+// stall, whose ~50-120 ms survival boundary the collapsed stalls only graze.
+// Mechanism validated, cell bar not met → the answering stays in the
+// experimental reactive bundle until a regime where release latency is the
+// margin (real paths, tighter budgets) earns it the default.
+func (s *SlidingSender) answerMissing(now clock.Timestamp, fb wire.Feedback) int {
+	if !s.cfg.SlidingReactiveShift {
+		return 0
+	}
+	if fb.Missing == 0 || !s.reactiveReachable() || s.wireLossBudget <= 0 {
+		return 0
+	}
+	if s.unitSentAt == nil {
+		s.unitSentAt = make(map[uint32]clock.Timestamp)
+	}
+	for id := range s.unitSentAt {
+		if id < fb.DecodedLowEdge {
+			delete(s.unitSentAt, id) // delivered or dead history; keep the map bounded
+		}
+	}
+	cycle := reactiveCycleMicros(s.rttMicros)
+	handled := 0 // sent now + still in flight: everything the coded residual need not cover
+	for k := 0; k < 64 && s.wireLossBudget > 0; k++ {
+		if fb.Missing&(1<<k) == 0 {
+			continue
+		}
+		id := fb.DecodedLowEdge + uint32(k)
+		if at, ok := s.unitSentAt[id]; ok && now.Sub(at) < cycle {
+			handled++ // a unit for this id is still in flight
+			continue
+		}
+		if !s.emitUnitRepair(now, id) {
+			continue // outside retention, or provably past its deadline
+		}
+		s.unitSentAt[id] = now
+		s.wireLossBudget--
+		handled++
+	}
+	return handled
+}
+
+// emitUnitRepair retransmits one retained source id as a unit repair — the exact
+// singleton wire shape (Kind=Repair, WindowBase=id, N=1, RepairKey=0) with the
+// payload built by a one-symbol encoder, so it carries the key-0 COEFFICIENT-
+// multiplied bytes the decoder expects (a raw-source payload decodes to garbage:
+// GenCoeffs(0,1)[0] != 1).
+func (s *SlidingSender) emitUnitRepair(now clock.Timestamp, id uint32) bool {
+	src, ok := s.enc.Source(id)
+	if !ok {
+		return false // slid out of retention
+	}
+	dl, ok := s.deadlines[id]
+	if !ok {
+		dl = now.Add(s.cfg.BufferMicros)
+	}
+	if s.cfg.OutageAware && now.Add(s.rttMicros/2).After(dl) {
+		s.stats.DeadReactiveSkips++
+		return false // provably cannot arrive in time
+	}
+	cp := make([]byte, len(src))
+	copy(cp, src)
+	enc := code.NewEncoderAt(s.cfg.SymbolSize, id)
+	enc.Add(cp)
+	_, n, pay := enc.Repair(0)
+	s.emit(wire.Symbol{Flow: s.cfg.Flow, Kind: wire.Repair, WindowBase: id, SrcIndex: 0, N: uint16(n),
+		RepairKey: 0, Deadline: int64(dl), SendTimestamp: int64(now), Payload: pay})
+	s.lastRepair = now
+	s.stats.Repair++
+	s.stats.ReactiveRepair++
+	s.stats.RepairDeficit++
+	return true
 }
 
 // Tick idle-flushes a band-repair when no source has arrived for a while.
 func (s *SlidingSender) Tick(now clock.Timestamp) {
 	if s.enc.Len() > 0 && now.Sub(s.lastWrite) >= flushIdleMicros && now.Sub(s.lastRepair) >= flushIdleMicros {
-		s.emitRepair(now, false)
+		s.emitRepair(now)
 	}
 }
 
@@ -850,7 +1165,9 @@ func (s *SlidingSender) Stats() SenderStats {
 }
 
 // EncoderControl returns the current advisory source-control request for an attached encoder.
-func (s *SlidingSender) EncoderControl() EncoderControl { return s.cadence.encoderControl() }
+func (s *SlidingSender) EncoderControl() EncoderControl {
+	return withResync(s.cadence.encoderControl(), &s.resync, s.ltrFidByStart)
+}
 
 func (s *SlidingSender) codeRate() float64 {
 	b := s.effectiveBand()
@@ -870,42 +1187,198 @@ func (s *SlidingSender) codeRate() float64 {
 	if cold && p < coldStartP {
 		p = coldStartP
 	}
-	// The set-point depends only on (effectiveBand, p, burstQ8) — delta is constant —
-	// so return the memo when none has moved. pEst/burstQ8 change only on feedback and the
-	// band only as the source cadence / RTT drift, so the expensive GE-tail search runs once
-	// per change instead of once per source symbol (the per-symbol cadence was the sliding
-	// profile's CPU/alloc pathology). The cached value is byte-identical to recomputing it.
-	// The cold-start window bypasses the memo (it is brief and p is being floored).
-	if !cold && s.crValid && b == s.crBand && p == s.crPEst && s.burstQ8 == s.crBurstQ8 {
+	// The set-point depends only on (effectiveBand, p, burstQ8) — plus, with
+	// SlidingReactiveShift, the reactive-rounds credit and the floor-decay verdict — delta
+	// is constant — so return the memo when none has moved. These change only on
+	// feedback / slow RTT drift, so the expensive GE-tail search runs once per change
+	// instead of once per source symbol (the per-symbol cadence was the sliding
+	// profile's CPU/alloc pathology). The cached value is byte-identical to
+	// recomputing it. The cold-start window bypasses the memo (it is brief and p is
+	// being floored).
+	rounds := 0
+	if s.cfg.SlidingReactiveShift {
+		rounds = reactiveRoundsFrom(s.cfg.BufferMicros, s.rttMicros)
+	}
+	floorOff := s.floorDecayed(rounds)
+	relief := s.deltaReliefOn()
+	if !cold && s.crValid && b == s.crBand && p == s.crPEst && s.burstQ8 == s.crBurstQ8 &&
+		rounds == s.crRounds && floorOff == s.crFloorOff && relief == s.crRelief {
+		if s.crRate > s.floodCap {
+			return s.floodCap // the breaker cap varies per feedback, outside the memo key
+		}
 		return s.crRate
 	}
 	delta := s.cfg.targetFailure()
+	if relief {
+		// Budget-conditional δ relief (SlidingReactiveShift): a real-timing glassbench cell
+		// (ge48 10%, 2.5×RTT ≈ 1.76 honest cycles) measured the δ=1e-3 GE set-point
+		// FLOODING — 182% overhead and a 10% delivery median, against 151% and 66%
+		// at δ=1e-2 — because just below the outage-censoring horizon the burst term
+		// sizes for a tail the wire cannot afford, and the flood's queueing costs
+		// more than the protection buys. Where the budget affords ≥1.5 honest
+		// reactive cycles the retro tier carries the tail instead, so δ loosens one
+		// decade toward the validated 1e-2 (never past it, and never gated at the
+		// frontier: at 1.06 cycles the same knob measured a ~1pp delivery COST, so
+		// the boundary sits between — see deltaReliefOn). Proactive sizing only;
+		// reactive deficit sizing keeps the base δ.
+		if delta *= deltaReliefFactor; delta > deltaReliefCap {
+			delta = deltaReliefCap
+		}
+	}
 	r := repairForTarget(b, p, delta, maxRepairFactor)
 	if ge := repairForGE(b, int(p*1e6), s.burstQ8, delta, maxRepairFactor); ge > r {
-		r = ge // burst-aware set-point (N2): size for the GE tail on a bursty channel
+		// Burst-aware set-point (N2): size for the GE tail on a bursty channel.
+		// NOTE (two-regime control): a saturation fallback — hold the recoverable
+		// set-point when the GE tail cannot reach δ at any affordable count — was
+		// built and REJECTED by the glassbench burst48 gate: at the bench's tiny
+		// per-window horizon (deadline-clipped band ≈ 8, ~57 pkt/s) it cut repair
+		// 49% but cost ~35 ffprobe frames — the "unreachable-δ" blanket overhead is
+		// in fact the only edge protection when nearly every burst spans the window.
+		// Numbers in docs/decisions/2026-07-02-outage-composure.md; do not re-add
+		// without a horizon-deep bench cell.
+		//
+		// The SlidingReactiveShift margin discount below is a DIFFERENT mechanism from that
+		// rejected fallback: it shrinks the margin only in proportion to measured
+		// reactive capability (rounds = budget over the honest cycle), so at the tiny
+		// horizons that killed the fallback rounds is 0 and the full GE margin is
+		// carried unchanged — the guard is structural, not estimated.
+		switch {
+		case relief:
+			// ARQ-mode (SlidingReactiveShift at >= 1.5 honest cycles): the burst
+			// tail belongs ENTIRELY to the retro-reactive tier — proactive carries
+			// only the i.i.d. set-point at the relieved δ. The real-timing
+			// head-to-head motivated this: at ge48/2.5×RTT the GE-sized flood
+			// delivered a 9% median while ARQ transports calmly retransmitted the
+			// actual 10% loss for ~92%; the coded analog of that behavior is a lean
+			// proactive layer plus deficit-driven retrospective repair with raised
+			// caps (see reactive/retroMaxWindowsARQ). The flood breaker backstops
+			// the transition regimes.
+		case s.cfg.SlidingReactiveShift && rounds >= reactiveFloorSafe:
+			// Two-margin offload port (generation repairCountFor): the BURST margin
+			// shrinks by 1/(rounds+1); the VARIANCE margin sheds only on a
+			// memoryless channel (roundsEff → 0 as the mean run length grows).
+			// Engages only at rounds >= reactiveFloorSafe — a single-round credit
+			// measured a -51 pp per-seed collapse in a mid-budget GE cell.
+			burstMargin := ge - r
+			r += burstMargin / (rounds + 1)
+			if roundsEff := rounds * burstQ8One / s.burstQ8; roundsEff > 0 {
+				mean := meanRepairCount(b, p)
+				if varMargin := r - burstMargin/(rounds+1) - mean; varMargin > 0 {
+					r = mean + varMargin/(roundsEff+1) + burstMargin/(rounds+1)
+				}
+			}
+		default:
+			r = ge
+		}
+	} else if s.cfg.SlidingReactiveShift && rounds >= reactiveFloorSafe {
+		if roundsEff := rounds * burstQ8One / s.burstQ8; roundsEff > 0 {
+			mean := meanRepairCount(b, p)
+			if varMargin := r - mean; varMargin > 0 {
+				r = mean + varMargin/(roundsEff+1)
+			}
+		}
 	}
 	rate := float64(r) / float64(b)
-	if rate < s.cfg.Redundancy {
+	if rate < s.cfg.Redundancy && !floorOff {
 		rate = s.cfg.Redundancy
 	}
 	if !cold {
-		s.crBand, s.crPEst, s.crBurstQ8, s.crRate, s.crValid = b, p, s.burstQ8, rate, true
+		s.crBand, s.crPEst, s.crBurstQ8, s.crRounds, s.crFloorOff, s.crRelief, s.crRate, s.crValid =
+			b, p, s.burstQ8, rounds, floorOff, relief, rate, true
+	}
+	if rate > s.floodCap {
+		rate = s.floodCap // wire-overrun breaker: see updateFloodBreaker
 	}
 	return rate
 }
 
-func (s *SlidingSender) reactive(now clock.Timestamp, deficit int) {
+// deltaReliefFactor/deltaReliefCap: the δ relief loosens the PROACTIVE target one
+// decade, capped at the real-timing-validated 1e-2 (a base δ already at/past the
+// cap gets no relief). deltaReliefMinCyclesX2 is the qualifying budget in HALF
+// honest cycles: 3 (=1.5 cycles) sits between the validated win at 1.76 cycles and
+// the measured mild loss at 1.06 cycles.
+const (
+	deltaReliefFactor      = 10
+	deltaReliefCap         = 1e-2
+	deltaReliefMinCyclesX2 = 3
+)
+
+// deltaReliefOn reports whether the budget-conditional δ relief qualifies: gated on
+// SlidingReactiveShift (it is a reactive-offload lever), a base δ below the cap, and a
+// budget of at least 1.5 honest reactive cycles at the current RTT estimate.
+func (s *SlidingSender) deltaReliefOn() bool {
+	if !s.cfg.SlidingReactiveShift || s.cfg.targetFailure() >= deltaReliefCap {
+		return false
+	}
+	cycle := reactiveCycleMicros(s.rttMicros)
+	return cycle > 0 && 2*s.cfg.BufferMicros >= deltaReliefMinCyclesX2*cycle
+}
+
+// floorDecayed is the sliding port of the generation sender's effectiveFloor rule
+// (gated on SlidingReactiveShift): drop the static Redundancy floor only when the link is
+// CONFIRMED clean (cleanFloorConfirm consecutive feedbacks positively reporting zero
+// loss — never mere signal absence: warmup and black holes keep the full floor) AND
+// the retro-reactive tier can run at least reactiveFloorSafe rounds inside the
+// budget, so a loss onset is caught reactively with margin. On a confirmed-clean,
+// reactive-capable link the floor recovers nothing — it is pure overhead the ARQ
+// competitors do not pay.
+func (s *SlidingSender) floorDecayed(rounds int) bool {
+	return s.cfg.SlidingReactiveShift && s.cleanRun >= cleanFloorConfirm && rounds >= reactiveFloorSafe
+}
+
+// reactive answers a feedback deficit with coded repair over the STUCK window at
+// the delivery cursor (fb.DecodedLowEdge) — retrospective repair. The former
+// trailing-band form could not, structurally, fix a burst at any budget: by the
+// time feedback reports the holes (cadence + RTT), new source has slid the band
+// hundreds of symbols past them, so trailing repair carried no innovation for the
+// stuck window and the deadline eviction was the only exit (the measured low-rate
+// burst48 deficit vs SRT). The encoder retains everything the receiver has not
+// acknowledged (SlideTo(DecodedLowEdge)), so RepairAt can cover exactly the window
+// the cursor is stuck on; the band decoder folds already-delivered columns via its
+// recent map and rejects what it cannot use.
+// retroMaxWindows bounds one retro round's span: up to this many band-strided
+// repair windows from the stuck cursor. The whole reported deficit must be
+// addressed in ONE round when possible — the per-symbol deadline wavefront moves
+// at the source rate, so a hole deferred to a second round is usually a hole lost.
+const retroMaxWindows = 4
+
+// retroMaxWindowsARQ is the retro span cap in ARQ-mode (SlidingReactiveShift at a
+// >= 1.5-cycle budget): with the proactive burst margin shed entirely, the retro
+// tier is the ONLY burst recovery, so it must be allowed to cover a whole deep
+// burst in one round. wireLossBudgetCapARQ raises the evidence-budget cap in step.
+const (
+	retroMaxWindowsARQ   = 12
+	wireLossBudgetCap    = 8
+	wireLossBudgetCapARQ = 24
+)
+
+func (s *SlidingSender) reactive(now clock.Timestamp, cursor uint32, deficit int) {
 	if s.enc.Len() == 0 {
 		return
 	}
 	band := s.effectiveBand()
-	if deficit > band {
-		deficit = band
+	if deficit <= 0 || s.wireLossBudget <= 0 {
+		return // no deficit, or no wire-loss evidence backing it (in-flight transit)
 	}
-	if deficit <= 0 {
+	if !s.reactiveReachable() {
+		// Sub-cycle budget (the frontier regime): a retro repair emitted NOW arrives
+		// after the stuck window's deadline wavefront by construction — pure waste
+		// (measured: ~120 dead symbols per burst at a 1xRTT budget). Proactive margins
+		// and the singleton/anchor extras own this regime; they stay on exactly here.
 		return
 	}
-	interval := s.rttMicros
+	// Debounce successive rounds by half the honest cycle: long enough that a new
+	// round is sized against a deficit the previous round has visibly shrunk, short
+	// enough that a residual round can still fit the deadline wavefront.
+	// NOTE (one-round retro, REFUTED 2026-07-04): replacing this debounce with
+	// in-flight innovation accounting (answer every report's deficit delta
+	// immediately) was built and measured a WASH on the ge48@2.5×RTT glass hole
+	// (median 14.6→14.4%, 16 paired seeds, overhead unchanged) — the stall is not
+	// sender response latency; on unbounded loopback there is no queue delaying the
+	// response either. The hole's binder is receiver/stream-structural (which
+	// equations complete the hole's rank, and when) — measure rank-growth-vs-time
+	// in the trace-replay harness before the next attempt.
+	interval := reactiveCycleMicros(s.rttMicros) / 2
 	if interval < minReactiveIntervalMicros {
 		interval = minReactiveIntervalMicros
 	} else if interval > maxReactiveIntervalMicros {
@@ -914,34 +1387,103 @@ func (s *SlidingSender) reactive(now clock.Timestamp, deficit int) {
 	if s.lastReactive != 0 && now.Sub(s.lastReactive) < interval {
 		return
 	}
-	s.lastReactive = now
-	// Size the batch to the loss the in-flight window actually experienced, not the global
-	// EWMA (which reports 0 through warmup and lags a burst). Over a band of b source symbols
-	// protected at the current code rate, being `deficit` short implies ≈ (b·rate + deficit) of
-	// the b·(1+rate) sent were lost — an accurate, lag-free per-window erasure rate.
-	p := s.pEst
-	if b := float64(band); b > 0 {
-		proactive := b * s.codeRate()
-		if pGen := (proactive + float64(deficit)) / (b + proactive); pGen > p {
-			p = pGen
-		}
+	// The repair span: band-strided windows anchored at the stuck cursor (clipped to
+	// retention), covering the WHOLE reported deficit up to the caps.
+	base := cursor
+	if encBase := s.enc.Base(); base < encBase {
+		base = encBase
 	}
-	extra := symbolsForDeficit(deficit, p, s.cfg.targetFailure(), maxRepairFactor)
-	base, width := s.repairWindowBase(band)
 	if s.reactiveBase != base {
 		s.reactiveBase, s.reactiveSent = base, 0
 	}
-	limit := maxRepairFactor*width - s.reactiveSent
+	maxWin := retroMaxWindows
+	if s.deltaReliefOn() {
+		maxWin = retroMaxWindowsARQ // ARQ-mode: the retro tier owns the burst tail
+	}
+	span := deficit
+	if cap := maxWin * band; span > cap {
+		span = cap
+	}
+	limit := maxRepairFactor*span - s.reactiveSent
 	if limit <= 0 {
-		return
+		return // this stuck window has had its fill; the deadline decides the rest
 	}
-	if extra > limit {
-		extra = limit
+	// Size against the loss the stuck span actually experienced, not the global EWMA
+	// (which reports 0 through warmup and lags a burst): being `deficit` short of a
+	// span protected at the current code rate implies ≈ (span·rate + deficit) of the
+	// span·(1+rate) sent were lost — a lag-free estimate.
+	p := s.pEst
+	if sp := float64(span); sp > 0 {
+		proactive := sp * s.codeRate()
+		if pGen := (proactive + float64(deficit)) / (sp + proactive); pGen > p {
+			p = pGen
+		}
 	}
-	for i := extra; i > 0; i-- {
-		s.emitRepair(now, true)
+	// NOTE (narrow-window retro, REFUTED 2026-07-04): marching the retro windows at
+	// width 16 instead of the band — the closure-law candidate after the burst
+	// autopsy showed values emerge only at full-rank closure of coupled spans —
+	// measured a WASH on the ge48@2.5×RTT glass hole (median 14.2 vs 15.7%, 16
+	// paired seeds, guards/overhead unchanged), as did the one-round debounce
+	// removal before it. The retro tier is ~9% of repair volume at that cell and is
+	// not the release vector; the hole's binder sits in the proactive stream's
+	// closure dynamics + in-order amplification. Next candidate with a straight
+	// causal line: feedback carrying a which-ids bitmap for the stuck neighborhood
+	// so the sender can answer with unit repairs (true retransmissions — base=id,
+	// n=1 — which close instantly); needs a wire-tail extension and its own arc.
+	sent, remaining := 0, deficit
+	for w := 0; w < maxWin && remaining > 0 && sent < limit; w++ {
+		wBase := base + uint32(w*band)
+		wDef := remaining
+		if wDef > band {
+			wDef = band
+		}
+		batch := symbolsForDeficit(wDef, p, s.cfg.targetFailure(), maxRepairFactor)
+		if batch > limit-sent {
+			batch = limit - sent
+		}
+		emitted := 0
+		for i := batch; i > 0; i-- {
+			if !s.emitRepairAt(now, wBase, band) {
+				break // past retention: nothing left to cover
+			}
+			emitted++
+		}
+		if emitted == 0 {
+			break
+		}
+		sent += emitted
+		remaining -= wDef
 	}
-	s.reactiveSent += extra
+	if sent == 0 {
+		return // limit-blocked or past retention: do NOT burn the debounce slot
+	}
+	s.lastReactive = now
+	s.reactiveSent += sent
+	if s.wireLossBudget -= deficit - remaining; s.wireLossBudget < 0 {
+		s.wireLossBudget = 0 // addressed holes are spent; fresh wire loss re-arms
+	}
+}
+
+// emitRepairAt emits one retrospective repair over the retained window [at, at+n),
+// stamped with the deadline of the window's LAST symbol (the horizon until which
+// this repair can still matter). Reports whether a repair was actually emitted.
+func (s *SlidingSender) emitRepairAt(now clock.Timestamp, at uint32, n int) bool {
+	key := s.repairKey
+	base, nn, pay := s.enc.RepairAt(key, at, n)
+	if nn == 0 {
+		return false
+	}
+	s.repairKey++
+	dl, ok := s.deadlines[base+uint32(nn)-1]
+	if !ok {
+		dl = now.Add(s.cfg.BufferMicros)
+	}
+	s.emit(wire.Symbol{Flow: s.cfg.Flow, Kind: wire.Repair, WindowBase: base, SrcIndex: uint32(key), N: uint16(nn), RepairKey: key, Deadline: int64(dl), SendTimestamp: int64(now), Payload: pay})
+	s.lastRepair = now
+	s.stats.Repair++
+	s.stats.ReactiveRepair++
+	s.stats.RepairDeficit++
+	return true
 }
 
 func (s *SlidingSender) reactiveSparseProtected(now clock.Timestamp, fb wire.Feedback, deficit int) {
@@ -951,6 +1493,14 @@ func (s *SlidingSender) reactiveSparseProtected(now clock.Timestamp, fb wire.Fee
 	if fb.LossRate == 0 {
 		return
 	}
+	// NOTE (two-regime control): a provably-dead gate here — skip when now + rtt/2
+	// is past the newest protected deadline — was built and REVERTED: the sliding
+	// rttMicros estimate inflates under queueing, and the glassbench high-rate iid
+	// 1×RTT guard showed the gate starving UEP reference repair near deadlines
+	// (466.8±26.5 ff vs 480±0 with it removed) for a negligible byte saving. The
+	// generation reactive keeps its gate (validated harmless by the flow sweep):
+	// its per-generation deadline is the window's LATEST symbol, a conservative
+	// bound, and its reactive volume is the cost that matters.
 	band := s.effectiveBand()
 	trailingBase, _ := s.repairWindowBase(band)
 	base := fb.DecodedLowEdge
@@ -990,9 +1540,68 @@ func (s *SlidingSender) reactiveSparseProtected(now clock.Timestamp, fb wire.Fee
 				if s.cfg.ProtectedRepairPhasing {
 					target = s.scheduleProtectedRelease(hi, target, protectedLaneBase)
 				}
-				s.queueSparseRepair(ids, target)
+				s.queueSparseRepair(ids, target, true)
 				s.sparseSent++
 			}
+		}
+	}
+}
+
+// rttMinHalfWindowMicros is the min filter's half-window: two halves roll so a
+// valid minimum always spans 1.5-3 s of samples. Long enough that a transient
+// self-flood (which drains once the band stops clipping) cannot poison the
+// estimate; short enough that a genuine route change is adopted within ~3 s.
+const rttMinHalfWindowMicros = 1_500_000
+
+// Flood-breaker constants: the trigger threshold is scaled by (1−pEst) so honest
+// heavy loss (arrivals below offer BECAUSE the wire dropped them) never trips it —
+// only the wire-overrun signature (arrivals far below what loss explains) does.
+const (
+	floodTriggerQ8    = 218  // 0.85 in Q8: trigger when arrivals < 0.85×(1−pEst)×offered
+	floodTriggerMinQ8 = 128  // …but never above-trigger below half the offer (deep-loss floor)
+	floodCapMin       = 0.25 // the cap never starves protection entirely
+	floodClearReports = 3    // consecutive clean reports before the cap relaxes
+)
+
+// updateFloodBreaker folds one feedback report into the wire-overrun breaker: the
+// receiver's source-arrival rate (ΔHighestSeen/Δt) against the offered source rate
+// (1/interMicros), EWMA'd in Q8. Sustained arrivals far below what the reported
+// loss explains mean the sender itself is overrunning the wire — the pacer queue
+// grows without bound, every latency estimate poisons, and delivery collapses (the
+// excursion post-mortem). The response is AIMD on the PROACTIVE rate cap only.
+func (s *SlidingSender) updateFloodBreaker(now clock.Timestamp, fb wire.Feedback) {
+	defer func() { s.lastFBAt, s.lastFBHighest, s.lastFBSource = now, fb.HighestSeen, s.stats.Source }()
+	if s.lastFBAt == 0 || fb.HighestSeen <= s.lastFBHighest {
+		return
+	}
+	offered := s.stats.Source - s.lastFBSource // exact source symbols offered since the last report
+	if offered == 0 {
+		return
+	}
+	arrived := int64(fb.HighestSeen-s.lastFBHighest) * 256 / int64(offered) // Q8 ratio vs offer
+	if arrived > 512 {
+		arrived = 512 // in-flight skew can transiently exceed the window's offer; clamp
+	}
+	s.arriveRatioQ8 += (arrived - s.arriveRatioQ8) / 4
+	thresh := int64(float64(floodTriggerQ8) * (1 - s.pEst))
+	if thresh < floodTriggerMinQ8 {
+		thresh = floodTriggerMinQ8
+	}
+	if s.arriveRatioQ8 < thresh {
+		s.floodClear = 0
+		if cap := s.floodCap * 0.7; cap >= floodCapMin {
+			s.floodCap = cap
+		} else {
+			s.floodCap = floodCapMin
+		}
+		return
+	}
+	if s.floodCap >= maxRepairFactor {
+		return // inactive
+	}
+	if s.floodClear++; s.floodClear >= floodClearReports {
+		if s.floodCap *= 1.25; s.floodCap > maxRepairFactor {
+			s.floodCap = maxRepairFactor
 		}
 	}
 }
@@ -1001,14 +1610,29 @@ func (s *SlidingSender) updateRTT(now clock.Timestamp, fb wire.Feedback) {
 	if fb.HighestSeen == 0 {
 		return
 	}
-	if dl, ok := s.deadlines[fb.HighestSeen-1]; ok {
-		if sample := now.Sub(dl.Add(-s.cfg.BufferMicros)); sample > 0 {
-			s.rttMicros = s.rttMicros - s.rttMicros/8 + sample/8
-		}
+	dl, ok := s.deadlines[fb.HighestSeen-1]
+	if !ok {
+		return
+	}
+	sample := now.Sub(dl.Add(-s.cfg.BufferMicros))
+	if sample <= 0 {
+		return
+	}
+	if s.rttWinStart == 0 {
+		s.rttWinStart, s.rttMinCur, s.rttMinPrev = now, sample, sample
+	} else if now.Sub(s.rttWinStart) > rttMinHalfWindowMicros {
+		s.rttMinPrev, s.rttMinCur, s.rttWinStart = s.rttMinCur, sample, now
+	} else if sample < s.rttMinCur {
+		s.rttMinCur = sample
+	}
+	if s.rttMicros = s.rttMinCur; s.rttMinPrev < s.rttMicros {
+		s.rttMicros = s.rttMinPrev
 	}
 }
 
-func (s *SlidingSender) emitRepair(now clock.Timestamp, reactive bool) {
+// emitRepair emits one proactive trailing-band repair (deficit-answering reactive
+// repair goes through emitRepairAt, which does its own attribution).
+func (s *SlidingSender) emitRepair(now clock.Timestamp) {
 	if s.enc.Len() == 0 {
 		return
 	}
@@ -1019,8 +1643,10 @@ func (s *SlidingSender) emitRepair(now clock.Timestamp, reactive bool) {
 	s.emit(wire.Symbol{Flow: s.cfg.Flow, Kind: wire.Repair, WindowBase: base, SrcIndex: uint32(key), N: uint16(n), RepairKey: key, Deadline: int64(dl), SendTimestamp: int64(now), Payload: pay})
 	s.lastRepair = now
 	s.stats.Repair++
-	if reactive {
-		s.stats.ReactiveRepair++
+	if s.fbCount < coldStartFeedbacks {
+		s.stats.RepairProactiveCold++
+	} else {
+		s.stats.RepairProactive++
 	}
 }
 
@@ -1042,6 +1668,7 @@ func (s *SlidingSender) emitSparseRepair(now clock.Timestamp, ids []uint32, reac
 	s.emit(wire.Symbol{Flow: s.cfg.Flow, Kind: wire.SparseRepair, SrcIndex: uint32(key), N: uint16(len(copiedIDs)), RepairKey: key, SparseIDs: copiedIDs, Priority: uepCenterTier + 1, Deadline: int64(dl), SendTimestamp: int64(now), Payload: pay})
 	s.lastRepair = now
 	s.stats.Repair++
+	s.stats.RepairSparse++
 	if reactive {
 		s.stats.ReactiveRepair++
 	}
@@ -1061,9 +1688,17 @@ type SlidingReceiver struct {
 	lateDrops  uint64
 	lastFB     clock.Timestamp
 	fedOnce    bool
+	fbDue      bool // loss-onset event: emit feedback now (rate-limited), don't wait the cadence
 	deliverQ   []deliveredSym
 	sendQ      [][]byte
 	stats      ReceiverStats
+
+	// Reorder window for the loss estimate (lossrun.go); see the generation receiver.
+	// fastExpect is the UNDELAYED walk's cursor (fastLossWalk): honest counters and
+	// loss-onset events fire on raw arrival order; estimators settle behind the window.
+	reorder        reorderWindow
+	fastHaveExpect bool
+	fastExpect     uint32
 
 	// Per-symbol deadline. Each directly-received id carries its own stamped deadline (write
 	// time + budget); the receiver delivers/evicts by THAT, so an access unit written as one
@@ -1071,13 +1706,9 @@ type SlidingReceiver struct {
 	// uniform-spacing fit it violates (the clean-link premature-drop cliff). Pruned as the
 	// cursor advances past each id.
 	symDL map[uint32]clock.Timestamp
-	// Deadline extrapolation, used ONLY for never-directly-received (recovered/missing) ids:
-	// fit deadline(id) = refDL + (id-refID)*intervalUs from stamped (id, deadline) pairs.
-	haveRef    bool
-	refID      uint32
-	refDL      clock.Timestamp
-	intervalUs int64
-	refSamples int
+	// Deadline extrapolation (lossrun.go), used ONLY for never-directly-received
+	// (recovered/missing) ids: fit deadline(id) = refDL + (id-refID)*intervalUs.
+	deadlineFit
 
 	// Channel-erasure-rate estimator.
 	lossStarted bool
@@ -1087,11 +1718,13 @@ type SlidingReceiver struct {
 	pEWMA       float64
 	pHold       float64
 
-	// Forward-gap walk for the mean loss-run length (N2 burst-aware sizing); mirrors
-	// the generation receiver.
-	haveExpect  bool
-	expectNext  uint32
-	meanBurstQ8 uint32
+	// Forward-gap walk for the mean loss-run length (N2 burst-aware sizing) and the
+	// pre-recovery wire-loss count (N1 — the honest congestion signal, never
+	// decremented on decode; it also arms the retro-reactive tier). Shares the
+	// generation receiver's loss-run machinery (lossrun.go).
+	haveExpect bool
+	expectNext uint32
+	lossRunObserver
 
 	frames      map[uint32]*frameInfo
 	frameStarts []uint32
@@ -1099,17 +1732,36 @@ type SlidingReceiver struct {
 	haveCur     bool
 	idDelivered map[uint32]bool
 	fstats      FrameStats
+
+	// LTR resync feedback state (lossrun.go).
+	ltrResyncState
 }
 
 func NewSlidingReceiver(cfg Config) *SlidingReceiver {
-	return &SlidingReceiver{
-		cfg:         cfg,
-		dec:         code.NewBandDecoder(cfg.SymbolSize, cfg.codingWindow(), slidingMaxWin),
-		directRecv:  make(map[uint32]bool),
-		symDL:       make(map[uint32]clock.Timestamp),
-		intervalUs:  1,
-		meanBurstQ8: burstQ8One,
+	r := &SlidingReceiver{
+		cfg:             cfg,
+		dec:             code.NewBandDecoder(cfg.SymbolSize, cfg.codingWindow(), slidingMaxWin),
+		directRecv:      make(map[uint32]bool),
+		symDL:           make(map[uint32]clock.Timestamp),
+		deadlineFit:     deadlineFit{intervalUs: 1},
+		lossRunObserver: lossRunObserver{meanBurstQ8: burstQ8One},
 	}
+	// REFUTED for default-on (permutation sweep, 2026-07-03): wiring the reorder
+	// window to AutoReorderHoldoff on the SLIDING profile destabilized every paced
+	// lossy cell (proactive repair ~3x to the ceiling, p99 x3-5, delivery -6 to
+	// -12 pp vs the un-windowed walk, same seeds) through a mid-run estimator
+	// excursion the diagnostics did not fully isolate (final pEst LOWER yet the
+	// sizer flooding; suspicion: the censored loss window freezing against
+	// queueing-delayed settles). The generation profile keeps its cref-validated
+	// holdoff. Until the sliding interaction is explained and re-validated, the
+	// window engages here only on an EXPLICIT ReorderHoldoffMicros (experimental);
+	// the lateSink credit (a late-settled arrival still counts RECEIVED for the
+	// rate window) guards the known queueing-runaway mode when it is enabled.
+	r.reorder = reorderWindow{cfgHoldoff: cfg.ReorderHoldoffMicros, auto: false,
+		budget:   cfg.BufferMicros,
+		sink:     func(id uint32, _ uint8) { r.observeLoss(id) },
+		lateSink: func(id uint32, _ uint8) { r.observeLossWindow(id) }}
+	return r
 }
 
 // FeedSymbolECN absorbs one inbound symbol with its IP ECN codepoint. The sliding profile
@@ -1144,8 +1796,24 @@ func (r *SlidingReceiver) FeedSymbol(now clock.Timestamp, datagram []byte) {
 		// Count the network arrival for the erasure estimate independent of the
 		// deadline/cursor — a symbol received late was not dropped by the channel, so
 		// counting it as loss would inflate the redundancy controller (see the
-		// generation receiver). Each id's systematic arrives once.
-		r.observeLoss(id)
+		// generation receiver). Each id's systematic arrives once. The reorder window
+		// (lossrun.go) resequences the estimate's input, so reordered-late arrivals
+		// are counted received rather than as fictitious loss — without it, real
+		// timing jitter kept LossRate nonzero on CLEAN links, permanently blocking
+		// the floor decay and inflating pEst-driven repair (the pathology the
+		// generation receiver's holdoff was built for; the sliding profile simply
+		// never got the port).
+		if r.reorder.enabled() {
+			// Split walk: the honest counters (WireLost/CongestionLoss) and the
+			// loss-onset event fire IMMEDIATELY on the raw arrival order — they arm
+			// the retro-reactive tier and detection must not wait out the holdoff
+			// (delaying them measurably collapsed lossy delivery). The sizing
+			// estimators settle behind the reorder window via the resequenced sink.
+			r.fastLossWalk(id)
+			r.reorder.feed(now, id, 0)
+		} else {
+			r.observeLoss(id)
+		}
 		if sym.HasFrameDesc {
 			r.noteFrame(sym)
 		}
@@ -1156,6 +1824,7 @@ func (r *SlidingReceiver) FeedSymbol(now clock.Timestamp, datagram []byte) {
 			r.symDL[id] = dl // gate this id by its own true deadline, not the uniform-spacing fit
 		}
 		r.updateRef(id, dl)
+		r.observeSlack(now, dl)
 		r.dec.AddSystematic(id, sym.Payload)
 	case wire.Repair:
 		n := int(sym.N)
@@ -1203,6 +1872,9 @@ func (r *SlidingReceiver) admit(coverID uint32) bool {
 
 // Tick advances time, enforcing deadline skips and periodic feedback.
 func (r *SlidingReceiver) Tick(now clock.Timestamp) {
+	if r.reorder.enabled() {
+		r.reorder.drain(now) // settle losses whose holdoff expired without a new arrival
+	}
 	r.pump(now)
 	r.maybeFeedback(now)
 }
@@ -1284,13 +1956,18 @@ func (r *SlidingReceiver) drainDeliver(now clock.Timestamp) {
 		if !ok {
 			return
 		}
-		// Late-drop only a DIRECTLY-RECEIVED symbol whose OWN stamped deadline (symDL) passed
-		// while it waited behind an earlier gap. A RECOVERED id has no stamp — only the noisy
-		// uniform-spacing extrapolation, whose error grows with the distance from the reference id
-		// — so late-dropping it on that estimate evicts symbols the decoder surfaced within their
-		// true deadline (the residual sliding premature-drop gap). pump already advances the cursor
-		// past a genuinely-overdue gap before it is ever recovered, bounding recovered-id lateness,
-		// so deliver what the decoder surfaces here rather than re-judging it against the fit.
+		// Late-drop a DIRECTLY-RECEIVED symbol whose OWN stamped deadline (symDL) passed
+		// while it waited behind an earlier gap. A RECOVERED id has no stamp — only the
+		// extrapolated fit — and the old policy delivered it unconditionally on the
+		// claim that pump bounds recovered-id lateness; the config fuzzer FALSIFIED
+		// that bound (post-outage retro recovery delivered whole stale windows up to
+		// ~3× the budget late — dead-on-arrival data pushed at the app). A recovered
+		// id is now dropped when it is PROVABLY long-expired, by either witness:
+		// (a) the monotone stamp bound — deadlines never decrease in id, so an id at
+		// or below refID whose refDL has passed is expired by an EXACT stamp — or
+		// (b) the fit says it expired more than a generous grace ago (the grace
+		// absorbs fit error so the premature-drop guarantee stands; budget/8 within
+		// [10 ms, 25 ms]).
 		if r.cfg.EvictBrokenFrames && r.frameDoomed(rec.ID) {
 			r.evictAt(rec.ID)
 			continue
@@ -1301,6 +1978,20 @@ func (r *SlidingReceiver) drainDeliver(now clock.Timestamp) {
 			delete(r.directRecv, rec.ID)
 			delete(r.symDL, rec.ID)
 			continue
+		}
+		if _, direct := r.symDL[rec.ID]; !direct && !r.directRecv[rec.ID] {
+			expired := r.haveRef && rec.ID <= r.refID && now.After(r.refDL)
+			if !expired {
+				if dl, ok := r.deadline(rec.ID); ok && now.Sub(dl) > r.lateRecoveryGraceMicros() {
+					expired = true
+				}
+			}
+			if expired {
+				r.lateDrops++
+				r.attributeFrame(rec.ID, true)
+				delete(r.directRecv, rec.ID)
+				continue
+			}
 		}
 		r.attributeFrame(rec.ID, false)
 		r.deliverQ = append(r.deliverQ, deliveredSym{rec.ID, append([]byte(nil), rec.Data...)})
@@ -1324,10 +2015,14 @@ func (r *SlidingReceiver) deadlineOf(id uint32) (clock.Timestamp, bool) {
 }
 
 func (r *SlidingReceiver) maybeFeedback(now clock.Timestamp) {
-	if r.fedOnce && now.Sub(r.lastFB) < feedbackIntervalMicros {
-		return
+	if r.fedOnce {
+		since := now.Sub(r.lastFB)
+		if since < feedbackIntervalMicros && !(r.fbDue && since >= eventFeedbackMinMicros) {
+			return // not yet due: neither the cadence nor a rate-limited loss-onset event
+		}
 	}
 	r.fedOnce = true
+	r.fbDue = false
 	r.lastFB = now
 	def := r.dec.Deficit()
 	if def > 0xFFFF {
@@ -1341,29 +2036,35 @@ func (r *SlidingReceiver) maybeFeedback(now clock.Timestamp) {
 		Deficit:            uint16(def),
 		LossRate:           uint16(r.lossEstimate() * 65535),
 		Burstiness:         uint16(r.meanBurstQ8),
+		CongestionLoss:     uint16(r.clSinceFB), // pre-recovery loss this interval (N1)
 		Frames:             frames,
 		DecodableFrames:    decFrames,
 		Keyframes:          keys,
 		DecodableKeyframes: decKeys,
+		NewestDecodableLTR: r.newestDecLTR,
+		BrokenAnchors:      r.brokenAnchors,
+		// The stuck-neighborhood NACK bitmap: which of the 64 ids above the cursor
+		// are missing (covered-but-unproducible). The sender answers set bits with
+		// unit repairs — the closure-law-exempt response (see wire.Feedback.Missing).
+		Missing: r.dec.MissingIn(r.dec.Cursor()),
 	}))
+	r.clSinceFB = 0 // per-interval; consumers integrate the reported deltas
+	// No open-deficit latch — loss onset only (see the generation receiver's doc).
 }
 
-func (r *SlidingReceiver) updateRef(id uint32, dl clock.Timestamp) {
-	if !r.haveRef {
-		r.haveRef, r.refID, r.refDL = true, id, dl
-		return
+// lateRecoveryGraceMicros is the fit-error allowance before a recovered id is
+// dropped as expired: generous against the slope fit's measured error (a few ms)
+// so the no-premature-drop guarantee stands, tight enough to bound the stale-
+// delivery leak to the same order as the generation profile's residual.
+func (r *SlidingReceiver) lateRecoveryGraceMicros() int64 {
+	g := r.cfg.BufferMicros / 8
+	if g < 10_000 {
+		g = 10_000
 	}
-	if id > r.refID {
-		span := int64(id - r.refID)
-		if sample := dl.Sub(r.refDL) / span; sample > 0 {
-			r.intervalUs = r.intervalUs - r.intervalUs/4 + sample/4
-			if r.intervalUs > maxIntervalMicros {
-				r.intervalUs = maxIntervalMicros // bound the extrapolation multiplier (forged stamps)
-			}
-			r.refSamples++
-		}
-		r.refID, r.refDL = id, dl
+	if g > 25_000 {
+		g = 25_000
 	}
+	return g
 }
 
 func (r *SlidingReceiver) deadline(id uint32) (clock.Timestamp, bool) {
@@ -1389,7 +2090,7 @@ func (r *SlidingReceiver) noteFrame(sym wire.Symbol) {
 	}
 	r.frames[sym.FrameStart] = &frameInfo{
 		refs: sym.FrameRefs, length: sym.FrameLen, rap: sym.FrameRAP,
-		nonPic: sym.FrameNonPicture,
+		nonPic: sym.FrameNonPicture, disc: sym.FrameDiscardable, ltr: sym.FrameLTR,
 	}
 	i := sort.Search(len(r.frameStarts), func(i int) bool { return r.frameStarts[i] >= sym.FrameStart })
 	r.frameStarts = append(r.frameStarts, 0)
@@ -1466,6 +2167,7 @@ func (r *SlidingReceiver) resolveFrame(start uint32) {
 			}
 		}
 	}
+	r.noteResolvedLTR(start, fi, dec)
 	if len(r.frames) > frameMapCap {
 		r.pruneFrames(start)
 	}
@@ -1525,26 +2227,54 @@ func (r *SlidingReceiver) pruneFrames(cur uint32) {
 	r.frameStarts = kept
 }
 
+// fastLossWalk is the UNDELAYED forward-gap walk run on raw arrival order when the
+// reorder window is active: it fires the loss-onset event and the honest counters
+// the moment a gap appears (detection latency — CongestionLoss arms the retro
+// tier), accepting that reorder briefly overcounts them (saturating integrators;
+// consumers difference deltas). The sizing estimators are fed only by the
+// resequenced walk (observeLoss), where reorder has been settled out.
+func (r *SlidingReceiver) fastLossWalk(id uint32) {
+	if !r.fastHaveExpect {
+		r.fastHaveExpect, r.fastExpect = true, id+1
+		return
+	}
+	if id < r.fastExpect {
+		return
+	}
+	if run := id - r.fastExpect; run > 0 {
+		r.fbDue = true // loss onset: report now (rate-limited), the gap-triggered-NACK reflex
+		r.countRun(run, &r.stats)
+	}
+	r.fastExpect = id + 1
+}
+
 func (r *SlidingReceiver) observeLoss(id uint32) {
 	// Forward-gap walk: a first-arrival id past the expected one is a loss run of that
-	// length; smooth the mean run length in Q8 (signed EWMA, per-run-capped) for the
-	// burst-aware sizer (N2). Mirrors the generation receiver's walkGap.
+	// length, folded into the shared loss-run machinery (lossrun.go). With the reorder
+	// window active this walk sees the RESEQUENCED order and feeds only the sizing
+	// estimators; the honest counters and the loss-onset event already fired on the
+	// raw walk (fastLossWalk).
 	if !r.haveExpect {
 		r.haveExpect, r.expectNext = true, id+1
 	} else if id >= r.expectNext {
 		if run := id - r.expectNext; run > 0 {
-			s := int64(run)
-			if s > burstSampleCap {
-				s = burstSampleCap
+			if r.reorder.enabled() {
+				r.observeRunEstimates(run, r.intervalUs, r.cfg.OutageAware, &r.stats)
+			} else {
+				r.fbDue = true // loss onset: report now (rate-limited), the gap-triggered-NACK reflex
+				r.observeRun(run, r.intervalUs, r.cfg.OutageAware, &r.stats)
 			}
-			mb := int64(r.meanBurstQ8) + ((s<<8)-int64(r.meanBurstQ8))>>burstEWMAShift
-			if mb < burstQ8One {
-				mb = burstQ8One
-			}
-			r.meanBurstQ8 = uint32(mb)
 		}
 		r.expectNext = id + 1
 	}
+	r.observeLossWindow(id)
+}
+
+// observeLossWindow credits one received id to the loss-rate window (the pEst
+// estimate). Split from the gap walk so the reorder window's lateSink can credit
+// an arrival that settled lost in the walk — it still arrived, and dropping it
+// from the rate fed the queueing runaway (see reorderWindow.lateSink).
+func (r *SlidingReceiver) observeLossWindow(id uint32) {
 	if !r.lossStarted {
 		r.lossStarted, r.lossBase, r.lossHighest, r.lossRecv = true, id, id, 1
 		return
@@ -1562,8 +2292,10 @@ func (r *SlidingReceiver) observeLoss(id uint32) {
 	// the whole warmup before pEst can rise, the deciles-0/1 residual the live trace
 	// pinned (pEst=0 until ~write 512 at band 256). A 64-id sample already resolves the
 	// channel loss rate to ~1.6%, so widening it buys nothing but priming latency.
+	// The span is CENSORED like the generation receiver's: outage ids are excluded so
+	// the window neither closes on outage time nor reports outage loss as channel rate.
 	win := lossWindowMin
-	span := int(r.lossHighest-r.lossBase) + 1
+	span := int(r.lossHighest-r.lossBase) + 1 - r.lossExcl
 	if span < win {
 		return
 	}
@@ -1577,7 +2309,7 @@ func (r *SlidingReceiver) observeLoss(id uint32) {
 	} else {
 		r.pHold = hold
 	}
-	r.lossBase, r.lossRecv = r.lossHighest+1, 0
+	r.lossBase, r.lossRecv, r.lossExcl = r.lossHighest+1, 0, 0
 }
 
 func (r *SlidingReceiver) lossEstimate() float64 {

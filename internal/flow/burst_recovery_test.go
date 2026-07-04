@@ -39,6 +39,7 @@ func geDrop(seed int64, meanLoss, meanBurst float64) func(wire.Symbol) bool {
 // in dropped frames. This mirrors the txbench -ge sweep where meld holds ~100% while overhead
 // climbs 119→156→173%.
 func TestBurstRecoveryGenerationHolds(t *testing.T) {
+	t.Parallel()
 	const (
 		budget   = 200_000
 		meanLoss = 0.10
@@ -79,6 +80,7 @@ func TestBurstRecoveryGenerationHolds(t *testing.T) {
 // asserts only a loose delivery floor (the coder must not collapse), logging the curve so the
 // degradation — the gap to close — is visible and tracked rather than silent.
 func TestBurstRecoverySlidingDegradation(t *testing.T) {
+	t.Parallel()
 	const (
 		budget   = 200_000
 		meanLoss = 0.10

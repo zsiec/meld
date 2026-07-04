@@ -258,6 +258,39 @@ type Config struct {
 	// inert where the budget is ample and a graceful-degradation win where it binds, never hurts.
 	// Sender-side policy (the two ends need not match). Set false for the unbounded-repair behavior.
 	RepairWithinBudget bool
+	// OutageAware enables two-regime channel control: provision redundancy for the
+	// RECOVERABLE regime only, and compose through outages instead of chasing them.
+	// A repair symbol is useful only if emitted before its window's deadline minus the
+	// one-way delay (the recovery horizon); a loss run far beyond that horizon has a
+	// provably dead interior that NO redundancy recovers, so folding it into the
+	// erasure/burst estimators makes the sizer spend outage-scale overhead (up to the
+	// maxRepairFactor ceiling) on windows it cannot save — and that flood contends with
+	// healthy media at the pacer for many windows after the channel has recovered.
+	// With this on: (1) the receiver classifies a loss run longer than
+	// outageCensorKappa×horizon as an OUTAGE — excluded from the loss-rate window and
+	// the burst-length EWMA that size repair (channel time "pauses"), counted in
+	// separate outage telemetry; the honest congestion counters (WireLost,
+	// CongestionLoss) are NEVER censored. (2) The generation sender skips reactive
+	// repair that provably cannot arrive in time (now + OWD past the window deadline).
+	// Receiver- and sender-side policy; the two ends may differ. ON by default
+	// (DefaultConfig) — validated tie-or-better across the flow sweep and the
+	// glassbench grid at both packet-rate scales, and strictly better in outage
+	// regimes at high rate: composure through the outage prevents the poisoned-
+	// estimator repair flood from evicting healthy post-outage media (+36.5 ffprobe
+	// frames at 14% fewer wire bytes and 3.5x lower seed variance in the burst400
+	// gate; docs/decisions). Set false for the outage-blind estimators.
+	OutageAware bool
+	// SlidingReactiveShift (EXPERIMENTAL, off by default) enables the sliding
+	// profile's reactive-offload ports: the confirmed-clean floor decay, the
+	// rounds-gated burst/variance margin discount, and the budget-conditional
+	// TargetFailure relief. The 2026-07 permutation sweep measured the bundle's
+	// means positive (generous lossy +2.4 pp at 0.84x overhead) but with per-seed
+	// breaches beyond the cell noise floor in deep-burst cells, traced to the
+	// sliding RTT estimate inflating under self-induced queueing (which clips the
+	// band and saturates the sizer — and self-disables the relief exactly in the
+	// storms it targets). Off until the RTT estimator is hardened; the generation
+	// profile's ProactiveDecay is unaffected.
+	SlidingReactiveShift bool
 }
 
 // maxPaths bounds the multipath arity (matching wire.feedbackMaxPaths): the per-path
@@ -354,6 +387,10 @@ func DefaultConfig() Config {
 		// where there is no reorder (a cref no-regression sweep across loss 1/3/8% holds delivery and
 		// cuts proactive overhead severalfold under real-timing reorder); single-path only for now.
 		AutoReorderHoldoff: true,
+		// on by default: two-regime channel control — provision for the recoverable regime,
+		// compose through outages (inert without outages; strictly better with them: the
+		// glassbench burst400 gate shows better delivery at lower cost and far lower variance).
+		OutageAware: true,
 	}
 }
 
@@ -439,8 +476,73 @@ func effectiveProtectionTier(pri, minTID uint8) int {
 }
 
 // feedbackIntervalMicros is how often the receiver emits a cumulative feedback
-// report while a flow is active.
-const feedbackIntervalMicros = 20_000 // 20 ms
+// report while a flow is active — the idle POLLING floor. Loss onset does not
+// wait for it: a new wire-loss run marks feedback due immediately (rate-limited
+// by eventFeedbackMinMicros), the gap-triggered-NACK reflex ARQ transports have
+// always had. Feedback stays cumulative and idempotent, so the extra report is
+// pure latency win, never extra state.
+const (
+	feedbackIntervalMicros = 20_000 // 20 ms
+	// eventFeedbackMinMicros is the floor between loss-onset-triggered reports. Half
+	// the cadence, not lower: under sustained random loss a new run begins every few
+	// packets, and a tighter floor degenerates into a continuous reverse-path flood
+	// that measurably costs delivery in the sub-cycle frontier regime (the 0.75×RTT
+	// high-rate guard dropped 16 frames at a 5 ms floor) while buying nothing — the
+	// events exist to cut DETECTION latency for the first report of a run, and a
+	// 10 ms worst case already beats the 20 ms cadence it replaces.
+	eventFeedbackMinMicros = 10_000
+)
+
+// reactiveCycleMicros is one honest reactive cycle at the current RTT estimate:
+// the round trip (deficit out with the loss-onset event report, repair back) plus
+// an rtt/4 estimate margin plus the event-report floor. It replaces the former
+// 2×rtt + polling-cadence model, which over-doubled: the RTT estimator's samples
+// already include feedback transit (they tend to OVER-count the wire RTT), and
+// loss-onset reporting removed the polling cadence from the loop. The margin keeps
+// the model conservative without pricing reactive repair out of budgets (1.25-2)×RTT
+// — where ARQ demonstrably recovers, and where the old model claimed zero rounds
+// and carried full proactive margins as pure overhead.
+func reactiveCycleMicros(rttMicros int64) int64 {
+	return rttMicros + rttMicros/4 + eventFeedbackMinMicros
+}
+
+// reactiveRoundsFrom estimates how many reactive-repair top-ups fit inside budgetMicros
+// at rttMicros — shared by generation and sliding proactive sizers.
+func reactiveRoundsFrom(budgetMicros, rttMicros int64) int {
+	cycle := reactiveCycleMicros(rttMicros)
+	if cycle <= 0 || budgetMicros <= 0 {
+		return 0
+	}
+	return int(budgetMicros / cycle)
+}
+
+// extrasReplaceable is the capability predicate for the dedicated per-chunk
+// singleton and anchor-closure extras, shared by both sender profiles: the extras
+// are double coverage ONLY where the reactive tier can repair a full
+// observed-burst-length reference hole inside the deadline budget — one honest
+// reactive cycle plus the burst's own duration (a burst delays detection: nothing
+// arrives to walk the gap until it ends), with 2× the measured mean burst standing
+// in for the burst-length tail, matching the outage threshold's kappa. Where it
+// holds the extras are shed; where it fails they are the only protection that can
+// land, and stay on. The burst term is load-bearing: gating extras on the bare
+// cycle regressed low-rate burst48 at a 1.5×RTT budget by ~8 ffprobe frames (extras
+// off, retro too late for the early holes), while iid regimes (burst ≈ 1 symbol)
+// still shed the extras and their cost. coldBurstSyms is each profile's cold-start
+// stand-in (generation: GenSize; sliding: the effective band) — conservative:
+// extras stay on until the channel says bursts are short.
+func extrasReplaceable(bufferMicros, rttMicros, interMicros, coldBurstSyms int64, fbCount, burstQ8 int) bool {
+	if bufferMicros <= 0 {
+		return false
+	}
+	if interMicros <= 0 {
+		interMicros = 1_000
+	}
+	burstSyms := coldBurstSyms
+	if fbCount >= coldStartFeedbacks && burstQ8 > 0 {
+		burstSyms = int64(burstQ8) >> 8
+	}
+	return reactiveCycleMicros(rttMicros)+2*burstSyms*interMicros <= bufferMicros
+}
 
 // Reactive-repair (WP3) pacing constants. The sender retains closed generations
 // and, on a feedback rank deficit, sends extra repair for the blocking
@@ -521,12 +623,38 @@ const (
 	// Flush at stream end. During continuous streaming the gap between writes is far
 	// smaller, so it never fires.
 	flushIdleMicros = 10_000 // 10 ms
-	// maxIntervalMicros caps the receiver's per-symbol deadline-interval EWMA. A
+	// maxIntervalMicros caps the receiver's per-symbol deadline-interval estimate. A
 	// legitimate inter-symbol interval is sub-millisecond at live bitrates; a value past
 	// this is a forged/garbage Deadline stamp, so capping it keeps the deadline
 	// extrapolation (id-refID)*intervalUs from overflowing int64 (a wire-reachable
 	// invariant break — a wrapped deadline drops in-time symbols or delivers late ones).
 	maxIntervalMicros = 1_000_000 // 1 s
+	// intervalFitSpanIDs is the id span the deadline-interval fit averages over. The
+	// interval must be the SLOPE (deadline span ÷ id span) over a window, never an EWMA
+	// of consecutive stamp gaps: an access unit's chunks are written in one burst with
+	// ONE stamp, so consecutive gaps are zeros (skipped) interleaved with whole-frame
+	// jumps, and a gap-EWMA converges to the per-BATCH interval — up to chunks-per-frame
+	// times the true per-id spacing. Every never-received id's extrapolated deadline
+	// then lands that factor too deep in the past, and a long loss run is mass-evicted
+	// long before its true deadlines (the "premature-drop residual": measured as the
+	// 2x-early eviction that defeated retrospective repair in the batched-write sim,
+	// and the 0.44 clean-link-with-jitter decodable rate in the LTR experiment).
+	intervalFitSpanIDs = 64
+	// outageCensorKappa and outageCensorHorizonFloor set the outage-classification
+	// threshold (Config.OutageAware): a loss run longer than
+	// kappa·max(horizonSyms, floor) symbols is an outage, not an erasure sample. The
+	// horizon is the observed remaining-usefulness span (arrival slack over the
+	// inter-symbol interval); kappa=2 keeps every plausibly-recoverable run (edges
+	// included) inside the estimators. The floor guards the HORIZON estimate against
+	// noise, deliberately NOT the threshold against small horizons: at low packet
+	// rates the true horizon is genuinely a few symbols (e.g. ~3 at 57 pkt/s under a
+	// 100 ms budget), and an absolute threshold floor of 16 was measured to miss
+	// real outages entirely there — the sender's own repair overhead dilutes a
+	// 48-datagram burst to ~12 consecutive SOURCE losses, each representing ~200 ms
+	// of dead channel against 50 ms of slack (the glassbench burst48 calibration
+	// run; see docs/decisions).
+	outageCensorKappa        = 2
+	outageCensorHorizonFloor = 4
 )
 
 // repairForTarget returns the smallest repair count r such that a generation of k

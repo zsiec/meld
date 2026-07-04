@@ -27,6 +27,7 @@ func drawSlot(rng *rand.Rand, pNone, pTwo float64) int {
 // assumes independence — silently under-provisions and misses its decode-failure
 // target, while the correlation-aware joint-tail sizer holds it.
 func TestJointTailHoldsWhereIIDFails(t *testing.T) {
+	t.Parallel()
 	const (
 		k      = 32
 		delta  = 1e-3
@@ -122,6 +123,7 @@ func slotLosses(rng *rand.Rand, count int) []bool {
 // (joint-tail fed by the estimate) holds the decode-failure target where assuming
 // independence — the same marginals but pBoth = pa·pb — under-provisions.
 func TestCoLossEstimatorRecoversAndCloses(t *testing.T) {
+	t.Parallel()
 	const (
 		k      = 32
 		delta  = 1e-3
@@ -181,8 +183,8 @@ func TestPathScheduler(t *testing.T) {
 	s := newPathScheduler(2)
 	// Systematic: even split.
 	var sys [2]int
-	for i := 0; i < 100; i++ {
-		sys[s.systematicPath()]++
+	for id := uint32(0); id < 100; id++ {
+		sys[s.systematicPath(id)]++
 	}
 	if sys[0] != 50 || sys[1] != 50 {
 		t.Fatalf("systematic split %v, want 50/50", sys)

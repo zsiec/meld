@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/binary"
 	"encoding/csv"
+	"encoding/json"
 	"fmt"
 	"math"
 	"os"
@@ -78,7 +79,17 @@ func sweepSupported(arm string) bool {
 func sweepArm(arm string, c *chunked, loss float64, rtt, budget int, paceUs, meldMax, seed int64) float64 {
 	var got map[uint32]bool
 	if isMeldArm(arm) {
-		got = runMeldNamed(c, arm, loss, rtt, budget, paceUs, meldMax, seed).got
+		// Burst autopsy (GLASSTRACE=dir): capture the full relay/feedback/arrival
+		// trace for meld arms in probe mode — the hole regime needs LONG streams
+		// (streamk-extended), which only the probe path runs; the report machinery's
+		// traces exist only in the ffprobe mode.
+		if dir := os.Getenv("GLASSTRACE"); dir != "" {
+			tr := &seedTrace{Arm: arm, Seed: seed}
+			got = runMeldNamedTrace(c, arm, loss, rtt, budget, paceUs, meldMax, seed, tr).got
+			writeStandaloneTrace(dir, arm, rtt, budget, seed, tr)
+		} else {
+			got = runMeldNamed(c, arm, loss, rtt, budget, paceUs, meldMax, seed).got
+		}
 	} else {
 		switch arm {
 		case "libsrt":
@@ -95,6 +106,24 @@ func sweepArm(arm string, c *chunked, loss float64, rtt, budget int, paceUs, mel
 		return math.NaN()
 	}
 	return float64(len(got)) / float64(len(c.chunks))
+}
+
+// writeStandaloneTrace dumps one probe-mode seed trace as JSON into dir (burst
+// autopsy; best-effort — a write error is reported on stderr, never fatal).
+func writeStandaloneTrace(dir, arm string, rtt, budget int, seed int64, tr *seedTrace) {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		fmt.Fprintln(os.Stderr, "glasstrace:", err)
+		return
+	}
+	name := fmt.Sprintf("probe_trace_%s_rtt%d_bud%d_seed%d.json", strings.ReplaceAll(arm, "-", "_"), rtt, budget, seed)
+	b, err := json.MarshalIndent(tr, "", " ")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "glasstrace:", err)
+		return
+	}
+	if err := os.WriteFile(filepath.Join(dir, name), b, 0o644); err != nil {
+		fmt.Fprintln(os.Stderr, "glasstrace:", err)
+	}
 }
 
 // runProbe measures delivery at a FIXED budget (atXRTT × RTT) per arm/RTT and

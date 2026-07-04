@@ -13,7 +13,20 @@ type SenderStats struct {
 	ReactiveRepair        uint64 // repair symbols emitted in response to a feedback deficit
 	Throttled             uint64 // repair symbols dropped by the rate ceiling (N1 token bucket)
 	Shed                  uint64 // top-temporal-layer source chunks dropped at the encoder (ShedTopLayerOverBudget)
+	DeadReactiveSkips     uint64 // reactive rounds skipped because repair provably could not arrive in time (Config.OutageAware)
 	RecoveryCadenceFrames uint16 // encoder max recovery interval request; 0 means relaxed
+
+	// Per-mechanism attribution of Repair — where the redundancy bytes actually go,
+	// so cost work trims what measurement indicts rather than what theory suspects
+	// (scratchpad/all-regimes/PREREG-cost.md). Populated by the sliding profile (the
+	// deployable meld-auto profile the cost gates measure); on the generation profile
+	// the fields stay zero and Repair/ReactiveRepair carry the split as before.
+	// Invariant (sliding): Proactive + ProactiveCold + Singleton + Sparse + Deficit == Repair.
+	RepairProactive     uint64 // band repair from the warm proactive credit (write/flush/idle)
+	RepairProactiveCold uint64 // proactive band repair emitted under the cold-start floor
+	RepairSingleton     uint64 // dedicated per-reference singleton repair (reactive-incapable extras)
+	RepairSparse        uint64 // sparse protected repair (UEP/anchor; scheduled or feedback-driven)
+	RepairDeficit       uint64 // deficit-answering window repair (the retro-reactive tier)
 }
 
 // retGen is a closed generation the sender retains so it can answer a feedback
@@ -68,6 +81,7 @@ type Sender struct {
 	interMicros int64                 // EWMA of the per-symbol fill time, µs (AutoGenSize fill gate)
 	curGenWidth int                   // width fixed when the live generation opened (stamped on every symbol)
 	rttSampled  bool                  // a real RTT sample has arrived (AutoGenSize stays narrow until then)
+	fbCount     int                   // feedback reports received (cold-start gating for the extras predicate)
 	delayCliff  bool                  // latest raw feedback sample proves one-way propagation cannot fit the deadline
 	now         clock.Timestamp       // most recent entry-point time (for the rate ceiling)
 	bucket      tokenBucket           // aggregate emit-rate ceiling (N1), driven by cc when present
@@ -84,9 +98,14 @@ type Sender struct {
 	frameStart   map[uint32]uint32
 	curFrameID   uint32
 	haveCurFrame bool
-	sendQ        [][]byte
-	stats        SenderStats
-	cadence      recoveryCadenceController
+	// LTR resync: FrameStart+1 → frame id for frames the app marked FrameDesc.LTR, so a
+	// feedback-reported safe LTR (which names a FrameStart) translates back to the frame
+	// id the encoder needs (EncoderControl.ResyncRefFrameID). Pruned with frameStart.
+	ltrFidByStart map[uint32]uint32
+	resync        resyncController
+	sendQ         [][]byte
+	stats         SenderStats
+	cadence       recoveryCadenceController
 }
 
 // senderFrameWindow bounds the sender's frame-start map: references are recent (within a
@@ -100,7 +119,7 @@ const (
 	referenceBoostMaxRedundancy = 0.20 // above this, the static floor already protects references
 )
 
-// pruneFrameStarts drops far-back frame-start entries so the map stays bounded.
+// pruneFrameStarts drops far-back frame-start entries so the maps stay bounded.
 func (s *Sender) pruneFrameStarts(cur uint32) {
 	if len(s.frameStart) <= 2*senderFrameWindow {
 		return
@@ -108,6 +127,11 @@ func (s *Sender) pruneFrameStarts(cur uint32) {
 	for fid := range s.frameStart {
 		if fid+senderFrameWindow < cur {
 			delete(s.frameStart, fid)
+		}
+	}
+	for start, fid := range s.ltrFidByStart {
+		if fid+senderFrameWindow < cur {
+			delete(s.ltrFidByStart, start)
 		}
 	}
 }
@@ -163,6 +187,12 @@ type FrameDesc struct {
 	RecoveryRefresh bool     // reference slice inside a signaled intra-refresh recovery interval
 	Discardable     bool     // nothing references this unit
 	NonPicture      bool     // metadata/parameter material, not a displayed coded picture
+	// LTR marks a long-term-reference candidate the encoder RETAINS (its DPB keeps
+	// the frame until explicitly replaced), so the receiver can report the newest
+	// decodable one and the sender can ask for an LTR resync when the reference
+	// chain breaks (EncoderControl.Resync). Mark sparingly — one candidate every
+	// few reference frames is the WebRTC-practice cadence.
+	LTR bool
 }
 
 // WriteUnit hands one source media chunk to the flow at time now carrying a protection
@@ -257,14 +287,22 @@ func (s *Sender) writeSystematic(now clock.Timestamp, data []byte, priority uint
 		if !s.haveCurFrame || fd.FrameID != s.curFrameID {
 			s.frameStart[fd.FrameID] = id // first chunk of a new frame
 			s.curFrameID, s.haveCurFrame = fd.FrameID, true
+			if fd.LTR {
+				if s.ltrFidByStart == nil {
+					s.ltrFidByStart = make(map[uint32]uint32)
+				}
+				s.ltrFidByStart[id+1] = fd.FrameID // +1: the wire's FrameStart+1 encoding (0 = none)
+			}
 			s.pruneFrameStarts(fd.FrameID)
 		}
+		noteResyncHonored(&s.resync, s.ltrFidByStart, fd)
 		sym.HasFrameDesc = true
 		sym.FrameStart = s.frameStart[fd.FrameID]
 		sym.FrameLen = fd.Chunks
 		sym.FrameRAP, sym.FrameDiscardable = fd.RAP, fd.Discardable
 		sym.FrameRecoveryRefresh = fd.RecoveryRefresh
 		sym.FrameNonPicture = fd.NonPicture
+		sym.FrameLTR = fd.LTR
 		sym.FrameRefs = nil
 		for _, ref := range fd.RefFrameIDs {
 			if rs, ok := s.frameStart[ref]; ok {
@@ -276,9 +314,9 @@ func (s *Sender) writeSystematic(now clock.Timestamp, data []byte, priority uint
 		}
 	}
 	if s.sched != nil {
-		// Round-robin across paths (PLAN §3.6); one systematic per source id in order,
-		// so path(id) = id mod paths — the mapping the receiver mirrors for co-loss.
-		sym.PathID = uint8(s.sched.systematicPath())
+		// Round-robin across paths (PLAN §3.6): path(id) = id mod paths — the mapping
+		// the receiver mirrors for co-loss — shifted to the next live path in failover.
+		sym.PathID = uint8(s.sched.systematicPath(id))
 	}
 	s.emit(sym)
 	if s.shouldSingletonProtect(priority, fd) {
@@ -326,14 +364,22 @@ func (s *Sender) singletonRepairEnabled() bool {
 	return s.cfg.MaxBitrate <= 0 && s.cc == nil
 }
 
+// extrasReplaceableByReactive is the shared capability predicate (extrasReplaceable)
+// with the generation profile's cold-start stand-in: a generation-length burst.
+func (s *Sender) extrasReplaceableByReactive() bool {
+	return extrasReplaceable(s.cfg.BufferMicros, s.rttMicros, s.interMicros,
+		int64(s.cfg.GenSize), s.fbCount, s.burstQ8)
+}
+
 func (s *Sender) shouldSingletonProtect(priority uint8, fd *FrameDesc) bool {
 	if !s.singletonRepairEnabled() || !s.referenceBoostEnabled() {
 		return false
 	}
-	if priority > uepCenterTier {
-		return true
-	}
-	return fd != nil && priority == uepCenterTier && !fd.Discardable && (!fd.RAP || fd.RecoveryRefresh)
+	protectable := priority > uepCenterTier ||
+		(fd != nil && priority == uepCenterTier && !fd.Discardable && (!fd.RAP || fd.RecoveryRefresh))
+	// The capability predicate runs last: most chunks fail the cheap tier gates above,
+	// and this is the per-write hot path.
+	return protectable && !s.extrasReplaceableByReactive()
 }
 
 func (s *Sender) reactivePriorityFor(priority uint8, fd *FrameDesc) uint8 {
@@ -393,6 +439,14 @@ func (s *Sender) closeGen(now clock.Timestamp) {
 	for r := s.repairCountFor(n); int(key) < r; key++ {
 		s.emitRepair(s.live, key, n, pri, false)
 	}
+	if s.sched != nil && s.sched.probeOwed() {
+		// Dead-path probe backstop: revival is observed only through an arrival on
+		// the dead path, so probes must flow even when the sizer (rightly) emits no
+		// repair on a clean surviving path. One extra droppable repair, routed to
+		// the dead path by the armed scheduler.
+		s.emitRepair(s.live, key, n, pri, false)
+		key++
+	}
 	s.retained[base] = &retGen{enc: s.live, n: n, proactive: int(key), deadline: s.genDL, nextKey: key, closeAt: now, pri: pri, reactPri: reactPri, minTID: s.genMinTID}
 	s.live = code.NewEncoderAt(s.cfg.SymbolSize, base+uint32(n))
 	s.live.SetPool(s.pool)
@@ -410,6 +464,7 @@ func (s *Sender) FeedFeedback(now clock.Timestamp, fb wire.Feedback) {
 		return
 	}
 	s.now = now
+	s.fbCount++
 	s.updateRTT(now, fb)
 	if s.cc != nil {
 		// The congestion controller owns the budget; the bucket enforces it (repair
@@ -419,6 +474,7 @@ func (s *Sender) FeedFeedback(now clock.Timestamp, fb wire.Feedback) {
 		}
 	}
 	s.pEst = float64(fb.LossRate) / 65535 // feed-forward channel erasure estimate
+	s.resync.observe(now, fb.BrokenAnchors, fb.NewestDecodableLTR, resyncHoldMicros(s.cfg.BufferMicros, s.rttMicros))
 	// Floor-decay confidence: count consecutive feedbacks that POSITIVELY report a clean link, and
 	// snap to zero on the first loss observation. Keyed on the report (fb.LossRate), never on the
 	// mere absence of a signal — a black hole or warmup delivers no feedback at all, so cleanRun
@@ -449,6 +505,9 @@ func (s *Sender) FeedFeedback(now clock.Timestamp, fb wire.Feedback) {
 			s.slotDistPpm[j] = p65535ToPPM(d)
 		}
 		s.sched.setQuality(delivered)
+	}
+	if s.sched != nil {
+		s.sched.setDead(fb.DeadPaths) // path failover: source to live paths, probes to dead
 	}
 	// Retire generations the receiver has fully decoded/delivered past.
 	for base, g := range s.retained {
@@ -556,6 +615,15 @@ func (s *Sender) reactiveRepair(now clock.Timestamp, g *retGen, deficit int) {
 		return // too late to matter
 	}
 	if s.repairArrivesTooLate() {
+		return
+	}
+	// Provably-dead gate (two-regime control): a repair emitted now lands ~one
+	// one-way delay later; if that is already past the generation's LATEST symbol
+	// deadline, no symbol in the window can be helped — the spend is pure waste that
+	// also queues ahead of live traffic at the pacer. Arithmetic, not inference: a
+	// recoverable structural gap always has a live deadline and is never gated.
+	if s.cfg.OutageAware && now.Add(s.rttMicros/2).After(g.deadline) {
+		s.stats.DeadReactiveSkips++
 		return
 	}
 	if deficit > g.n {
@@ -666,7 +734,7 @@ func (s *Sender) repairCountFor(n int) int {
 	// fixed budget is steered up the dependency spine.
 	delta := targetFailureForTier(effectiveProtectionTier(s.sizingPriority(s.genMaxPri), s.genMinTID), s.cfg.targetFailure())
 	var r int
-	if s.sched != nil {
+	if s.sched != nil && !s.sched.anyDead() {
 		// Multipath: size the TOTAL repair against the JOINT erasure tail across all paths
 		// (the generation is spread over them and decoded from the union, N5). The
 		// per-slot erasure-count histogram embeds the cross-path correlation, so a
@@ -674,6 +742,9 @@ func (s *Sender) repairCountFor(n int) int {
 		// correlation it reduces to the binomial.
 		r = repairForJointTailN(n, s.slotDistribution(), delta, maxRepairFactor)
 	} else {
+		// Single path — or failover: with a path dead the aligned-slot histogram is
+		// stale (the receiver suspends it) and placement no longer matches it, so
+		// size against the aggregate loss estimate until the path set is whole again.
 		r = repairForTarget(n, s.pEst, delta, maxRepairFactor)
 	}
 	// Burst-aware set-point: size for the Gilbert-Elliott tail when the channel is
@@ -692,7 +763,7 @@ func (s *Sender) repairCountFor(n int) int {
 	// proactive analog of "common case eager, tail lazy": it cuts the bursty-LAN overhead that
 	// blanket GE sizing spends on every generation while reactive sits idle.
 	ge := repairForGE(n, s.burstMarginalPPM(), s.burstQ8, delta, maxRepairFactor)
-	rounds := s.reactiveRounds()
+	rounds := reactiveRoundsFrom(s.cfg.BufferMicros, s.rttMicros)
 	// The two margins above the mean expected loss are offloaded to the reactive tier
 	// independently, because they are safe to offload under DIFFERENT conditions:
 	//
@@ -786,23 +857,20 @@ func (s *Sender) effectiveFloor(n int) int {
 }
 
 // reactiveRounds estimates how many reactive-repair top-ups the reactive tier can land inside
-// the deadline budget at the current RTT — each costs one round trip plus a feedback interval
-// to observe. It is 0 when that cycle does not fit the budget (high RTT), so the proactive
-// layer must carry the full burst margin itself; it grows as the RTT shrinks relative to the
-// budget, letting reactive repair absorb the burst tail instead.
+// the deadline budget at the current RTT — each costs one honest reactive cycle
+// (reactiveCycleMicros: round trip + estimate margin + the loss-onset report floor). It is 0
+// when that cycle does not fit the budget (high RTT), so the proactive layer must carry the
+// full burst margin itself; it grows as the RTT shrinks relative to the budget, letting
+// reactive repair absorb the burst tail instead.
+//
+// History: this used 2×rtt + the 20 ms polling cadence — a guard against the RTT estimator
+// under-counting — which priced reactive repair out of budgets up to ~4×RTT and carried full
+// proactive margins exactly where ARQ transports demonstrably recover at ~zero overhead (the
+// generous-budget cost gap vs SRT/RIST). Loss-onset event feedback removed the cadence from
+// the loop, and the estimator's samples already include feedback transit (they tend to
+// OVER-count the wire RTT), so the honest cycle keeps a 25% margin instead of a 2× one.
 func (s *Sender) reactiveRounds() int {
-	// One reactive cycle is a full round trip (the batch out, its effect back) plus a feedback
-	// interval to observe. Use 2×rttMicros for the round trip: the RTT estimate (updateRTT)
-	// tends to UNDER-count because HighestSeen is advanced by window-covering repair, so it
-	// tracks closer to one-way than round-trip. Doubling keeps reactiveRounds CONSERVATIVE — it
-	// must never over-credit reactive availability, or the burst margin is discounted on a link
-	// where reactive cannot actually land in time (under-protection at high RTT).
-	cycle := 2*s.rttMicros + feedbackIntervalMicros
-	budget := s.cfg.BufferMicros
-	if cycle <= 0 || budget <= 0 {
-		return 0
-	}
-	return int(budget / cycle)
+	return reactiveRoundsFrom(s.cfg.BufferMicros, s.rttMicros)
 }
 
 // burstMarginalPPM is the marginal erasure rate (ppm) the GE burst term sizes against:
@@ -924,7 +992,46 @@ func (s *Sender) Stats() SenderStats {
 }
 
 // EncoderControl returns the current advisory source-control request for an attached encoder.
-func (s *Sender) EncoderControl() EncoderControl { return s.cadence.encoderControl() }
+func (s *Sender) EncoderControl() EncoderControl {
+	return withResync(s.cadence.encoderControl(), &s.resync, s.ltrFidByStart)
+}
+
+// withResync folds the resync controller's active request into an EncoderControl,
+// translating the wire-level FrameStart+1 back to the application's frame id. A request
+// whose LTR has been pruned from the translation map can no longer be named, so it is
+// dropped (the controller re-raises on the next damage report).
+func withResync(ec EncoderControl, rc *resyncController, fidByStart map[uint32]uint32) EncoderControl {
+	req := rc.request()
+	if req == 0 {
+		return ec
+	}
+	fid, ok := fidByStart[req]
+	if !ok {
+		rc.honored() // unnameable: drop the request
+		return ec
+	}
+	ec.Resync, ec.ResyncRefFrameID = true, fid
+	return ec
+}
+
+// noteResyncHonored is the shared honored-detection: a written frame whose references
+// include the requested LTR's frame id means the encoder complied.
+func noteResyncHonored(rc *resyncController, fidByStart map[uint32]uint32, fd *FrameDesc) {
+	req := rc.request()
+	if req == 0 || fd == nil {
+		return
+	}
+	fid, ok := fidByStart[req]
+	if !ok {
+		return
+	}
+	for _, ref := range fd.RefFrameIDs {
+		if ref == fid {
+			rc.honored()
+			return
+		}
+	}
+}
 
 // RateBudgetBitsPerSec returns the current send-rate budget the host should pace the
 // media source within (the congestion controller's output, or the static ceiling when

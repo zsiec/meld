@@ -30,13 +30,14 @@ func runFrameFlow(t *testing.T, cfg Config, units []shape.Unit, lossP float64, s
 			if err != nil {
 				continue
 			}
-			var key uint32
-			if sym.Kind == wire.Systematic {
-				key = sym.SrcIndex
-			} else {
-				key = (sym.WindowBase*100003 + uint32(sym.RepairKey)) | (1 << 31)
+			if sym.Kind != wire.Systematic {
+				// Repair is withheld entirely: this harness compares the receiver's
+				// parse-free FrameStats against the delivery oracle UNDER LOSS, and its
+				// zero-transit feedback loop lets the (retrospective) reactive tier
+				// otherwise recover everything — leaving no loss to compare on.
+				continue
 			}
-			if coinU(seed, uint32(sym.Kind), key) < lossP {
+			if coinU(seed, uint32(sym.Kind), sym.SrcIndex) < lossP {
 				continue
 			}
 			r.FeedSymbol(now, d)

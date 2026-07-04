@@ -180,6 +180,32 @@ func (e *Encoder) RepairWindow(repairKey uint16, ew int) (base uint32, n int, pa
 	return e.base + uint32(start), n, payload
 }
 
+// RepairAt builds a repair symbol over the EXPLICIT retained window
+// [at, at+n) — retrospective repair for a stuck delivery cursor, whose holes the
+// trailing-band repair (RepairWindow) can no longer reach once new source has slid
+// the band past them. The requested range is clipped to the retained window; the
+// clipped n' is returned (0 with a nil payload when nothing overlaps). The caller
+// must use a fresh repairKey per emission, exactly as with RepairWindow.
+func (e *Encoder) RepairAt(repairKey uint16, at uint32, n int) (base uint32, nOut int, payload []byte) {
+	lo := int64(at) - int64(e.base)
+	if lo < 0 {
+		n += int(lo) // clip the below-window prefix
+		lo = 0
+	}
+	if lo >= int64(len(e.syms)) || n <= 0 {
+		return 0, 0, nil
+	}
+	if rem := int64(len(e.syms)) - lo; int64(n) > rem {
+		n = int(rem)
+	}
+	payload = e.symBuf() // zeroed, ready to accumulate the linear combination
+	coeffs := GenCoeffs(repairKey, n)
+	for j := 0; j < n; j++ {
+		gf.MulAdd(payload, e.syms[lo+int64(j)], coeffs[j])
+	}
+	return e.base + uint32(lo), n, payload
+}
+
 // RepairSparse builds a repair symbol over the explicitly listed source ids. ids
 // must be strictly increasing and currently retained. It is the protected-layer
 // companion to RepairWindow: the equation codes only the listed columns, so

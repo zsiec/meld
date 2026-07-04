@@ -30,6 +30,8 @@ func TestSymbolRoundTrip(t *testing.T) {
 			FrameStart: 12, FrameLen: 7, FrameRefs: []uint32{8, 20}, FrameRAP: true, FrameRecoveryRefresh: true, Payload: []byte("with frame desc")},
 		{Flow: 9, Kind: Systematic, SrcIndex: 51, HasFrameDesc: true, FrameStart: 13, FrameLen: 1,
 			FrameDiscardable: true, FrameNonPicture: true, SendTimestamp: 42, Payload: []byte("desc + ts")},
+		{Flow: 9, Kind: Systematic, SrcIndex: 52, Priority: 2, HasFrameDesc: true, FrameStart: 14,
+			FrameLen: 3, FrameRefs: []uint32{2}, FrameLTR: true, Payload: []byte("ltr candidate")},
 		{Flow: 10, Kind: SparseRepair, SrcIndex: 99, N: 4, RepairKey: 123, Priority: 3, Deadline: 55,
 			SendTimestamp: 44, SparseIDs: []uint32{12, 21, 24, 33}, Payload: []byte("sparse repair")},
 	}
@@ -50,7 +52,8 @@ func TestSymbolRoundTrip(t *testing.T) {
 			got.HasFrameDesc != want.HasFrameDesc || got.FrameLen != want.FrameLen || got.FrameStart != want.FrameStart ||
 			!u32eq(got.FrameRefs, want.FrameRefs) || got.FrameRAP != want.FrameRAP ||
 			got.FrameRecoveryRefresh != want.FrameRecoveryRefresh ||
-			got.FrameDiscardable != want.FrameDiscardable || got.FrameNonPicture != want.FrameNonPicture {
+			got.FrameDiscardable != want.FrameDiscardable || got.FrameNonPicture != want.FrameNonPicture ||
+			got.FrameLTR != want.FrameLTR {
 			t.Fatalf("case %d: header mismatch: got %+v want %+v", i, got, want)
 		}
 		// The leading byte carries the current version in its high nibble.
@@ -74,7 +77,9 @@ func feedbackEqual(a, b Feedback) bool {
 		a.LossRate != b.LossRate || a.Deficits != b.Deficits ||
 		a.CongestionLoss != b.CongestionLoss || a.Burstiness != b.Burstiness ||
 		a.Frames != b.Frames || a.DecodableFrames != b.DecodableFrames ||
-		a.Keyframes != b.Keyframes || a.DecodableKeyframes != b.DecodableKeyframes {
+		a.Keyframes != b.Keyframes || a.DecodableKeyframes != b.DecodableKeyframes ||
+		a.NewestDecodableLTR != b.NewestDecodableLTR || a.BrokenAnchors != b.BrokenAnchors ||
+		a.DeadPaths != b.DeadPaths || a.Missing != b.Missing {
 		return false
 	}
 	return u16eq(a.PathLoss, b.PathLoss) && u16eq(a.SlotDist, b.SlotDist)
@@ -97,7 +102,8 @@ func TestFeedbackRoundTrip(t *testing.T) {
 		LossRate: 19661, Deficits: [MaxFeedbackGens]uint8{7, 0, 3, 0, 1, 0, 0, 255},
 		CongestionLoss: 1234, Burstiness: 512,
 		PathLoss: []uint16{26214, 6553, 3276}, SlotDist: []uint16{52000, 9000, 3000, 535},
-		Frames: 120, DecodableFrames: 117, Keyframes: 4, DecodableKeyframes: 3}
+		Frames: 120, DecodableFrames: 117, Keyframes: 4, DecodableKeyframes: 3,
+		NewestDecodableLTR: 887, BrokenAnchors: 6, DeadPaths: 0b10, Missing: 0xDEAD_BEEF_0000_0101}
 	enc := EncodeFeedback(nil, want)
 	typ, err := PeekType(enc)
 	if err != nil || !IsFeedback(typ) {
@@ -132,6 +138,23 @@ func TestFeedbackRoundTrip(t *testing.T) {
 	singleGot, err := DecodeFeedback(EncodeFeedback(nil, single))
 	if err != nil || !feedbackEqual(singleGot, single) {
 		t.Fatalf("single-path media feedback: got %+v err=%v", singleGot, err)
+	}
+	// A datagram truncated before the LTR-resync tail (media stats present) decodes
+	// with the LTR and failover fields zero — an older peer's report reads as "no signal".
+	noLTR, err := DecodeFeedback(enc[:len(enc)-feedbackLTRLen-9])
+	if err != nil || noLTR.Frames != want.Frames || noLTR.NewestDecodableLTR != 0 || noLTR.BrokenAnchors != 0 || noLTR.DeadPaths != 0 {
+		t.Fatalf("ltr-truncated decode: %+v err=%v", noLTR, err)
+	}
+	// Truncated after the LTR tail but before DeadPaths: LTR present, failover and
+	// missing-bitmap zero.
+	noDead, err := DecodeFeedback(enc[:len(enc)-9])
+	if err != nil || noDead.NewestDecodableLTR != want.NewestDecodableLTR || noDead.DeadPaths != 0 || noDead.Missing != 0 {
+		t.Fatalf("deadpaths-truncated decode: %+v err=%v", noDead, err)
+	}
+	// Truncated after DeadPaths but before the missing bitmap: bitmap reads zero.
+	noMiss, err := DecodeFeedback(enc[:len(enc)-8])
+	if err != nil || noMiss.DeadPaths != want.DeadPaths || noMiss.Missing != 0 {
+		t.Fatalf("missing-truncated decode: %+v err=%v", noMiss, err)
 	}
 }
 

@@ -30,6 +30,7 @@ func overheadAtRTT(owdMicros int64, loss float64) simResult {
 // loss estimate lags so the proactive set-point stays near the floor and under-protects — a
 // separate effect, visible as the lower high-RTT delivery — not the reactive over-send.)
 func TestReactiveOverheadVsRTT(t *testing.T) {
+	t.Parallel()
 	const loss = 0.20
 	owds := []int64{10_000, 20_000, 50_000} // RTT 20, 40, 100 ms — where reactive repair is active
 	for _, owd := range owds {

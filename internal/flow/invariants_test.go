@@ -45,6 +45,7 @@ func assertCoreInvariants(t *testing.T, res simResult, n int, label string) {
 // the deliverable regime; losses above the code rate simply drop (counted), never corrupt or
 // reorder delivery.
 func TestInvariantsFuzz(t *testing.T) {
+	t.Parallel()
 	cfg := Config{Flow: 1, SymbolSize: 128, GenSize: 16, Redundancy: 0.15, TargetFailure: 1e-3, BufferMicros: 200_000}
 	const n = 16 * 12
 	losses := []float64{0.05, 0.15, 0.30, 0.45}

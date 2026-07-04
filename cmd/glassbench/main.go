@@ -341,7 +341,14 @@ var meldRed float64 = -1
 var meldGenSize int
 var meldNoAuto bool
 var meldNoReorder bool
+var meldNoDecay bool
+var meldReactiveShift bool
 var jitterDur time.Duration
+
+// deadlineArbiter scores every arm against the same hard per-chunk playout deadline
+// (sendTime + budget), instead of "frames eventually delivered" — see docs/bench.md
+// "Deadline Semantics" for why ARQ latency-window output otherwise inflates burst cells.
+var deadlineArbiter = new(bool)
 
 // Relay counters instrument what the impairment relay actually observes. Forward
 // means sender-side UDP traffic toward the receiver-side endpoint; reverse means
@@ -621,6 +628,9 @@ func relayOn(listenPort int, downstream string, drop func() bool, owd time.Durat
 			if a != nil {
 				relayReverseEnq.Add(1)
 				relayReverseEnqBytes.Add(int64(n))
+				if trace != nil {
+					trace.recordFeedback(b[:n]) // burst autopsy: decoded feedback stream
+				}
 				revCh <- delayed{at: time.Now().Add(owd), b: append([]byte(nil), b[:n]...), to: a}
 			}
 		}
@@ -645,6 +655,8 @@ type meldArmConfig struct {
 	sliding            bool
 	disableFramePolicy bool
 	repairCeiling      bool
+	outageAware        bool
+	outageOff          bool
 }
 
 func meldArm(name string) (meldArmConfig, bool) {
@@ -653,6 +665,14 @@ func meldArm(name string) (meldArmConfig, bool) {
 		return meldArmConfig{name: name}, true
 	case "meld-auto":
 		return meldArmConfig{name: name, uep: true, frame: true, sliding: true}, true
+	case "meld-outage":
+		// meld-auto with two-regime outage composure explicitly ON. Now that
+		// Config.OutageAware is default-on this equals meld-auto; kept for grids that
+		// pre-date the default. meld-outage-off is the A/B arm (the outage-blind
+		// estimators the default replaced).
+		return meldArmConfig{name: name, uep: true, frame: true, sliding: true, outageAware: true}, true
+	case "meld-outage-off":
+		return meldArmConfig{name: name, uep: true, frame: true, sliding: true, outageOff: true}, true
 	case "meld-uep-unit":
 		return meldArmConfig{name: name, uep: true}, true
 	case "meld-flat-frame":
@@ -750,6 +770,12 @@ func runMeldArm(c *chunked, arm meldArmConfig, loss float64, rttMs, budgetMs int
 	if meldNoReorder {
 		cfg.AutoReorderHoldoff = false // disable the self-tuning reorder window (A/B the default-on)
 	}
+	if meldNoDecay {
+		cfg.ProactiveDecay = false // disable the margin/floor decay (A/B the default-on)
+	}
+	if meldReactiveShift {
+		cfg.SlidingReactiveShift = true // opt-in sliding reactive-offload bundle (A/B arm)
+	}
 	if arm.sliding {
 		// Band-form sliding coder: repair is fungible across a wide window, so a
 		// concentrated burst is covered without a round trip (vs the generation
@@ -766,6 +792,12 @@ func runMeldArm(c *chunked, arm meldArmConfig, loss float64, rttMs, budgetMs int
 		cfg.TargetFailure = 1e-12
 		cfg.Redundancy = 1.0
 		cfg.RepairWithinBudget = false
+	}
+	if arm.outageAware {
+		cfg.OutageAware = true
+	}
+	if arm.outageOff {
+		cfg.OutageAware = false
 	}
 	resetRelayMetrics()
 	rx, err := meld.NewReceiver("127.0.0.1:0", cfg)
@@ -786,6 +818,14 @@ func runMeldArm(c *chunked, arm meldArmConfig, loss float64, rttMs, budgetMs int
 		return meldRunResult{}
 	}
 	got := map[uint32]bool{}
+	var arrivals map[uint32]time.Time
+	if *deadlineArbiter || trace != nil {
+		// Meld enforces the per-chunk deadline internally; recording arrivals at the
+		// same pipeline position as the ARQ sinks makes the arbiter a self-honesty
+		// check here rather than a semantics change. A seed trace records them too
+		// (the burst autopsy's per-chunk landing times).
+		arrivals = map[uint32]time.Time{}
+	}
 	var mu sync.Mutex
 	done := make(chan struct{})
 	go func() {
@@ -798,8 +838,14 @@ func runMeldArm(c *chunked, arm meldArmConfig, loss float64, rttMs, budgetMs int
 				return
 			}
 			if n >= seqHdr {
+				seq := binary.BigEndian.Uint32(buf[:seqHdr])
 				mu.Lock()
-				got[binary.BigEndian.Uint32(buf[:seqHdr])] = true
+				got[seq] = true
+				if arrivals != nil {
+					if _, seen := arrivals[seq]; !seen {
+						arrivals[seq] = time.Now()
+					}
+				}
 				mu.Unlock()
 			}
 		}
@@ -834,6 +880,14 @@ func runMeldArm(c *chunked, arm meldArmConfig, loss float64, rttMs, budgetMs int
 	tx.Close()
 	rx.Close()
 	<-done
+	mu.Lock()
+	if trace != nil {
+		trace.recordArrivals(arrivals, start, paceUs, budgetMs)
+	}
+	if *deadlineArbiter {
+		applyDeadlineArbiter(arm.name, got, arrivals, start, paceUs, budgetMs)
+	}
+	mu.Unlock()
 	if os.Getenv("GLASSDBG") != "" {
 		var miss [10]int
 		total := len(c.chunks)
@@ -847,13 +901,19 @@ func runMeldArm(c *chunked, arm meldArmConfig, loss float64, rttMs, budgetMs int
 			txStats.Source, txStats.Repair, txStats.ReactiveRepair, txStats.Throttled,
 			relayStats.ForwardEnqueued, relayStats.ForwardSent,
 			rxStats.Delivered, rxStats.Recovered, rxStats.Lost, rxStats.Evicted, len(got), total, miss)
+		fmt.Fprintf(os.Stderr, "[attr arm=%s] proactive=%d cold=%d singleton=%d sparse=%d deficit=%d (repair=%d)\n",
+			arm.name, txStats.RepairProactive, txStats.RepairProactiveCold, txStats.RepairSingleton,
+			txStats.RepairSparse, txStats.RepairDeficit, txStats.Repair)
 	}
 	return meldRunResult{got: got, txStats: txStats, rxStats: rxStats, relayEnq: relayStats.ForwardEnqueued, relaySent: relayStats.ForwardSent}
 }
 
 // --- C-stack arms (real subprocess + relay) — cref-identical drive ---
 
-func udpSink(port int, got map[uint32]bool, mu *sync.Mutex) *net.UDPConn {
+// udpSink collects delivered chunk seqs; when at is non-nil it also records each
+// seq's FIRST arrival instant (the equal-deadline arbiter's receive clock — srt/rist
+// deliver in order, so the first datagram at the sink IS that chunk's delivery).
+func udpSink(port int, got map[uint32]bool, at map[uint32]time.Time, mu *sync.Mutex) *net.UDPConn {
 	conn, _ := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port})
 	go func() {
 		b := make([]byte, 2048)
@@ -867,8 +927,14 @@ func udpSink(port int, got map[uint32]bool, mu *sync.Mutex) *net.UDPConn {
 				return
 			}
 			if n >= seqHdr {
+				seq := binary.BigEndian.Uint32(b[:seqHdr])
 				mu.Lock()
-				got[binary.BigEndian.Uint32(b[:seqHdr])] = true
+				got[seq] = true
+				if at != nil {
+					if _, seen := at[seq]; !seen {
+						at[seq] = time.Now()
+					}
+				}
 				mu.Unlock()
 			}
 		}
@@ -876,7 +942,9 @@ func udpSink(port int, got map[uint32]bool, mu *sync.Mutex) *net.UDPConn {
 	return conn
 }
 
-func feed(port int, chunks [][]byte, paceUs int64) {
+// feed paces the chunks into the sender tool and returns the schedule anchor:
+// chunk seq s left the source at (returned start) + s·paceUs.
+func feed(port int, chunks [][]byte, paceUs int64) time.Time {
 	fc, _ := net.DialUDP("udp", nil, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port})
 	defer fc.Close()
 	start := time.Now()
@@ -886,6 +954,65 @@ func feed(port int, chunks [][]byte, paceUs int64) {
 			time.Sleep(d)
 		}
 	}
+	return start
+}
+
+// arbLatency returns the ARQ-arm latency setting for a playout budget. Under the
+// equal-deadline arbiter the transport must RELEASE data before the deadline:
+// srt-live-transmit's TSBPD (and ristreceiver's recovery buffer) release at
+// ingest + latency ON THE RECEIVER'S CLOCK, whose view of ingest trails send time
+// by the one-way transit — measured arrivals sit at send + latency + owd + ε, so
+// latency == budget − headroom alone scores ~owd late at EVERY budget (the 0%
+// C-anchor artifact; min/med lateness ≈ owd + 0-10 ms across buf 150-600). An
+// operator deploying against a hard send-time deadline budgets for transit:
+// latency = budget − owd − 20 ms output headroom (TSBPD/buffer release jitter
+// measured ±8 ms; 10 ms straddled the deadline and dropped a third of libsrt's
+// on-time-capable chunks), floored at SRT's conventional 20 ms minimum. This is
+// the same physics the Meld arm pays internally (its deadline stamps are
+// send-time + budget, covering transit).
+func arbLatency(budgetMs, owdMs int) int {
+	l := budgetMs - owdMs - 20
+	if l < 20 {
+		l = 20
+	}
+	return l
+}
+
+// applyDeadlineArbiter drops every delivered seq whose first arrival missed its
+// playout deadline — sendStart + seq·paceUs + budget, the SAME hard per-chunk
+// deadline the Meld arms enforce internally (docs/bench.md "Deadline Semantics":
+// without this, ARQ arms are scored on frames EVENTUALLY delivered, and burst
+// cells compare scoring semantics rather than transports). Chunks with no
+// recorded arrival (nil map entry) are kept — the arbiter never invents loss.
+// Reports how many it dropped.
+func applyDeadlineArbiter(arm string, got map[uint32]bool, at map[uint32]time.Time, sendStart time.Time, paceUs int64, budgetMs int) int {
+	if at == nil || sendStart.IsZero() {
+		return 0
+	}
+	budget := time.Duration(budgetMs) * time.Millisecond
+	late := 0
+	for seq := range got {
+		arr, ok := at[seq]
+		if !ok {
+			continue
+		}
+		deadline := sendStart.Add(time.Duration(seq)*time.Duration(paceUs)*time.Microsecond + budget)
+		if arr.After(deadline) {
+			delete(got, seq)
+			late++
+		}
+	}
+	if late > 0 && os.Getenv("GLASSDBG") != "" {
+		lates := make([]time.Duration, 0, len(at))
+		for seq, arr := range at {
+			deadline := sendStart.Add(time.Duration(seq)*time.Duration(paceUs)*time.Microsecond + budget)
+			lates = append(lates, arr.Sub(deadline))
+		}
+		sort.Slice(lates, func(i, j int) bool { return lates[i] < lates[j] })
+		fmt.Fprintf(os.Stderr, "[arbiter arm=%s] dropped %d past-deadline chunks (kept %d); lateness min/med/max = %v / %v / %v\n",
+			arm, late, len(got), lates[0], lates[len(lates)/2], lates[len(lates)-1])
+	}
+	return late
 }
 
 type benchProc struct {
@@ -942,8 +1069,14 @@ func runLibsrt(c *chunked, loss float64, rttMs, latMs int, paceUs int64, seed in
 	owd := time.Duration(rttMs/2) * time.Millisecond
 	rport, sink := freeUDP(), freeUDP()
 	got := map[uint32]bool{}
+	budgetMs := latMs // the cell budget; the arm's latency setting derives from it below
+	var arrivals map[uint32]time.Time
+	if *deadlineArbiter {
+		arrivals = map[uint32]time.Time{}
+		latMs = arbLatency(budgetMs, rttMs/2)
+	}
 	var mu sync.Mutex
-	sc := udpSink(sink, got, &mu)
+	sc := udpSink(sink, got, arrivals, &mu)
 	defer sc.Close()
 	pf := ""
 	if fec != "" {
@@ -980,7 +1113,7 @@ func runLibsrt(c *chunked, loss float64, rttMs, latMs int, paceUs int64, seed in
 		fmt.Fprintln(os.Stderr, "libsrt send exited:", err)
 		return nil
 	}
-	feed(feedInPort, c.chunks, paceUs)
+	feedStart := feed(feedInPort, c.chunks, paceUs)
 	time.Sleep(owd + time.Duration(latMs+800)*time.Millisecond)
 	if err, ok := sendP.exited(); ok {
 		fmt.Fprintln(os.Stderr, "libsrt send exited after feed:", err)
@@ -990,6 +1123,9 @@ func runLibsrt(c *chunked, loss float64, rttMs, latMs int, paceUs int64, seed in
 		fmt.Fprintln(os.Stderr, "libsrt recv exited after feed:", err)
 		return nil
 	}
+	mu.Lock()
+	defer mu.Unlock()
+	applyDeadlineArbiter("libsrt", got, arrivals, feedStart, paceUs, budgetMs)
 	return got
 }
 
@@ -1000,8 +1136,14 @@ func runLibrist(c *chunked, loss float64, rttMs, latMs int, paceUs int64, seed i
 	env := append(os.Environ(), "DYLD_LIBRARY_PATH="+home+"/dev/librist/build")
 	rport, feedIn, sink := freeEven(), freeUDP(), freeUDP()
 	got := map[uint32]bool{}
+	budgetMs := latMs // the cell budget; the arm's latency setting derives from it below
+	var arrivals map[uint32]time.Time
+	if *deadlineArbiter {
+		arrivals = map[uint32]time.Time{}
+		latMs = arbLatency(budgetMs, rttMs/2)
+	}
 	var mu sync.Mutex
-	sc := udpSink(sink, got, &mu)
+	sc := udpSink(sink, got, arrivals, &mu)
 	defer sc.Close()
 	recv := exec.Command(tools+"/ristreceiver", "-p", "0", "-b", strconv.Itoa(latMs),
 		"-i", fmt.Sprintf("rist://@127.0.0.1:%d", rport), "-o", fmt.Sprintf("udp://127.0.0.1:%d", sink))
@@ -1036,7 +1178,7 @@ func runLibrist(c *chunked, loss float64, rttMs, latMs int, paceUs int64, seed i
 		fmt.Fprintln(os.Stderr, "librist send exited:", err)
 		return nil
 	}
-	feed(feedIn, c.chunks, paceUs)
+	feedStart := feed(feedIn, c.chunks, paceUs)
 	time.Sleep(owd + time.Duration(latMs+800)*time.Millisecond)
 	if err, ok := sendP.exited(); ok {
 		fmt.Fprintln(os.Stderr, "librist send exited after feed:", err)
@@ -1046,6 +1188,9 @@ func runLibrist(c *chunked, loss float64, rttMs, latMs int, paceUs int64, seed i
 		fmt.Fprintln(os.Stderr, "librist recv exited after feed:", err)
 		return nil
 	}
+	mu.Lock()
+	defer mu.Unlock()
+	applyDeadlineArbiter("librist", got, arrivals, feedStart, paceUs, budgetMs)
 	return got
 }
 
@@ -1252,6 +1397,8 @@ func main() {
 	gensize := flag.Int("gensize", 0, "Meld GenSize override (0 = default)")
 	noauto := flag.Bool("noauto", false, "disable Meld AutoGenSize (pin GenSize)")
 	noreorder := flag.Bool("noreorder", false, "disable Meld AutoReorderHoldoff (on by default)")
+	nodecay := flag.Bool("nodecay", false, "disable Meld ProactiveDecay (on by default; A/B the margin/floor decay)")
+	reactiveshift := flag.Bool("reactiveshift", false, "enable Meld SlidingReactiveShift (experimental sliding reactive-offload bundle)")
 	sourceConstrained := flag.Bool("sourceconstrained", false, "model a constrained encoder/source: drop AVC SEI positively identified as non-recovery; default preserves SEI")
 	sourceDropDisposable := flag.Bool("sourcedropdisposable", false, "constrained AVC source model: also drop non-reference disposable pictures")
 	autoEncoderCadence := flag.Bool("autoencoder", false, "macro frontier: model Meld encoder recovery-cadence actuator; meld-auto may use bounded x264 source variants")
@@ -1259,11 +1406,14 @@ func main() {
 	autoEncoderByteCap := flag.Float64("autoencoderbytecap", 0, "macro frontier autoencoder: max Meld source bytes as a multiple of baseline source bytes (0=unbounded)")
 	autoEncoderPSNRMin := flag.Float64("autoencoderpsnrmin", 0, "macro frontier autoencoder: minimum average PSNR dB vs baseline source (0=disabled)")
 	jitterMs := flag.Int("jitter", 0, "max per-datagram forward jitter ms (injects reorder)")
+	deadlineArbiter = flag.Bool("deadlinearbiter", false, "equal-deadline scoring: drop chunks arriving past sendTime+budget for ALL arms (docs/bench.md \"Deadline Semantics\")")
 	reportDir := flag.String("reportdir", "", "write ladder report artifacts to this directory")
 	reportCaseName := flag.String("reportcase", "", "case name for report artifacts (default derived from loss/burst/RTT)")
 	flag.Parse()
 	jitterDur = time.Duration(*jitterMs) * time.Millisecond
 	meldNoReorder = *noreorder
+	meldNoDecay = *nodecay
+	meldReactiveShift = *reactiveshift
 	geBurstPkts = *geburst
 	sldWindow = *sldwin
 	meldTgtFail = *tgtfail
@@ -1506,7 +1656,7 @@ func main() {
 		want[strings.TrimSpace(a)] = true
 	}
 	order := []string{
-		"meld", "meld-auto", "meld-flat", "meld-flat-unit",
+		"meld", "meld-auto", "meld-outage", "meld-outage-off", "meld-flat", "meld-flat-unit",
 		"meld-uep-unit", "meld-flat-frame", "meld-uep", "meld-uep-frame", "meld-uep-frame-atomic", "meld-uep-frame-noatomic",
 		"meld-sld", "meld-sld-uep", "meld-repair-ceiling",
 		"oracle-source", "oracle-ideal",

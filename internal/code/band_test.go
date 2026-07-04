@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"math/rand"
 	"testing"
+
+	"github.com/zsiec/meld/internal/gf"
 )
 
 // winSym is the symbol size the sliding/band decoder tests use; winSrc builds n random
@@ -345,6 +347,85 @@ func TestBandLateRepairSoundness(t *testing.T) {
 		drain()
 		if got < n/3 {
 			t.Fatalf("seed %d: only delivered %d/%d (late-repair recovery regressed)", seed, got, n)
+		}
+	}
+}
+
+// TestBandDecoderMixedAnchorWindows pins the stranded-row fix: repair windows with
+// DIFFERENT anchors (the retrospective reactive tier anchors at a stuck delivery
+// cursor while proactive repair slides with the frontier) drive back-substitution
+// chains that legitimately grow a row past the band width b. The decoder must
+// either keep such a row visible to later eliminations (span cap 2b with a matching
+// scan radius) or discard it — never store it beyond the scan radius, where the
+// window reports full rank yet never collapses for delivery (the premature-drop
+// oracle's ge-15%-burst10-40ms regression, ids 134-145).
+func TestBandDecoderMixedAnchorWindows(t *testing.T) {
+	const (
+		b   = 16
+		n   = 96
+		sym = 8
+	)
+	src := make([][]byte, n)
+	for i := range src {
+		src[i] = make([]byte, sym)
+		for j := range src[i] {
+			src[i][j] = byte(i*31 + j*7 + 1)
+		}
+	}
+	repairAt := func(key uint16, base, width int) []byte {
+		coeffs := GenCoeffs(key, width)
+		pay := make([]byte, sym)
+		for j := 0; j < width; j++ {
+			gf.MulAdd(pay, src[base+j], coeffs[j])
+		}
+		return pay
+	}
+
+	d := NewBandDecoder(sym, b, 1024)
+	// Systematics arrive for everything EXCEPT a burst hole at [20, 32).
+	for i := 0; i < n; i++ {
+		if i >= 20 && i < 32 {
+			continue
+		}
+		d.AddSystematic(uint32(i), src[i])
+	}
+	got := map[uint32][]byte{}
+	drain := func() {
+		for {
+			rec, ok := d.Deliver()
+			if !ok {
+				return
+			}
+			got[rec.ID] = rec.Data
+		}
+	}
+	drain()
+	// Mixed anchors: proactive trailing windows marching with the frontier, inter-
+	// leaved with retro windows anchored at the stuck cursor (20). The interleaving
+	// is what chains back-substitutions across anchors and grows row spans.
+	key := uint16(1)
+	for round := 0; round < 8; round++ {
+		base := 32 + round*8
+		if base+b > n {
+			base = n - b
+		}
+		d.AddRepair(uint32(base), b, key, repairAt(key, base, b))
+		key++
+		d.AddRepair(20, b, key, repairAt(key, 20, b))
+		key++
+		d.AddRepair(24, b, key, repairAt(key, 24, b))
+		key++
+	}
+	drain()
+	for i := 0; i < n; i++ {
+		data, ok := got[uint32(i)]
+		if !ok {
+			t.Fatalf("id %d not delivered (stranded rows: rank present but never collapsed)", i)
+		}
+		for j := range data {
+			if data[j] != src[i][j] {
+				t.Fatalf("id %d corrupted at byte %d", i, j)
+			}
 		}
 	}
 }
