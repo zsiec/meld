@@ -44,6 +44,7 @@ type SlidingSender struct {
 	// grows one it must be tracked separately, never folded back in here.
 	rttMinCur   int64
 	rttMinPrev  int64
+	rttSample   int64 // latest instantaneous RTT sample (pre-min-fold): sample − rttMicros = queue delay
 	rttWinStart clock.Timestamp
 	// Repair flood breaker: AIMD cap on the PROACTIVE code rate, driven by wire-
 	// overrun evidence in feedback — the receiver's source-arrival rate falling far
@@ -58,12 +59,23 @@ type SlidingSender struct {
 	lastFBAt      clock.Timestamp
 	lastFBHighest uint32
 	lastFBSource  uint64 // stats.Source at the previous report (the exact offer)
+	lastFBRepair  uint64 // stats.Repair at the previous report (the offered repair mix)
 	arriveRatioQ8 int64  // EWMA of observed/offered source rate, Q8 (256 = keeping up)
-	lastWrite     clock.Timestamp
-	lastRepair    clock.Timestamp
-	lastReactive  clock.Timestamp
-	reactiveBase  uint32
-	reactiveSent  int
+	// Headroom-aware sizing (Amendment 9): a CONTINUOUS affordable-rate ceiling on
+	// the proactive set-point, measured from the passed-through fraction f =
+	// arrival/offer ÷ (1−reported loss). The breaker above is the post-hoc AIMD
+	// backstop; sizing to an unaffordable δ target and letting it clamp after the
+	// damage is the measured breaker/set-point LIMIT CYCLE (boom → 0.25-cap slam →
+	// 300-400 ms under-protection → drain → boom; the arc-8 isolation). This cap
+	// enters the sizer instead: tighten to the measured affordable rate on
+	// saturation evidence, probe upward additively only when arrivals track offer
+	// AND the RTT min-filter shows no standing queue. >= maxRepairFactor ⇒ inactive.
+	headroomCap  float64
+	lastWrite    clock.Timestamp
+	lastRepair   clock.Timestamp
+	lastReactive clock.Timestamp
+	reactiveBase uint32
+	reactiveSent int
 	// wireLossBudget gates retrospective repair on EVIDENCE of wire loss: the
 	// receiver's CongestionLoss field counts pre-recovery loss from the forward-gap
 	// walk — arrivals-based, so symbols merely in flight can never inflate it (the
@@ -124,6 +136,7 @@ func NewSlidingSender(cfg Config) *SlidingSender {
 		enc:           code.NewEncoder(cfg.SymbolSize),
 		rttMicros:     defaultRTTMicros,
 		floodCap:      maxRepairFactor, // breaker inactive until wire-overrun evidence
+		headroomCap:   maxRepairFactor, // affordable-rate ceiling inactive until saturation evidence
 		arriveRatioQ8: 256,
 		burstQ8:       burstQ8One,
 		deadlines:     make(map[uint32]clock.Timestamp),
@@ -996,19 +1009,60 @@ func (s *SlidingSender) FeedFeedback(now clock.Timestamp, fb wire.Feedback) {
 		return
 	}
 	s.fbCount++
+	// Captured before updateFloodBreaker's defer refreshes lastFBSource: whether any
+	// source symbols were offered in the interval this report covers (the clean-run
+	// progress gate below).
+	offeredSince := s.stats.Source != s.lastFBSource
 	s.updateRTT(now, fb)
 	s.updateFloodBreaker(now, fb)
 	s.pEst = float64(fb.LossRate) / 65535
 	// Floor-decay confidence (see floorDecayed): count consecutive feedbacks that
-	// POSITIVELY report a clean link; snap to zero on the first loss observation.
+	// POSITIVELY report a clean link; snap to zero on any contrary evidence.
 	// Keyed on the report, never on signal absence — a black hole or warmup delivers
 	// no feedback at all, so cleanRun stays 0 and the full floor is retained.
-	if fb.LossRate == 0 {
-		if s.cleanRun < cleanFloorConfirm {
-			s.cleanRun++
-		}
-	} else {
+	//
+	// A clean report is the STRICT composite: the persistent rate estimate AND the
+	// per-interval honest counter AND both decoder-state snapshots quiet. The rate
+	// term is the anchor — the per-regime signal survey (2026-07-04) measured the
+	// snapshot signals alone stringing 64+ quiet reports between bursts at 1% and
+	// even 10% GE loss (false-arm), while LossRate's EWMA/hold memory never goes
+	// quiet under real loss (longest zero-run 8-23 of the 64 required). The extra
+	// terms guard the rate term's own blind spot: LossRate is quantized to uint16,
+	// so sub-1.5e-5 loss reads 0 there while CongestionLoss>0 still reports each
+	// event, and Deficit/Missing surface damage the instant a report is assembled.
+	// On a clean link at natural timing all four are simultaneously quiet for 100%
+	// of reports (survey), so the strict conjunction costs nothing where it should
+	// arm. Under heavy reorder the walks fire constantly and the raw composite
+	// never arms — for that regime the peer's SETTLED evidence takes over below.
+	clean := fb.LossRate == 0 && fb.CongestionLoss == 0 && fb.Deficit == 0 && fb.Missing == 0
+	if fb.HasSettled {
+		// A settled-walk peer adjudicates reorder for us: SettledLost counts only
+		// ids proven absent past the reorder holdoff, so a clean-but-reordered link
+		// reads clean (the raw walks read dirty on nearly every report there) and
+		// any REAL wire loss — recovered or not — reads dirty within holdoff + one
+		// cadence. That bound is the re-arm latency trade: the raw composite
+		// re-armed on the same report as the loss evidence; settled evidence lags
+		// it by up to the holdoff (~10-30 ms), well inside what rounds >=
+		// reactiveFloorSafe already guarantees recoverable. The instantaneous
+		// Deficit/Missing snapshots are deliberately excluded here: on a
+		// clean+reorder link they are exactly the in-flight transients the settled
+		// walk exists to adjudicate. Like the raw composite, a total forward
+		// outage freezes every signal and reads clean — benign for the floor (a
+		// decayed floor changes nothing while the wire drops everything; the
+		// backlog settles dirty the moment arrivals resume).
+		clean = fb.SettledLost == 0
+	}
+	switch {
+	case !clean:
 		s.cleanRun = 0
+	case offeredSince && s.cleanRun < cleanFloorConfirm:
+		// Only reports covering an interval where source was actually OFFERED build
+		// confidence — an idle stream's "nothing offered, nothing lost" reports are
+		// vacuously clean and must not arm the decay toward an unprotected resume
+		// (the raw composite blocked idle re-arming by accident: LossRate's EWMA
+		// memory; settled evidence reads honestly quiet there). Idle freezes the
+		// counter; dirty evidence resets it regardless of offering.
+		s.cleanRun++
 	}
 	if s.burstQ8 = int(fb.Burstiness); s.burstQ8 < burstQ8One {
 		s.burstQ8 = burstQ8One // mean loss-run length for the burst-aware sizer (N2)
@@ -1187,24 +1241,21 @@ func (s *SlidingSender) codeRate() float64 {
 	if cold && p < coldStartP {
 		p = coldStartP
 	}
-	// The set-point depends only on (effectiveBand, p, burstQ8) — plus, with
-	// SlidingReactiveShift, the reactive-rounds credit and the floor-decay verdict — delta
+	// The set-point depends only on (effectiveBand, p, burstQ8, the reactive-rounds
+	// credit, the floor-decay verdict) — delta
 	// is constant — so return the memo when none has moved. These change only on
 	// feedback / slow RTT drift, so the expensive GE-tail search runs once per change
 	// instead of once per source symbol (the per-symbol cadence was the sliding
 	// profile's CPU/alloc pathology). The cached value is byte-identical to
 	// recomputing it. The cold-start window bypasses the memo (it is brief and p is
 	// being floored).
-	rounds := 0
-	if s.cfg.SlidingReactiveShift {
-		rounds = reactiveRoundsFrom(s.cfg.BufferMicros, s.rttMicros)
-	}
+	rounds := reactiveRoundsFrom(s.cfg.BufferMicros, s.rttMicros)
 	floorOff := s.floorDecayed(rounds)
 	relief := s.deltaReliefOn()
 	if !cold && s.crValid && b == s.crBand && p == s.crPEst && s.burstQ8 == s.crBurstQ8 &&
 		rounds == s.crRounds && floorOff == s.crFloorOff && relief == s.crRelief {
-		if s.crRate > s.floodCap {
-			return s.floodCap // the breaker cap varies per feedback, outside the memo key
+		if cap := s.proactiveCap(); s.crRate > cap {
+			return cap // the headroom/breaker caps vary per feedback, outside the memo key
 		}
 		return s.crRate
 	}
@@ -1279,15 +1330,27 @@ func (s *SlidingSender) codeRate() float64 {
 		}
 	}
 	rate := float64(r) / float64(b)
-	if rate < s.cfg.Redundancy && !floorOff {
+	if floorOff {
+		// Confirmed clean zeroes the WHOLE proactive set-point, not just the static
+		// floor: 64 consecutive settled-clean reports prove the wire lost nothing
+		// for >1.2s, so any pEst/burstQ8 above zero here is by construction a
+		// reorder ghost of the raw-order sizing walks (a real loss would have
+		// settled dirty within the holdoff and reset cleanRun) — sizing proactive
+		// repair from a known-false estimate is pure waste. Measured (arming sim,
+		// clean link + 3ms reorder): ghost pEst held the rate ABOVE the floor, so
+		// removing only the floor removed nothing. Exit is the same evidence path
+		// as the floor re-arm: first settled loss resets cleanRun and full sizing
+		// resumes instantly at the raw walks' (ghost-inflated, aggressive) view.
+		rate = 0
+	} else if rate < s.cfg.Redundancy {
 		rate = s.cfg.Redundancy
 	}
 	if !cold {
 		s.crBand, s.crPEst, s.crBurstQ8, s.crRounds, s.crFloorOff, s.crRelief, s.crRate, s.crValid =
 			b, p, s.burstQ8, rounds, floorOff, relief, rate, true
 	}
-	if rate > s.floodCap {
-		rate = s.floodCap // wire-overrun breaker: see updateFloodBreaker
+	if cap := s.proactiveCap(); rate > cap {
+		rate = cap // headroom cap (continuous) / flood breaker (backstop): see updateHeadroom
 	}
 	return rate
 }
@@ -1314,16 +1377,25 @@ func (s *SlidingSender) deltaReliefOn() bool {
 	return cycle > 0 && 2*s.cfg.BufferMicros >= deltaReliefMinCyclesX2*cycle
 }
 
-// floorDecayed is the sliding port of the generation sender's effectiveFloor rule
-// (gated on SlidingReactiveShift): drop the static Redundancy floor only when the link is
-// CONFIRMED clean (cleanFloorConfirm consecutive feedbacks positively reporting zero
-// loss — never mere signal absence: warmup and black holes keep the full floor) AND
-// the retro-reactive tier can run at least reactiveFloorSafe rounds inside the
-// budget, so a loss onset is caught reactively with margin. On a confirmed-clean,
-// reactive-capable link the floor recovers nothing — it is pure overhead the ARQ
-// competitors do not pay.
+// floorDecayed is the sliding port of the generation sender's effectiveFloor rule:
+// drop the static Redundancy floor only when the link is CONFIRMED clean
+// (cleanFloorConfirm consecutive feedbacks positively reporting the strict clean
+// composite — never mere signal absence: warmup and black holes keep the full
+// floor) AND the retro-reactive tier can run at least reactiveFloorSafe rounds
+// inside the budget, so a loss onset is caught reactively with margin. On a
+// confirmed-clean, reactive-capable link the floor recovers nothing — it is pure
+// overhead the ARQ competitors do not pay.
+//
+// DEFAULT-ON (2026-07-04), previously gated on SlidingReactiveShift: the glass
+// clean cell (rtt 60, 3×RTT budget) measured 15.7% standing overhead at 100%
+// delivery against 3.3% with the decay engaged, identical delivery — the floor
+// premium was meld's largest real cost vs ARQ transports on clean links. The
+// eligibility gate is structural: at 2.5×RTT and below, rounds < reactiveFloorSafe
+// and the full floor is retained (measured: the decay cannot and does not engage
+// there). The composite detector never armed across 1%-loss, 10% GE-burst, and
+// heavy-reorder trace surveys; see cleanRun's keying in FeedFeedback.
 func (s *SlidingSender) floorDecayed(rounds int) bool {
-	return s.cfg.SlidingReactiveShift && s.cleanRun >= cleanFloorConfirm && rounds >= reactiveFloorSafe
+	return s.cleanRun >= cleanFloorConfirm && rounds >= reactiveFloorSafe
 }
 
 // reactive answers a feedback deficit with coded repair over the STUCK window at
@@ -1570,7 +1642,10 @@ const (
 // grows without bound, every latency estimate poisons, and delivery collapses (the
 // excursion post-mortem). The response is AIMD on the PROACTIVE rate cap only.
 func (s *SlidingSender) updateFloodBreaker(now clock.Timestamp, fb wire.Feedback) {
-	defer func() { s.lastFBAt, s.lastFBHighest, s.lastFBSource = now, fb.HighestSeen, s.stats.Source }()
+	defer func() {
+		s.lastFBAt, s.lastFBHighest, s.lastFBSource, s.lastFBRepair =
+			now, fb.HighestSeen, s.stats.Source, s.stats.Repair
+	}()
 	if s.lastFBAt == 0 || fb.HighestSeen <= s.lastFBHighest {
 		return
 	}
@@ -1583,6 +1658,7 @@ func (s *SlidingSender) updateFloodBreaker(now clock.Timestamp, fb wire.Feedback
 		arrived = 512 // in-flight skew can transiently exceed the window's offer; clamp
 	}
 	s.arriveRatioQ8 += (arrived - s.arriveRatioQ8) / 4
+	s.updateHeadroom(fb, offered, arrived, now.Sub(s.lastFBAt))
 	thresh := int64(float64(floodTriggerQ8) * (1 - s.pEst))
 	if thresh < floodTriggerMinQ8 {
 		thresh = floodTriggerMinQ8
@@ -1606,6 +1682,100 @@ func (s *SlidingSender) updateFloodBreaker(now clock.Timestamp, fb wire.Feedback
 	}
 }
 
+// Headroom-cap constants (Amendment 9). The saturation threshold sits below the
+// honest-loss noise floor measured by the three-regime survey (f reads 1.0 under
+// 10% GE loss with rare onset dips to ~0.93, and 0.53-0.80 under real overrun),
+// so honest loss never tightens the cap; the clear threshold plus the standing-
+// queue gate govern the time-based upward probe — small-signal hunting around
+// capacity instead of the AIMD's 0.25↔3.0 relaxation oscillation.
+const (
+	headroomSatF        = 0.90 // saturation evidence: passed-through fraction below this tightens
+	headroomClearF      = 0.97 // arrivals track offer above this: eligible to probe upward
+	headroomProbePerSec = 0.50 // additive probe rate (time-based: 10 ms event feedbacks must not multiply it)
+	headroomSafety      = 0.90 // discount on the measured affordable rate
+)
+
+// updateHeadroom folds one report into the affordable-rate ceiling: with the wire
+// passing fraction f of the offered (1+r) mix, the affordable proactive rate is
+// f·(1+r)−1 — offered load equal to what the wire demonstrably serves. Tighten to
+// that (discounted) on saturation evidence; probe upward additively (per unit
+// TIME, not per report) only when arrivals track offer AND the RTT min-filter
+// window shows no standing queue (at capacity the queue stands even while
+// arrivals track offer, and probing then is what re-enters the boom).
+//
+// f is the INSTANTANEOUS same-interval ratio, deliberately not the breaker's
+// EWMA: during the post-tighten queue DRAIN the EWMA keeps reading low while the
+// offered mix has already been cut, and recombining the two ratchets the
+// "affordable" estimate below zero (measured: the cap slammed to the 0.25 floor
+// within two reports of every tighten). The instantaneous ratio reads ≥1 during
+// a drain (arrivals = wire service against the reduced offer) — no false
+// tighten — and the standing-queue gate keeps the drain from reading as
+// probe-eligible.
+//
+// Tightening requires BOTH kinds of evidence — f low AND a standing queue in
+// the RTT min-filter — because a low f alone is ambiguous: GE-burst frontier
+// stalls depress the same-interval arrival ratio with no congestion at all, and
+// on an UNSATURATED wire that misread strips protection that was load-bearing
+// (glass, first cut: ge12@0.75x 97.9→90.6 and ge48@1.5x 98.4→91.0 median, both
+// cells where the baseline DELIVERS at 245-256% overhead — the wire affords
+// it). Real overrun always stands a queue (sim booms: rtt 61→72-93ms; the hole
+// cell's flood self-queues per the excursion post-mortem), so requiring the
+// delay signature restores those guards while keeping every true-saturation
+// tighten. The tighten queue bar (min + 1/8) sits below the probe's quiet bar
+// (min + 1/4): asymmetric hysteresis — tighten on modest queue evidence, probe
+// only when the queue is clearly gone. The cap never drops below the breaker's
+// protection floor nor below the reported mean-loss replacement rate plus
+// margin — a cap under the mean guarantees decode failure, the onset
+// false-constraint hazard the survey's transient f≈0.93 dips under honest loss
+// demand guarding against.
+func (s *SlidingSender) updateHeadroom(fb wire.Feedback, offered uint64, arrivedQ8, dtMicros int64) {
+	if !s.cfg.HeadroomAwareSizing {
+		return // opt-in (Config.HeadroomAwareSizing): the cap stays inactive
+	}
+	repOffered := float64(s.stats.Repair-s.lastFBRepair) / float64(offered)
+	denom := 1 - float64(fb.LossRate)/65535
+	if denom < 0.5 {
+		denom = 0.5 // deep-loss floor, as the breaker's trigger: attribution saturates
+	}
+	f := (float64(arrivedQ8) / 256) / denom
+	if f > 1 {
+		f = 1
+	}
+	// The queue witness is the INSTANTANEOUS sample, not the min-filter: the
+	// min-window (1.5 s halves) is built to exclude queueing, so it cannot see a
+	// sub-window boom (gating on it un-broke the sim limit cycle). The 1/6 bar
+	// clears glass natural release wobble (~±13%).
+	switch {
+	case f < headroomSatF && s.rttSample > s.rttMicros+s.rttMicros/6:
+		if cap := headroomSafety * (f*(1+repOffered) - 1); cap < s.headroomCap {
+			s.headroomCap = cap
+			s.stats.HeadroomTightens++
+		}
+	case f >= headroomClearF && s.rttMinCur <= s.rttMicros+s.rttMicros/4:
+		s.headroomCap += headroomProbePerSec * float64(dtMicros) / 1e6
+	}
+	if s.headroomCap < floodCapMin {
+		s.headroomCap = floodCapMin
+	}
+	if pFloor := 1.3 * float64(fb.LossRate) / 65535; s.headroomCap < pFloor {
+		s.headroomCap = pFloor
+	}
+	if s.headroomCap > maxRepairFactor {
+		s.headroomCap = maxRepairFactor // inactive
+	}
+}
+
+// proactiveCap is the effective ceiling on the proactive set-point: the continuous
+// headroom cap (sizer-integrated, Amendment 9) backstopped by the AIMD flood
+// breaker (which should now rarely bind — it fires only when the continuous cap's
+// estimate lagged real overrun).
+func (s *SlidingSender) proactiveCap() float64 {
+	if s.headroomCap < s.floodCap {
+		return s.headroomCap
+	}
+	return s.floodCap
+}
+
 func (s *SlidingSender) updateRTT(now clock.Timestamp, fb wire.Feedback) {
 	if fb.HighestSeen == 0 {
 		return
@@ -1618,6 +1788,7 @@ func (s *SlidingSender) updateRTT(now clock.Timestamp, fb wire.Feedback) {
 	if sample <= 0 {
 		return
 	}
+	s.rttSample = sample // per-report instantaneous RTT: the queue-delay witness (updateHeadroom)
 	if s.rttWinStart == 0 {
 		s.rttWinStart, s.rttMinCur, s.rttMinPrev = now, sample, sample
 	} else if now.Sub(s.rttWinStart) > rttMinHalfWindowMicros {
@@ -1700,6 +1871,18 @@ type SlidingReceiver struct {
 	fastHaveExpect bool
 	fastExpect     uint32
 
+	// Settled-loss walk (wire.Feedback.SettledLost): a second, ALWAYS-ON adaptive
+	// reorder window whose resequenced gap walk counts only losses that survived the
+	// holdoff — the reorder-tolerant clean/dirty evidence the sender's floor decay
+	// keys on. It feeds NOTHING else: the sizing estimators keep the raw-order walks
+	// above (a settled sizing walk reads truer burst lengths, and the honest GE
+	// set-point then exceeds paced wire headroom — the measured breaker/set-point
+	// limit cycle that refuted the holdoff port for sizing, twice).
+	settled          reorderWindow
+	settledStarted   bool
+	settledNext      uint32
+	settledLostSince int // settled-lost ids since the last feedback report
+
 	// Per-symbol deadline. Each directly-received id carries its own stamped deadline (write
 	// time + budget); the receiver delivers/evicts by THAT, so an access unit written as one
 	// burst — a whole video frame at one instant, sharing one deadline — is not gated by the
@@ -1761,7 +1944,47 @@ func NewSlidingReceiver(cfg Config) *SlidingReceiver {
 		budget:   cfg.BufferMicros,
 		sink:     func(id uint32, _ uint8) { r.observeLoss(id) },
 		lateSink: func(id uint32, _ uint8) { r.observeLossWindow(id) }}
+	// The settled-loss walk is always on, with a FIXED, conservatively generous
+	// holdoff (an explicit ReorderHoldoffMicros overrides it). Fixed, not the
+	// adaptive AutoReorderHoldoff dynamics: the adaptive window decays 1/8 on every
+	// filled gap, so under steady reorder it keeps shrinking back below the spread
+	// and periodically settles a merely-late id lost — one such false settle per
+	// 1.3 s is enough to keep resetting a 64-consecutive-clean detector forever
+	// (measured: the arming sim never armed on a clean reordered link). Estimator
+	// tolerance forgives occasional miscounts; a consecutive-run detector does not.
+	// Over-holding is the fail-safe direction here — it only delays loss evidence,
+	// bounding floor re-arm at holdoff + one report cadence, which the decay's
+	// rounds >= reactiveFloorSafe eligibility already covers with margin. Its gap
+	// walk counts a loss only after the holdoff proves the id absent. No lateSink:
+	// this walk feeds no rate window, so the queueing-runaway credit does not apply.
+	r.settled = reorderWindow{cfgHoldoff: settledHoldoffMicros(cfg),
+		budget: cfg.BufferMicros,
+		sink: func(id uint32, _ uint8) {
+			if r.settledStarted && id > r.settledNext {
+				r.settledLostSince += int(id - r.settledNext)
+			}
+			r.settledStarted, r.settledNext = true, id+1
+		}}
 	return r
+}
+
+// settledHoldoffMicros is the settled-loss walk's fixed reorder holdoff: an
+// explicit ReorderHoldoffMicros wins; otherwise an eighth of the deadline budget,
+// clamped to [10ms, 30ms] — generous against plausible reorder spreads (the glass
+// jitter cells measure <= 5ms; real-path reorder is typically single-digit ms)
+// while adding at most one-to-two report cadences of floor re-arm latency.
+func settledHoldoffMicros(cfg Config) int64 {
+	if cfg.ReorderHoldoffMicros > 0 {
+		return cfg.ReorderHoldoffMicros
+	}
+	h := cfg.BufferMicros / 8
+	if h < 10_000 {
+		h = 10_000
+	}
+	if h > 30_000 {
+		h = 30_000
+	}
+	return h
 }
 
 // FeedSymbolECN absorbs one inbound symbol with its IP ECN codepoint. The sliding profile
@@ -1817,6 +2040,15 @@ func (r *SlidingReceiver) FeedSymbol(now clock.Timestamp, datagram []byte) {
 		if sym.HasFrameDesc {
 			r.noteFrame(sym)
 		}
+		// The settled walk observes WIRE arrivals, so it must be fed BEFORE the
+		// duplicate/cursor gate: a reorder-ghost repair can RECOVER an in-flight id,
+		// advancing the cursor past it, and the real systematic then lands here as a
+		// "duplicate" — gating the walk on novelty made it settle that id lost on a
+		// zero-loss link (measured: 1-3 false settled losses per report, exactly the
+		// ghost-reactive rate, holding cleanRun at zero forever). A true wire dup is
+		// harmless to the walk: its second copy takes the id<next late path, which
+		// counts nothing under the fixed holdoff.
+		r.settled.feed(now, id, 0)
 		if id < r.dec.Cursor() || r.directRecv[id] {
 			r.stats.Duplicates++
 		} else {
@@ -1874,6 +2106,9 @@ func (r *SlidingReceiver) admit(coverID uint32) bool {
 func (r *SlidingReceiver) Tick(now clock.Timestamp) {
 	if r.reorder.enabled() {
 		r.reorder.drain(now) // settle losses whose holdoff expired without a new arrival
+	}
+	if r.settled.enabled() {
+		r.settled.drain(now) // the settled-loss walk expires holdoffs on the clock too
 	}
 	r.pump(now)
 	r.maybeFeedback(now)
@@ -2028,6 +2263,10 @@ func (r *SlidingReceiver) maybeFeedback(now clock.Timestamp) {
 	if def > 0xFFFF {
 		def = 0xFFFF
 	}
+	settledLost := r.settledLostSince
+	if settledLost > 0xFFFF {
+		settledLost = 0xFFFF
+	}
 	frames, decFrames, keys, decKeys := feedbackFrameStats(r.fstats)
 	r.sendQ = append(r.sendQ, wire.EncodeFeedback(nil, wire.Feedback{
 		Flow:               r.cfg.Flow,
@@ -2047,8 +2286,12 @@ func (r *SlidingReceiver) maybeFeedback(now clock.Timestamp) {
 		// are missing (covered-but-unproducible). The sender answers set bits with
 		// unit repairs — the closure-law-exempt response (see wire.Feedback.Missing).
 		Missing: r.dec.MissingIn(r.dec.Cursor()),
+		// Settled-loss evidence for the sender's floor decay (reorder-tolerant;
+		// see wire.Feedback.SettledLost and the settled walk's construction).
+		SettledLost: uint16(settledLost),
 	}))
-	r.clSinceFB = 0 // per-interval; consumers integrate the reported deltas
+	r.clSinceFB = 0        // per-interval; consumers integrate the reported deltas
+	r.settledLostSince = 0 // per-interval, like clSinceFB
 	// No open-deficit latch — loss onset only (see the generation receiver's doc).
 }
 

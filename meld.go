@@ -93,7 +93,16 @@ type Config struct {
 	// only for now. Receiver-side. Off by default.
 	AutoReorderHoldoff bool
 	// Redundancy is the FLOOR proactive code rate (repair per source symbol); the
-	// controller raises the rate above it as the measured loss requires.
+	// controller raises the rate above it as the measured loss requires. On a link
+	// CONFIRMED clean whose latency budget affords at least two reactive repair
+	// rounds, proactive repair decays to zero and any loss onset is caught
+	// reactively — protection there recovers nothing and is pure overhead; the
+	// first loss evidence restores full sizing instantly. Cleanliness is judged by
+	// the receiver's SETTLED walk (an id counts lost only after a reorder holdoff
+	// proves it absent), so plain reorder neither blocks the decay nor fakes
+	// cleanliness; against a peer predating that evidence, every raw loss signal
+	// must be quiet instead. Warmup, absent feedback, idle intervals, and tight
+	// budgets always retain the full floor.
 	Redundancy float64
 	// TargetFailure is the per-generation decode-failure probability the redundancy
 	// controller sizes the proactive code rate to (the QoS knob). 0 ⇒ default 1e-3.
@@ -190,7 +199,7 @@ type Config struct {
 	// ON by default (DefaultConfig); set false for the outage-blind estimators.
 	OutageAware bool
 	// SlidingReactiveShift (EXPERIMENTAL, off by default) enables the sliding profile's
-	// reactive-offload levers: confirmed-clean floor decay, the rounds-gated burst/variance
+	// remaining reactive-offload levers: the rounds-gated burst/variance
 	// margin discount, budget-conditional TargetFailure relief, and NACK-bitmap unit
 	// answering (the receiver's missing-ids bitmap answered with instant-closing unit
 	// retransmissions of retained sources; measured to collapse hole release latency
@@ -200,6 +209,17 @@ type Config struct {
 	// cells; off until a regime where release latency is the margin earns it more.
 	// Sender-side.
 	SlidingReactiveShift bool
+	// HeadroomAwareSizing (EXPERIMENTAL, off by default) caps the sliding profile's
+	// proactive repair set-point at the wire's MEASURED affordable rate, so the sizer
+	// never demands protection the path cannot carry (unaffordable sizing floods the
+	// sender's own queue and collapses delivery — the breaker/set-point limit cycle).
+	// On explicit-capacity links the deterministic bench measures large wins (the
+	// worst saturating cell 23%→95% of chunks delivered in time; nine sweep cells +9
+	// to +70 points at lower overhead; none worse). Off by default: a loopback bench
+	// has no true wire capacity and misreads bursty scheduling delay as saturation
+	// (two bursty cells traded ~6 points of delivery for ~200 points of overhead
+	// there), so the default waits on real-path validation. Sender-side.
+	HeadroomAwareSizing bool
 	// Passphrase enables encryption (docs/encryption.md): when non-empty, the Sender and
 	// Receiver run an X25519 + ML-KEM-768 hybrid post-quantum handshake before any media
 	// and AEAD-seal every chunk (encrypt-then-code, forward-secret, authenticated). Both
@@ -314,6 +334,7 @@ func (c Config) toFlow() flow.Config {
 		RepairWithinBudget:     c.RepairWithinBudget,
 		OutageAware:            c.OutageAware,
 		SlidingReactiveShift:   c.SlidingReactiveShift,
+		HeadroomAwareSizing:    c.HeadroomAwareSizing,
 	}
 }
 
@@ -387,6 +408,7 @@ type SenderStats struct {
 	Repair                uint64 // repair symbols sent (total)
 	ReactiveRepair        uint64 // the subset sent in response to a feedback rank deficit
 	Throttled             uint64 // repair symbols dropped by the aggregate rate ceiling
+	HeadroomTightens      uint64 // headroom-cap tighten events: sustained wire-saturation evidence capped the proactive set-point (sliding profile)
 	RecoveryCadenceFrames uint16 // encoder max recovery interval request; 0 means relaxed
 
 	// Per-mechanism attribution of Repair. The five counters below sum to Repair on
@@ -559,8 +581,9 @@ func (s *Sender) Stats() SenderStats {
 func senderStatsFromFlow(st flow.SenderStats) SenderStats {
 	return SenderStats{
 		Source: st.Source, Repair: st.Repair, ReactiveRepair: st.ReactiveRepair,
-		Throttled: st.Throttled, RecoveryCadenceFrames: st.RecoveryCadenceFrames,
-		RepairProactive: st.RepairProactive, RepairProactiveCold: st.RepairProactiveCold,
+		Throttled: st.Throttled, HeadroomTightens: st.HeadroomTightens,
+		RecoveryCadenceFrames: st.RecoveryCadenceFrames,
+		RepairProactive:       st.RepairProactive, RepairProactiveCold: st.RepairProactiveCold,
 		RepairSingleton: st.RepairSingleton, RepairSparse: st.RepairSparse, RepairDeficit: st.RepairDeficit,
 	}
 }

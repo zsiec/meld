@@ -21,11 +21,10 @@ import (
 	"github.com/zsiec/meld/internal/wire"
 )
 
-// lastFuzzChannel records the channel kind fuzzConfig drew (debug visibility).
-var lastFuzzChannel string
-
-// fuzzConfig draws one valid Config + channel + timing from a seeded PRNG.
-func fuzzConfig(rng *rand.Rand) (Config, simLink) {
+// fuzzConfig draws one valid Config + channel + timing from a seeded PRNG,
+// returning the channel kind for the per-case log (a package-level record of it
+// raced under t.Parallel — unsynchronized writes from every subtest).
+func fuzzConfig(rng *rand.Rand) (Config, simLink, string) {
 	pick := func(xs []int64) int64 { return xs[rng.Intn(len(xs))] }
 	cfg := Config{
 		Flow:          1,
@@ -54,6 +53,7 @@ func fuzzConfig(rng *rand.Rand) (Config, simLink) {
 	}
 	cfg.ProactiveDecay = rng.Intn(2) == 0
 	cfg.AutoReorderHoldoff = rng.Intn(2) == 0
+	cfg.HeadroomAwareSizing = rng.Intn(3) == 0
 	cfg.OutageAware = rng.Intn(2) == 0
 	cfg.RepairWithinBudget = rng.Intn(2) == 0
 	cfg.ProtectedRepairPhasing = rng.Intn(2) == 0
@@ -64,22 +64,23 @@ func fuzzConfig(rng *rand.Rand) (Config, simLink) {
 
 	// The channel: loss model × reorder × propagation × cadence × wire physics.
 	var drop func(wire.Symbol) bool
+	var channel string
 	switch rng.Intn(4) {
 	case 0:
-		lastFuzzChannel = "clean"
+		channel = "clean"
 		drop = func(wire.Symbol) bool { return false }
 	case 1:
 		p := []float64{0.02, 0.10, 0.25}[rng.Intn(3)]
-		lastFuzzChannel = "uniform"
+		channel = "uniform"
 		drop = uniformDrop(rng.Uint64()|1, p)
 	case 2:
 		b := []float64{8, 48, 200}[rng.Intn(3)]
-		lastFuzzChannel = "ge"
+		channel = "ge"
 		drop = geDrop(rng.Int63()|1, 0.10, b)
 	default:
 		// An emission-count total outage mid-stream (kills source AND repair).
 		to := 200 + 40*(1+rng.Intn(8))
-		lastFuzzChannel = "outage"
+		channel = "outage"
 		ch := &pathOutageChannel{path: 0, from: 200, to: to}
 		drop = ch.drop
 	}
@@ -109,7 +110,7 @@ func fuzzConfig(rng *rand.Rand) (Config, simLink) {
 	if rng.Intn(4) == 0 {
 		sl.burst = 4 // whole-access-unit batched writes
 	}
-	return cfg, sl
+	return cfg, sl, channel
 }
 
 // TestConfigPermutationFuzz draws random config×channel cases and asserts the four
@@ -144,7 +145,7 @@ func TestConfigPermutationFuzz(t *testing.T) {
 func runFuzzCase(t *testing.T, caseSeed int64) {
 	t.Helper()
 	rng := rand.New(rand.NewSource(caseSeed))
-	cfg, sl := fuzzConfig(rng)
+	cfg, sl, channel := fuzzConfig(rng)
 	defer func() {
 		if r := recover(); r != nil {
 			t.Fatalf("case seed %d PANICKED: %v (cfg=%+v)", caseSeed, r, cfg)
@@ -153,8 +154,8 @@ func runFuzzCase(t *testing.T, caseSeed int64) {
 	snd, rcv := newFuzzCores(cfg)
 	res := sl.runCores(snd, rcv)
 	label := "cfgfuzz seed " + strconv.FormatInt(caseSeed, 10)
-	t.Logf("cfg: %+v sim: owd=%d src=%d jitter=%d pace=%d burst=%d",
-		cfg, sl.owdMicros, sl.srcMicros, sl.jitterMicros, sl.paceBytesPerSec, sl.burst)
+	t.Logf("cfg: %+v sim: channel=%s owd=%d src=%d jitter=%d pace=%d burst=%d",
+		cfg, channel, sl.owdMicros, sl.srcMicros, sl.jitterMicros, sl.paceBytesPerSec, sl.burst)
 	// Two DOCUMENTED residuals are recorded, not failed (everything else is strict):
 	// (1) a RECOVERED id carries no stamp of its own, so it is delivered/evicted by
 	// the extrapolated deadline fit; the fit's error (a few ms after an outage or

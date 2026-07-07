@@ -42,18 +42,10 @@ func sweepArms() []sweepArm {
 	return []sweepArm{
 		{"default", func(c *Config) {}},
 		{"AA", func(c *Config) {}}, // same config, disjoint timing seed: the noise floor
-		// C1/C2: the generation sender's floor decay + reactive-availability margin
-		// discount, ported to the sliding profile behind ProactiveDecay.
-		{"sld-shift", func(c *Config) { c.SlidingReactiveShift = true }},
-		{"tf1e-2", func(c *Config) { c.TargetFailure = 1e-2 }},
-		{"shift+tf", func(c *Config) { c.SlidingReactiveShift = true; c.TargetFailure = 1e-2 }},
-		{"shift+tf+cw128", func(c *Config) {
-			c.SlidingReactiveShift, c.TargetFailure, c.CodingWindow = true, 1e-2, 128
-		}},
-		// Ladder re-run arms (arc 3): the fixed reorder window, alone and with the
-		// reactive-shift bundle, on the min-RTT + flood-breaker substrate.
+		// Arc-8 step-1 reproduction pass (PREREG Amendment 8): the arc-3
+		// RE-REFUTED holdoff wiring, re-scored on the ARBITERED metric before the
+		// isolation work — nothing else in the arm set for a clean reproduction.
 		{"hold8", func(c *Config) { c.ReorderHoldoffMicros = 8_000 }},
-		{"hold8+shift", func(c *Config) { c.ReorderHoldoffMicros = 8_000; c.SlidingReactiveShift = true }},
 	}
 }
 

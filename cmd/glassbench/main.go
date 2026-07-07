@@ -343,6 +343,9 @@ var meldNoAuto bool
 var meldNoReorder bool
 var meldNoDecay bool
 var meldReactiveShift bool
+
+// meldHeadroom enables the experimental headroom-aware proactive sizing (A/B arm).
+var meldHeadroom bool
 var jitterDur time.Duration
 
 // deadlineArbiter scores every arm against the same hard per-chunk playout deadline
@@ -776,6 +779,9 @@ func runMeldArm(c *chunked, arm meldArmConfig, loss float64, rttMs, budgetMs int
 	if meldReactiveShift {
 		cfg.SlidingReactiveShift = true // opt-in sliding reactive-offload bundle (A/B arm)
 	}
+	if meldHeadroom {
+		cfg.HeadroomAwareSizing = true // opt-in affordable-rate ceiling on the proactive sizer (A/B arm)
+	}
 	if arm.sliding {
 		// Band-form sliding coder: repair is fungible across a wide window, so a
 		// concentrated burst is covered without a round trip (vs the generation
@@ -896,9 +902,9 @@ func runMeldArm(c *chunked, arm meldArmConfig, loss float64, rttMs, budgetMs int
 				miss[i*10/total]++
 			}
 		}
-		fmt.Fprintf(os.Stderr, "[dbg arm=%s frame=%v uep=%v atomic=%v noframepolicy=%v sld=%v] tx src=%d repair=%d(reactive=%d throttled=%d) | relay enq=%d sent=%d | rx deliv=%d recov=%d lost=%d evicted=%d | got=%d/%d | miss-by-decile=%v\n",
+		fmt.Fprintf(os.Stderr, "[dbg arm=%s frame=%v uep=%v atomic=%v noframepolicy=%v sld=%v] tx src=%d repair=%d(reactive=%d throttled=%d tightens=%d) | relay enq=%d sent=%d | rx deliv=%d recov=%d lost=%d evicted=%d | got=%d/%d | miss-by-decile=%v\n",
 			arm.name, arm.frame, arm.uep, cfg.FrameAtomic, arm.disableFramePolicy, cfg.Sliding,
-			txStats.Source, txStats.Repair, txStats.ReactiveRepair, txStats.Throttled,
+			txStats.Source, txStats.Repair, txStats.ReactiveRepair, txStats.Throttled, txStats.HeadroomTightens,
 			relayStats.ForwardEnqueued, relayStats.ForwardSent,
 			rxStats.Delivered, rxStats.Recovered, rxStats.Lost, rxStats.Evicted, len(got), total, miss)
 		fmt.Fprintf(os.Stderr, "[attr arm=%s] proactive=%d cold=%d singleton=%d sparse=%d deficit=%d (repair=%d)\n",
@@ -1399,6 +1405,7 @@ func main() {
 	noreorder := flag.Bool("noreorder", false, "disable Meld AutoReorderHoldoff (on by default)")
 	nodecay := flag.Bool("nodecay", false, "disable Meld ProactiveDecay (on by default; A/B the margin/floor decay)")
 	reactiveshift := flag.Bool("reactiveshift", false, "enable Meld SlidingReactiveShift (experimental sliding reactive-offload bundle)")
+	headroom := flag.Bool("headroom", false, "enable Meld HeadroomAwareSizing (experimental affordable-rate ceiling on proactive repair)")
 	sourceConstrained := flag.Bool("sourceconstrained", false, "model a constrained encoder/source: drop AVC SEI positively identified as non-recovery; default preserves SEI")
 	sourceDropDisposable := flag.Bool("sourcedropdisposable", false, "constrained AVC source model: also drop non-reference disposable pictures")
 	autoEncoderCadence := flag.Bool("autoencoder", false, "macro frontier: model Meld encoder recovery-cadence actuator; meld-auto may use bounded x264 source variants")
@@ -1414,6 +1421,7 @@ func main() {
 	meldNoReorder = *noreorder
 	meldNoDecay = *nodecay
 	meldReactiveShift = *reactiveshift
+	meldHeadroom = *headroom
 	geBurstPkts = *geburst
 	sldWindow = *sldwin
 	meldTgtFail = *tgtfail

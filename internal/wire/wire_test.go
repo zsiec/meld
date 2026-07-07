@@ -79,7 +79,8 @@ func feedbackEqual(a, b Feedback) bool {
 		a.Frames != b.Frames || a.DecodableFrames != b.DecodableFrames ||
 		a.Keyframes != b.Keyframes || a.DecodableKeyframes != b.DecodableKeyframes ||
 		a.NewestDecodableLTR != b.NewestDecodableLTR || a.BrokenAnchors != b.BrokenAnchors ||
-		a.DeadPaths != b.DeadPaths || a.Missing != b.Missing {
+		a.DeadPaths != b.DeadPaths || a.Missing != b.Missing ||
+		a.SettledLost != b.SettledLost || a.HasSettled != b.HasSettled {
 		return false
 	}
 	return u16eq(a.PathLoss, b.PathLoss) && u16eq(a.SlotDist, b.SlotDist)
@@ -103,7 +104,8 @@ func TestFeedbackRoundTrip(t *testing.T) {
 		CongestionLoss: 1234, Burstiness: 512,
 		PathLoss: []uint16{26214, 6553, 3276}, SlotDist: []uint16{52000, 9000, 3000, 535},
 		Frames: 120, DecodableFrames: 117, Keyframes: 4, DecodableKeyframes: 3,
-		NewestDecodableLTR: 887, BrokenAnchors: 6, DeadPaths: 0b10, Missing: 0xDEAD_BEEF_0000_0101}
+		NewestDecodableLTR: 887, BrokenAnchors: 6, DeadPaths: 0b10, Missing: 0xDEAD_BEEF_0000_0101,
+		SettledLost: 321, HasSettled: true}
 	enc := EncodeFeedback(nil, want)
 	typ, err := PeekType(enc)
 	if err != nil || !IsFeedback(typ) {
@@ -141,20 +143,28 @@ func TestFeedbackRoundTrip(t *testing.T) {
 	}
 	// A datagram truncated before the LTR-resync tail (media stats present) decodes
 	// with the LTR and failover fields zero — an older peer's report reads as "no signal".
-	noLTR, err := DecodeFeedback(enc[:len(enc)-feedbackLTRLen-9])
+	noLTR, err := DecodeFeedback(enc[:len(enc)-feedbackLTRLen-11])
 	if err != nil || noLTR.Frames != want.Frames || noLTR.NewestDecodableLTR != 0 || noLTR.BrokenAnchors != 0 || noLTR.DeadPaths != 0 {
 		t.Fatalf("ltr-truncated decode: %+v err=%v", noLTR, err)
 	}
 	// Truncated after the LTR tail but before DeadPaths: LTR present, failover and
 	// missing-bitmap zero.
-	noDead, err := DecodeFeedback(enc[:len(enc)-9])
+	noDead, err := DecodeFeedback(enc[:len(enc)-11])
 	if err != nil || noDead.NewestDecodableLTR != want.NewestDecodableLTR || noDead.DeadPaths != 0 || noDead.Missing != 0 {
 		t.Fatalf("deadpaths-truncated decode: %+v err=%v", noDead, err)
 	}
-	// Truncated after DeadPaths but before the missing bitmap: bitmap reads zero.
-	noMiss, err := DecodeFeedback(enc[:len(enc)-8])
-	if err != nil || noMiss.DeadPaths != want.DeadPaths || noMiss.Missing != 0 {
+	// Truncated after DeadPaths but before the missing bitmap: bitmap and the
+	// settled tail read zero/absent.
+	noMiss, err := DecodeFeedback(enc[:len(enc)-10])
+	if err != nil || noMiss.DeadPaths != want.DeadPaths || noMiss.Missing != 0 || noMiss.HasSettled {
 		t.Fatalf("missing-truncated decode: %+v err=%v", noMiss, err)
+	}
+	// Truncated after the missing bitmap but before the settled tail (an arc-6-era
+	// peer): Missing decodes, HasSettled stays false — a zero count from an old peer
+	// must never read as positive clean evidence.
+	noSettled, err := DecodeFeedback(enc[:len(enc)-2])
+	if err != nil || noSettled.Missing != want.Missing || noSettled.HasSettled || noSettled.SettledLost != 0 {
+		t.Fatalf("settled-truncated decode: %+v err=%v", noSettled, err)
 	}
 }
 

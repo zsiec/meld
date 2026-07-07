@@ -171,6 +171,9 @@ type feedbackTraceEvent struct {
 	CongestionLoss     uint16  `json:"congestion_loss"`
 	NewestDecodableLTR uint32  `json:"newest_decodable_ltr,omitempty"`
 	BrokenAnchors      uint16  `json:"broken_anchors,omitempty"`
+	Missing            uint64  `json:"missing,omitempty"`
+	SettledLost        uint16  `json:"settled_lost,omitempty"`
+	HasSettled         bool    `json:"has_settled,omitempty"`
 }
 
 // arrivalTraceEvent is one chunk's FIRST arrival at the receiver-side sink.
@@ -348,6 +351,9 @@ func (t *seedTrace) recordFeedback(datagram []byte) {
 		CongestionLoss:     fb.CongestionLoss,
 		NewestDecodableLTR: fb.NewestDecodableLTR,
 		BrokenAnchors:      fb.BrokenAnchors,
+		Missing:            fb.Missing,
+		SettledLost:        fb.SettledLost,
+		HasSettled:         fb.HasSettled,
 	})
 }
 

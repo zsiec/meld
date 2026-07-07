@@ -473,6 +473,26 @@ type Feedback struct {
 	// law: rank arrives at need-rate, VALUES wait on full-rank closure). 0 = nothing
 	// missing / peer predates the extension.
 	Missing uint64
+
+	// --- settled-loss tail extension (appended, length-gated) ---
+
+	// SettledLost counts source ids the receiver's SETTLED walk confirmed lost since
+	// the last report: an id counts only after lower-neighborhood arrivals plus a
+	// reorder holdoff prove it absent, so a merely reordered-late arrival never
+	// counts. This is the reorder-tolerant clean/dirty evidence the sender's
+	// confirmed-clean floor decay keys on — the raw-order signals (LossRate,
+	// CongestionLoss, instantaneous Deficit/Missing) read dirty on almost every
+	// report under real reorder even at zero true loss, permanently blocking the
+	// decay. The settled walk feeds NOTHING else: the sizing estimators keep the
+	// raw-order walks (a settled sizing walk measures truer burst lengths, and the
+	// honest GE set-point then exceeds paced wire headroom — the measured
+	// breaker/set-point limit cycle that refuted the holdoff port twice).
+	// Saturates at 65535. Meaningful only when HasSettled.
+	SettledLost uint16
+	// HasSettled reports that the peer emitted the settled-loss tail (the field is
+	// length-gated on the wire, so a zero from an old peer is indistinguishable from
+	// a clean interval without it). Decode-side only.
+	HasSettled bool
 }
 
 // EncodeFeedback appends the encoded Feedback to dst and returns the slice. It
@@ -526,7 +546,10 @@ func encodeFeedbackMediaStats(dst []byte, f Feedback) []byte {
 	dst = append(dst, f.DeadPaths)
 	var miss [8]byte
 	binary.BigEndian.PutUint64(miss[:], f.Missing)
-	return append(dst, miss[:]...)
+	dst = append(dst, miss[:]...)
+	var settled [2]byte
+	binary.BigEndian.PutUint16(settled[:], f.SettledLost)
+	return append(dst, settled[:]...)
 }
 
 // DecodeFeedback parses a Feedback datagram. The base fields require feedbackLen
@@ -590,6 +613,11 @@ func DecodeFeedback(b []byte) (Feedback, error) {
 					off++
 					if len(b) >= off+8 {
 						f.Missing = binary.BigEndian.Uint64(b[off:])
+						off += 8
+						if len(b) >= off+2 {
+							f.SettledLost = binary.BigEndian.Uint16(b[off:])
+							f.HasSettled = true
+						}
 					}
 				}
 			}

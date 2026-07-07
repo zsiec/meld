@@ -15,6 +15,7 @@ type SenderStats struct {
 	Shed                  uint64 // top-temporal-layer source chunks dropped at the encoder (ShedTopLayerOverBudget)
 	DeadReactiveSkips     uint64 // reactive rounds skipped because repair provably could not arrive in time (Config.OutageAware)
 	RecoveryCadenceFrames uint16 // encoder max recovery interval request; 0 means relaxed
+	HeadroomTightens      uint64 // headroom-cap tighten events (sliding; sustained saturation evidence — see updateHeadroom)
 
 	// Per-mechanism attribution of Repair — where the redundancy bytes actually go,
 	// so cost work trims what measurement indicts rather than what theory suspects

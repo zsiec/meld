@@ -291,6 +291,19 @@ type Config struct {
 	// storms it targets). Off until the RTT estimator is hardened; the generation
 	// profile's ProactiveDecay is unaffected.
 	SlidingReactiveShift bool
+
+	// HeadroomAwareSizing (EXPERIMENTAL, off by default) integrates a measured
+	// affordable-rate ceiling into the sliding proactive sizer (updateHeadroom):
+	// the GE set-point is capped at what the wire demonstrably serves, breaking
+	// the breaker/set-point limit cycle the arc-9 isolation named. Sim-validated
+	// on explicit-capacity links (the worst holdoff cell 1391→5677-5762 of 6000
+	// delivered; nine sweep cells +9 to +70 pp at lower overhead; zero cells
+	// worse). OFF by default because the loopback glass bench REGRESSED two
+	// bursty guard cells (~-6 pp delivery for -170 to -200 pp overhead) — its
+	// wire has no true capacity, so transient scheduling delay reads as
+	// saturation there; a real path (which has real capacity) is the only honest
+	// arbiter, and this flag awaits that soak.
+	HeadroomAwareSizing bool
 }
 
 // maxPaths bounds the multipath arity (matching wire.feedbackMaxPaths): the per-path

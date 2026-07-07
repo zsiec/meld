@@ -50,6 +50,10 @@ type simLink struct {
 	// tap, when set, observes every forward datagram after the drop decision — placement
 	// and channel-behavior observability for tests (e.g. failover placement assertions).
 	tap func(sym wire.Symbol, dropped bool)
+	// fbTap, when set, observes every feedback report at the instant the sender has
+	// absorbed it — estimator-timeline observability (the caller closes over the
+	// cores handed to runCores to snapshot their post-absorption state).
+	fbTap func(now clock.Timestamp, fb wire.Feedback)
 }
 
 // simResult is the observed outcome of a simLink run.
@@ -236,6 +240,9 @@ func (sl simLink) runCores(s coreSenderT, r coreReceiverT) simResult {
 		deliverDue(&r2s, func(d []byte) {
 			if f, err := wire.DecodeFeedback(d); err == nil {
 				s.FeedFeedback(now, f)
+				if sl.fbTap != nil {
+					sl.fbTap(now, f)
+				}
 			}
 		})
 		s.Tick(now)
