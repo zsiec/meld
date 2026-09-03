@@ -166,12 +166,12 @@ func runNPProactive(t *testing.T, cfg Config, n int, seedDist func(*Sender), ch 
 	return int(st.Delivered), int(st.Lost), ordered, inTime
 }
 
-// TestNPathJointTailMoneyTest is the N5 money test at N=3: on a correlated 3-path channel,
+// TestNPathJointTailImprovesCorrelatedLoss verifies that on a correlated three-path channel,
 // PROACTIVE joint-tail sizing fed the TRUE per-slot erasure-count histogram loses fewer
 // symbols than sizing that assumes the paths are independent (same marginals, Binomial(3,
 // p)) — the correlation awareness provisions for the all-paths-out tail an independence
 // sizer misses.
-func TestNPathJointTailMoneyTest(t *testing.T) {
+func TestNPathJointTailImprovesCorrelatedLoss(t *testing.T) {
 	const (
 		n       = 3600 // multiple of GenSize and of 3 paths
 		paths   = 3

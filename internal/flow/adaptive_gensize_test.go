@@ -64,8 +64,10 @@ func TestGenWidthEnvelope(t *testing.T) {
 // low bitrate (a slow-filling wide generation would raise latency), monotonically in bitrate.
 func TestGenWidthFillCap(t *testing.T) {
 	mk := func(bitrateBps int64) Config {
-		return Config{GenSize: 16, SymbolSize: 1316, AdaptiveGenSize: true,
-			NominalRTTMicros: 40_000, BufferMicros: 400_000, NominalBitrateBps: bitrateBps}
+		return Config{
+			GenSize: 16, SymbolSize: 1316, AdaptiveGenSize: true,
+			NominalRTTMicros: 40_000, BufferMicros: 400_000, NominalBitrateBps: bitrateBps,
+		}
 	}
 	if w := mk(0).genWidth(); w != maxAdaptiveGenWidth {
 		t.Fatalf("no bitrate hint: genWidth=%d, want %d (fill gate off)", w, maxAdaptiveGenWidth)
@@ -154,8 +156,10 @@ func TestAdaptiveGenSizeStaysNarrowBelowRTT(t *testing.T) {
 		owd    = 50_000 // 100 ms RTT > budget ⇒ all-proactive regime
 		n      = 480
 	)
-	cfg := Config{Flow: 1, SymbolSize: 256, GenSize: 16, Redundancy: 0.15, TargetFailure: 1e-3,
-		BufferMicros: budget, AdaptiveGenSize: true, NominalRTTMicros: 2 * owd}
+	cfg := Config{
+		Flow: 1, SymbolSize: 256, GenSize: 16, Redundancy: 0.15, TargetFailure: 1e-3,
+		BufferMicros: budget, AdaptiveGenSize: true, NominalRTTMicros: 2 * owd,
+	}
 	if w := cfg.genWidth(); w != 16 {
 		t.Fatalf("budget<RTT: genWidth = %d, want 16 — the wide generation must be suppressed here", w)
 	}

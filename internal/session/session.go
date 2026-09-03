@@ -81,11 +81,11 @@ func newCoreReceiver(cfg flow.Config) coreReceiver {
 }
 
 func usesL4SMarking(cfg flow.Config) bool {
-	return cfg.CongestionControl && !cfg.Sliding
+	return cfg.CongestionControl
 }
 
 func usesECNReceive(cfg flow.Config) bool {
-	return !cfg.Sliding
+	return !cfg.Sliding || cfg.CongestionControl
 }
 
 func mtuProbeBodySize(size int, ctl controlState) int {
@@ -177,7 +177,7 @@ func newSenderCfg(sub Substrate, cfg flow.Config, clk clock.Clock, sec *Security
 		return nil, err
 	}
 	if err := sec.validate(cfg.SymbolSize); err != nil {
-		sub.Close()
+		_ = sub.Close()
 		return nil, err
 	}
 	s := &Sender{
@@ -210,12 +210,12 @@ func newSenderCfg(sub Substrate, cfg flow.Config, clk clock.Clock, sec *Security
 		s.hsDone = make(chan struct{})
 		init, err := crypto.NewInitiator(s.psk, beU32(cfg.Flow), sec.epochSize())
 		if err != nil {
-			sub.Close()
+			_ = sub.Close()
 			return nil, err
 		}
 		msg1, err := init.WriteMessage1()
 		if err != nil {
-			sub.Close()
+			_ = sub.Close()
 			return nil, err
 		}
 		s.hsInit = init
@@ -228,7 +228,7 @@ func newSenderCfg(sub Substrate, cfg flow.Config, clk clock.Clock, sec *Security
 		select {
 		case <-s.hsDone:
 		case <-time.After(handshakeTimeout):
-			s.Close()
+			_ = s.Close()
 			return nil, errHandshakeTimeout
 		}
 	}
@@ -307,7 +307,7 @@ func (s *Sender) Flush() {
 		s.pace.offer(out)
 		return
 	}
-	s.transmit(out)
+	_ = s.transmit(out) // Flush has no error result; a following Close still reports its error
 }
 
 // Stats returns the sender's emission counters.
@@ -341,7 +341,7 @@ func (s *Sender) Close() error {
 // backpressured) when enabled, else transmitted immediately (the pre-pacer behaviour).
 func (s *Sender) sendOut(out [][]byte) error {
 	if s.pace != nil {
-		return s.pace.put(out)
+		return s.pace.putFlow(out)
 	}
 	return s.transmit(out)
 }
@@ -394,7 +394,7 @@ func (s *Sender) recvLoop() {
 			s.handleCookieReply(buf[:n])
 		case wire.IsClockProbe(t):
 			// Echo the probe's T0 with the sender's receive (T1) and send (T2) times, so the
-			// receiver can recover the clock offset (N4). On an encrypted flow the probe is
+			// receiver can recover the clock offset. On an encrypted flow the probe is
 			// authenticated and the echo sealed, so a forged or replayed probe cannot skew the
 			// offset; open and seal happen under the lock so the sequence/replay state is safe.
 			recv := int64(s.clk.Now())
@@ -513,7 +513,7 @@ func (s *Sender) tickLoop() {
 				s.pace.setRate(budget / 8) // re-slave to the current budget
 				s.pace.offer(out)          // tick-driven repair/keepalive: non-blocking
 			} else {
-				s.transmit(out)
+				_ = s.transmit(out) // background repair has no synchronous caller to report to
 			}
 			if probe != nil {
 				_ = writeDatagram(s.sub, probe, nil) // control plane: bypass the pacer
@@ -523,7 +523,7 @@ func (s *Sender) tickLoop() {
 }
 
 // PathMTU returns the discovered path PLPMTU in bytes (the UDP-payload size DPLPMTUD has
-// confirmed the path passes), or 0 when probing is disabled. Phase 1 reports it; symbol
+// confirmed the path passes), or 0 when probing is disabled. Symbol
 // sizing does not yet consume it.
 func (s *Sender) PathMTU() int {
 	s.mu.Lock()
@@ -564,7 +564,7 @@ type Receiver struct {
 	// goroutine — mu → emitMu → deliverCh → mu.)
 	emitQ     [][][]byte
 	emitting  bool
-	cs        clockSync // cross-host clock-offset estimate (N4)
+	cs        clockSync // cross-host clock-offset estimate
 	probeTick int       // tick counter pacing the clock-offset probes
 	deliverCh chan []byte
 	done      chan struct{}
@@ -595,7 +595,7 @@ func NewReceiver(bind string, cfg flow.Config, sec *SecurityConfig) (*Receiver, 
 	}
 	r, err := newReceiver(sub, cfg, clock.NewRealClock(), sec)
 	if err != nil {
-		sub.Close()
+		_ = sub.Close()
 		return nil, err
 	}
 	return r, nil
@@ -610,7 +610,7 @@ func NewReceiverOver(sub Substrate, cfg flow.Config, sec *SecurityConfig) (*Rece
 
 // newReceiver builds the receive host on sub with a given clock and starts its
 // goroutines. The clock seam lets a test inject an offset clock to exercise the
-// cross-host handshake (N4) without two machines.
+// cross-host handshake without two machines.
 func newReceiver(sub Substrate, cfg flow.Config, clk clock.Clock, sec *SecurityConfig) (*Receiver, error) {
 	if err := validateSubstrate(sub); err != nil {
 		return nil, err
@@ -669,7 +669,7 @@ func (r *Receiver) Read(p []byte) (int, error) {
 		if r.ptPool != nil {
 			// Encrypted session: c is a pooled decrypt buffer (openAll). The plaintext has been
 			// copied into the caller's p, so the buffer can be recycled for the next decrypt.
-			r.ptPool.Put(c)
+			r.ptPool.put(c)
 		}
 		return n, nil
 	case <-timeout:
@@ -694,7 +694,7 @@ func (r *Receiver) Stats() flow.ReceiverStats {
 	return addStats(r.statAccum, r.flow.Stats())
 }
 
-// FrameStats returns the receiver's parse-free media-frame decodability snapshot (WP6).
+// FrameStats returns the receiver's parse-free media-frame decodability snapshot.
 func (r *Receiver) FrameStats() flow.FrameStats {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -1013,7 +1013,8 @@ type delivered struct {
 // drainSend collects all pending transmit datagrams from a flow half.
 func drainSend(f interface {
 	PollSend() ([]byte, bool)
-}) [][]byte {
+},
+) [][]byte {
 	var out [][]byte
 	for {
 		d, ok := f.PollSend()
@@ -1027,7 +1028,8 @@ func drainSend(f interface {
 // drainDeliver collects all pending delivered source symbols (id + chunk) from a receiver.
 func drainDeliver(r interface {
 	PollDeliver() (uint32, []byte, bool)
-}) []delivered {
+},
+) []delivered {
 	var out []delivered
 	for {
 		id, d, ok := r.PollDeliver()

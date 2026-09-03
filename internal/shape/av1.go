@@ -53,8 +53,10 @@ func NewAV1Shaper() *AV1Shaper {
 }
 
 // Shape parses an AV1 OBU stream and returns the protectable units in order. Sequence
-// headers, frames, tile groups, and metadata become units; temporal delimiters, padding,
-// redundant frame headers, and tile lists are dropped.
+// headers, temporal delimiters, frames, tile groups, and metadata become units. Temporal
+// delimiters are essential framing in a low-overhead OBU stream and receive the same tiny,
+// high-priority treatment as other decoder bootstrap material. Padding, redundant frame
+// headers, and tile lists are dropped.
 func (s *AV1Shaper) Shape(stream []byte) []Shaped {
 	var out []Shaped
 	for _, o := range av1OBUs(stream) {
@@ -66,6 +68,8 @@ func (s *AV1Shaper) Shape(stream []byte) []Shaped {
 			if seq, ok := parseAV1SeqHeader(o.payload); ok {
 				s.seq, s.seqValid = seq, true
 			}
+		case av1TemporalDelim:
+			u.Class = ClassParamSet
 		case av1Frame, av1FrameHeader:
 			s.shapeFrame(&u, o)
 		case av1TileGroup:
@@ -77,7 +81,7 @@ func (s *AV1Shaper) Shape(stream []byte) []Shaped {
 			u.Class, u.Confidence = ClassEnhancement, Inferred
 			u.RefersTo = s.refChain()
 		default:
-			continue // temporal delimiter, padding, redundant header, tile list
+			continue // padding, redundant header, tile list
 		}
 		out = append(out, Shaped{Unit: u, Payload: o.full})
 		s.nextID++
@@ -278,7 +282,7 @@ func av1OBUs(b []byte) []av1OBU {
 
 // leb128 reads an unsigned LEB128 integer (AV1 §4.10.5), returning the value and the
 // number of bytes consumed (0 on a truncated/over-long encoding).
-func leb128(b []byte) (val int, n int) {
+func leb128(b []byte) (val, n int) {
 	for n = 0; n < 8 && n < len(b); n++ {
 		v := b[n]
 		val |= int(v&0x7f) << (7 * n)

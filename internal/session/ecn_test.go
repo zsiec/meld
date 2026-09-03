@@ -22,7 +22,7 @@ func TestECNSetAndRead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	defer rx.Close()
+	defer func() { _ = rx.Close() }()
 	if err := setECN(rx); err != nil {
 		t.Fatalf("setECN rx: %v", err)
 	}
@@ -31,7 +31,7 @@ func TestECNSetAndRead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer tx.Close()
+	defer func() { _ = tx.Close() }()
 	if err := setECN(dialedSubstrate{tx}); err != nil {
 		t.Fatalf("setECN tx: %v", err)
 	}
@@ -78,7 +78,7 @@ func TestParseRecvECNNoAlloc(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	defer rx.Close()
+	defer func() { _ = rx.Close() }()
 	if err := setECN(rx); err != nil {
 		t.Fatalf("setECN: %v", err)
 	}
@@ -86,7 +86,7 @@ func TestParseRecvECNNoAlloc(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer tx.Close()
+	defer func() { _ = tx.Close() }()
 	_, _ = tx.Write([]byte("x"))
 	buf, oob := make([]byte, 64), make([]byte, 128)
 	_ = rx.SetReadDeadline(time.Now().Add(2 * time.Second))

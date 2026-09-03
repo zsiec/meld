@@ -87,3 +87,45 @@ func TestReceiverReportsECN(t *testing.T) {
 		t.Fatalf("all-CE stream reported EcnCE %d, want ≈65535", got)
 	}
 }
+
+func TestSlidingReceiverReportsECN(t *testing.T) {
+	cfg := Config{
+		Flow: 4, SymbolSize: 256, Sliding: true, CodingWindow: 16,
+		Redundancy: 0, BufferMicros: 200_000,
+	}
+	feed := func(ecn ECN) uint16 {
+		s := NewSlidingSender(cfg)
+		r := NewSlidingReceiver(cfg)
+		now := clock.Timestamp(1)
+		for i := 0; i < 16; i++ {
+			s.Write(now, makeChunkN(uint32(i)))
+		}
+		for {
+			d, ok := s.PollSend()
+			if !ok {
+				break
+			}
+			if sym, err := wire.DecodeSymbol(d); err == nil && sym.Kind == wire.Systematic {
+				r.FeedSymbolECN(now, d, ecn)
+			}
+		}
+		r.Tick(now.Add(feedbackIntervalMicros + 1))
+		var last wire.Feedback
+		for {
+			d, ok := r.PollSend()
+			if !ok {
+				break
+			}
+			if fb, err := wire.DecodeFeedback(d); err == nil {
+				last = fb
+			}
+		}
+		return last.EcnCE
+	}
+	if got := feed(NotECT); got != 0 {
+		t.Fatalf("sliding unmarked stream reported EcnCE %d", got)
+	}
+	if got := feed(CE); got < 60_000 {
+		t.Fatalf("sliding all-CE stream reported EcnCE %d, want near 65535", got)
+	}
+}

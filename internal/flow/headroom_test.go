@@ -1,10 +1,8 @@
 package flow
 
-// Tests for the opt-in headroom-aware proactive sizing (Config.HeadroomAwareSizing,
-// PREREG Amendment 9): flag-off inertness (the default path must be byte-identical
-// to the pre-arc-9 sizer), the flag-on win on a genuinely capacity-limited paced
-// link (the breaker/set-point limit cycle the arc-8 isolation named), and no false
-// tighten on clean links.
+// Tests for opt-in headroom-aware proactive sizing: flag-off inertness, the
+// flag-on win on a genuinely capacity-limited paced link, and no false tightening
+// on clean links.
 
 import (
 	"testing"
@@ -12,17 +10,19 @@ import (
 	"github.com/zsiec/meld/internal/wire"
 )
 
-// headroomCell is the arc-8 isolation cell: 10% GE-12 loss through a 1 MiB/s paced
-// wire at rtt 60ms / budget 90ms — the sizer's honest set-point exceeds the wire's
+// headroomCell uses 10% GE-12 loss through a 1 MiB/s paced wire at RTT 60 ms and
+// budget 90 ms. The sizer's unconstrained set point exceeds the wire's
 // ~2x headroom, so uncapped sizing enters the boom/slam limit cycle.
 func headroomCell(headroom bool) (simResult, *SlidingSender) {
 	cfg := sweepDefaultCfg(90_000)
 	cfg.HeadroomAwareSizing = headroom
 	s := NewSlidingSender(cfg)
 	r := NewSlidingReceiver(cfg)
-	res := simLink{cfg: cfg, owdMicros: 30_000, srcMicros: 500, n: 6_000,
+	res := simLink{
+		cfg: cfg, owdMicros: 30_000, srcMicros: 500, n: 6_000,
 		sliding: true, drop: sweepDrop(sweepCell{loss: 0.10, burst: 12}, 0),
-		paceBytesPerSec: 1 << 20, timingJitterMicros: 2_000, timingSeed: 3}.runCores(s, r)
+		paceBytesPerSec: 1 << 20, timingJitterMicros: 2_000, timingSeed: 3,
+	}.runCores(s, r)
 	return res, s
 }
 
@@ -61,9 +61,11 @@ func TestHeadroomSizingQuietOnCleanLink(t *testing.T) {
 	cfg.HeadroomAwareSizing = true
 	s := NewSlidingSender(cfg)
 	r := NewSlidingReceiver(cfg)
-	res := simLink{cfg: cfg, owdMicros: 30_000, srcMicros: 500, n: 6_000,
+	res := simLink{
+		cfg: cfg, owdMicros: 30_000, srcMicros: 500, n: 6_000,
 		sliding: true, drop: func(wire.Symbol) bool { return false },
-		paceBytesPerSec: 1 << 20, timingJitterMicros: 2_000, timingSeed: 3}.runCores(s, r)
+		paceBytesPerSec: 1 << 20, timingJitterMicros: 2_000, timingSeed: 3,
+	}.runCores(s, r)
 	assertCoreInvariants(t, res, 6_000, "headroom clean link")
 	if res.delivered != 6_000 {
 		t.Fatalf("clean link delivered %d/6000", res.delivered)

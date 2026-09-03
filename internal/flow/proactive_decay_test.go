@@ -53,8 +53,10 @@ func TestProactiveDecayHoldsDeliveryLowerOverhead(t *testing.T) {
 		n      = 640
 	)
 	mk := func(decay bool) Config {
-		return Config{Flow: 1, SymbolSize: 256, GenSize: 32, Redundancy: 0.05, TargetFailure: 1e-3,
-			BufferMicros: budget, ProactiveDecay: decay}
+		return Config{
+			Flow: 1, SymbolSize: 256, GenSize: 32, Redundancy: 0.05, TargetFailure: 1e-3,
+			BufferMicros: budget, ProactiveDecay: decay,
+		}
 	}
 	run := func(decay bool) simResult {
 		return simLink{cfg: mk(decay), owdMicros: owd, srcMicros: 500, n: n, drop: geDrop(5, 0.05, 1)}.run()

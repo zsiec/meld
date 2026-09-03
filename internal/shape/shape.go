@@ -34,8 +34,8 @@ const (
 	ClassBase
 	// ClassRAP: random-access points (IDR / CRA / KEY_FRAME) — the resync anchor.
 	ClassRAP
-	// ClassParamSet: parameter sets / sequence header / sticky HDR — tiny and
-	// session-fatal on loss; the cheapest high-leverage bytes, protected hardest.
+	// ClassParamSet: parameter sets / sequence header / essential framing / sticky
+	// HDR — tiny high-leverage bytes that are protected hardest.
 	ClassParamSet
 	// NumClasses is the count of tiers.
 	NumClasses
@@ -121,7 +121,7 @@ func Decodable(units []Unit, delivered map[uint32]bool) map[uint32]bool {
 }
 
 // DecodableFrameRate is the fraction of coded PICTURES (displayed frames) that are
-// decodable given the delivered set — the WP6 quality metric. Non-picture units
+// decodable given the delivered set. Non-picture units
 // (parameter sets, SEI, metadata) are excluded from the denominator — they are not
 // displayed frames — but their loss still poisons every picture that depends on them, so
 // they dominate the score by leverage.
@@ -144,7 +144,7 @@ func DecodableFrameRate(units []Unit, delivered map[uint32]bool) float64 {
 }
 
 // DecodableKeyframeRate is the fraction of random-access points (RAP / keyframe units)
-// that are decodable — the headline WP6 metric. A keyframe is the resync anchor: lose
+// that are decodable. A keyframe is the resync anchor: lose
 // it (or the parameter set beneath it) and the entire GOP hanging off it is undecodable
 // until the next one, so keyframe survival dominates glass-to-glass quality. It is the
 // sharpest test of "protect the unrecoverable cheaply": the keyframe + parameter set are

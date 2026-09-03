@@ -12,8 +12,10 @@ import (
 func TestShedTopLayerOverBudget(t *testing.T) {
 	run := func(shed bool) (source, shedCnt uint64, base int) {
 		const sym = 1000
-		cfg := Config{Flow: 1, SymbolSize: sym, GenSize: 16, Redundancy: 0, BufferMicros: 200_000,
-			MaxBitrate: 1_000_000, ShedTopLayerOverBudget: shed} // 1 Mbps budget
+		cfg := Config{
+			Flow: 1, SymbolSize: sym, GenSize: 16, Redundancy: 0, BufferMicros: 200_000,
+			MaxBitrate: 1_000_000, ShedTopLayerOverBudget: shed,
+		} // 1 Mbps budget
 		s := NewSender(cfg)
 		now := clock.Timestamp(0)
 		// Alternate base (TID 0, reference) and leaf (TID 2, discardable), 1000 B each, every 1 ms

@@ -5,12 +5,8 @@ import (
 	"testing"
 )
 
-// Allocation gates for the warm decode path. CLAUDE.md mandates "no allocation on the warm
-// path once buffers are sized" and "benches use -benchmem with an allocation gate on hot
-// paths" — yet there was no allocation test anywhere in the tree. These establish the gate
-// and, crucially, assert that decode allocation does NOT scale super-linearly with loss: the
-// txbench meld-sld profile allocates 13→24→49 GB/GB as loss rises 10→20→30%, which a flat
-// gate would have caught.
+// Allocation gates for the warm decode path. They assert that allocation remains bounded
+// once buffers are sized and does not scale super-linearly with loss.
 
 // bandEvent is one decoder input in a pre-computed (post-loss) stream, so AllocsPerRun
 // measures only the decoder, not encoding or loss generation.

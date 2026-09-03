@@ -2,7 +2,7 @@ package flow
 
 import "github.com/zsiec/meld/internal/clock"
 
-// This file is N3's delay-based congestion controller — a Copa-style rate controller
+// This file implements a Copa-style delay-based congestion controller
 // (Arun & Balakrishnan, NSDI'18) adapted to Meld's per-feedback RTT samples, with the
 // L4S/DCTCP ECN response layered on. The controller owns the total send-rate budget; the
 // redundancy sizer then allocates repair WITHIN that budget (CC sets the budget, FEC fits
@@ -16,15 +16,9 @@ import "github.com/zsiec/meld/internal/clock"
 // is NOT a CC input even though the receiver reports the pre-recovery wire loss
 // (Feedback.CongestionLoss, which the redundancy SIZER consumes) — because loss is AMBIGUOUS:
 // a policer's congestion and a wireless link's corruption are indistinguishable here (both
-// show a silent queue + silent ECN + drops). This was measured, not just asserted: a loss
-// backstop — gated to fire only when delay AND ECN are both silent, and only on rate↔loss-
-// CORRELATED loss (a policer, where loss falls as the rate falls; not corruption, where it
-// stays flat) — was built and validated on impair + the txbench cref glass-to-glass bench. It
-// still regressed bursty wireless (a common case: the rate cut the probe needs to detect the
-// correlation itself costs delivery), for only the narrow hard-policer benefit that the
-// operator-set MaxBitrate ceiling and application ABR already bound — so it was removed. The
-// pre-recovery wire-loss counter stays (it sizes FEC and answers the "no CC" objection); it
-// just never throttles the rate. See PLAN.md §3.8.
+// show a silent queue + silent ECN + drops). A loss backstop would therefore cut the rate
+// on lossy-but-uncongested paths. The pre-recovery wire-loss counter sizes FEC but never
+// throttles the rate; MaxBitrate and application adaptation bound hard policers.
 
 // Congestion-control tuning. δ is the throughput/latency knob: rate ≈ 1/(δ·d_q), so a
 // smaller δ tolerates a larger standing queue for more throughput (live video favors
@@ -129,13 +123,10 @@ func newCongestionController(delta float64, mss int, maxBitrate int64) *congesti
 // the irregular feedback cadence). reBaseline handles the propagation floor RISING
 // (path change), which a windowed min cannot track on its own.
 //
-// The additive step is FIXED: Copa's velocity multiplier (§3.1 — double the step while cwnd
-// moves consistently one way) is deliberately omitted. It was built and A/B-measured here, and
-// it re-converges to a bandwidth INCREASE ~2.4x faster but overshoots the standing queue badly
-// (~130 ms vs ~18 ms on a 5x jump) — a latency spike live media cannot afford, and it broke the
-// bounded-queue invariant the convergence tests pin. The benefit it buys (fast reclaim of FREED
-// bandwidth) is one a fixed-rate media source cannot use beyond its encode rate, and slow start
-// already covers the startup ramp — so the trade (latency for throughput) is backwards for Meld.
+// The additive step is fixed. A velocity multiplier would trade a faster response to
+// newly available bandwidth for a larger standing-queue excursion. Fixed-rate media
+// cannot use capacity beyond its encode rate, and slow start already covers startup,
+// so the controller favors the bounded-queue behavior pinned by its convergence tests.
 func (cc *congestionController) onSample(now clock.Timestamp, rttMicros int64, ceFraction float64) {
 	if rttMicros <= 0 {
 		return
@@ -208,6 +199,26 @@ func (cc *congestionController) onSample(now clock.Timestamp, rttMicros int64, c
 		cc.cwndBytes -= cc.cwndBytes * (cc.alpha / 2) * fracRTT
 	}
 	cc.clampCwnd()
+}
+
+// seedRate raises a newly primed controller to an already-observed application
+// rate. A live media sender is application-limited before its first feedback: it
+// has already demonstrated a source+recovery offer, so restarting from a
+// two-packet TCP window would create a local pacing queue and consume the very
+// deadline the controller is meant to protect. This is only a starting point;
+// subsequent delay/ECN samples retain full authority to reduce the window.
+func (cc *congestionController) seedRate(bytesPerSec int64) {
+	if !cc.primed || bytesPerSec <= 0 {
+		return
+	}
+	rttSec := float64(cc.rttStanding.value()) / 1e6
+	if rttSec <= 0 {
+		return
+	}
+	if cwnd := float64(bytesPerSec) * rttSec; cwnd > cc.cwndBytes {
+		cc.cwndBytes = cwnd
+		cc.clampCwnd()
+	}
 }
 
 // reBaseline raises rttMin to the standing RTT when the propagation floor has risen:

@@ -1,9 +1,7 @@
 package flow
 
-// Arc-8 step-2 isolation instrument (PREREG Amendment 8): the sliding reorder
-// holdoff harms bursty paced cells through a mechanism the RTT-trap fix did not
-// remove (re-refuted twice, worst cell rtt60-b1.5x-ge12 at -52.7pp arbitered).
-// This diagnostic runs that exact cell single-seed, default vs hold8, and prints
+// This diagnostic isolates how sliding reorder holdoff affects a bursty paced
+// cell. It runs the cell single-seed, default vs hold8, and prints
 // a per-feedback timeline of both ends' estimator internals so the divergence
 // names the mechanism. Env-gated diagnostic, not a regression test.
 //
@@ -39,17 +37,19 @@ func TestHoldoffDiagTimeline(t *testing.T) {
 		cfg.ReorderHoldoffMicros = arm.holdoff
 		s := NewSlidingSender(cfg)
 		r := NewSlidingReceiver(cfg)
-		sl := simLink{cfg: cfg, owdMicros: owd, srcMicros: src, n: n,
+		sl := simLink{
+			cfg: cfg, owdMicros: owd, srcMicros: src, n: n,
 			sliding: true, drop: sweepDrop(sweepCell{loss: arm.loss, burst: 12}, 0),
-			paceBytesPerSec: pace, timingJitterMicros: tjit, timingSeed: 3}
+			paceBytesPerSec: pace, timingJitterMicros: tjit, timingSeed: 3,
+		}
 		var last clock.Timestamp
 		sl.fbTap = func(now clock.Timestamp, fb wire.Feedback) {
 			if now.Sub(last) < 100_000 {
 				return // 100ms cadence keeps the timeline readable
 			}
 			last = now
-			// f = rho/(1-pEst): the passed-through-fraction estimate Amendment 9's
-			// headroom cap would key on. rho is the breaker's EWMA arrival/offer.
+			// f = rho/(1-pEst): the passed-through-fraction estimate used by the
+			// headroom cap. rho is the breaker's EWMA arrival/offer.
 			f := (float64(s.arriveRatioQ8) / 256) / (1 - s.pEst)
 			if f > 1 {
 				f = 1

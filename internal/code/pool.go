@@ -1,8 +1,7 @@
 package code
 
 // Pool recycles symbol-size byte buffers across the coders of one flow so the warm
-// encode/decode path stops allocating once the working set is sized — the CLAUDE.md mandate
-// ("no allocation on the warm path once buffers are sized"). The symbol-size payload buffers
+// encode/decode path stops allocating once the working set is sized. Symbol payload buffers
 // (one per source/recovered symbol, ~1316 B each) dominate the transport's allocation; left
 // un-pooled, every generation allocates a fresh set and frees the previous to the GC. A buffer
 // handed back via put MUST no longer be referenced by the caller.

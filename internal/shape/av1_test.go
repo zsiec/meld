@@ -19,17 +19,18 @@ func TestAV1ShaperClassifies(t *testing.T) {
 	seqHdr := []byte{0x0A, 0x02, 0x00, 0x00} // type 1, has_size, size 2
 	keyFrame := []byte{0x32, 0x01, 0x00}     // type 6, size 1, payload show_existing=0 frame_type=KEY(00)
 	interFr := []byte{0x32, 0x01, 0x20}      // type 6, payload frame_type=INTER(01)
-	tempDelim := []byte{0x12, 0x00}          // type 2, size 0 — dropped
+	tempDelim := []byte{0x12, 0x00}          // type 2, size 0 — essential low-overhead framing
 	metadata := []byte{0x2A, 0x01, 0x01}     // type 5, size 1
 
 	sh := NewAV1Shaper().Shape(av1Stream(seqHdr, keyFrame, interFr, tempDelim, metadata))
-	if len(sh) != 4 {
-		t.Fatalf("got %d units, want 4 (temporal delimiter dropped)", len(sh))
+	if len(sh) != 5 {
+		t.Fatalf("got %d units, want 5", len(sh))
 	}
 	assertUnit(t, sh, 0, ClassParamSet, false, false, 0, Signaled)       // sequence header (id 0)
 	assertUnit(t, sh, 1, ClassRAP, true, false, 0, Signaled, 0)          // KEY frame → seq header
 	assertUnit(t, sh, 2, ClassBase, false, false, 0, Signaled, 1)        // INTER frame → KEY (prevRef)
-	assertUnit(t, sh, 3, ClassEnhancement, false, false, 0, Inferred, 2) // metadata → INTER (prevRef)
+	assertUnit(t, sh, 3, ClassParamSet, false, false, 0, Signaled)       // temporal delimiter
+	assertUnit(t, sh, 4, ClassEnhancement, false, false, 0, Inferred, 2) // metadata → INTER (prevRef)
 }
 
 // TestAV1ShaperTemporalAndShowExisting: a temporal-extension INTER frame tiers by its

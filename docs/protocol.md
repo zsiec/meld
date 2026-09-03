@@ -1,7 +1,7 @@
 # Meld Protocol
 
-This document describes the protocol as implemented today. It is meant to be the
-source material for a future formal spec, not the formal spec itself.
+This document describes the protocol as implemented today. The byte-level working
+specification is maintained in [the LaTeX specification](spec/README.md).
 
 ## Goals
 
@@ -9,22 +9,19 @@ Meld is built for live media under a deadline. The main goal is to maximize
 decodable media at a fixed latency budget when loss recovery cannot wait for a
 named-packet retransmission round trip.
 
-The current credible frontier is:
-
-- iid or tail-erasure loss
-- low latency
-- playout budget at or below roughly one RTT
-- same encoded source as SRT/RIST baselines
-
-The protocol is not optimized around separate deployable profiles. The intended
-deployment model is one adaptive profile that behaves conservatively outside the
-frontier.
+The protocol is not divided into deployable recovery profiles. One adaptive
+path measures loss, burst persistence, reorder, source cadence, RTT, deadline
+slack, and available byte headroom, then chooses recovery work that can still
+arrive on time. Measured envelopes belong in generated benchmark artifacts rather
+than the protocol definition; [Benchmarking](bench.md) defines the required method.
 
 ## Model
 
-Meld sends fixed-size **source symbols** and **repair symbols**.
+Meld codes fixed-width **algebraic source symbols** and **repair symbols**.
 
-- A source symbol carries one application media chunk.
+- A source symbol carries one application media chunk of up to `SymbolSize`
+  bytes. A systematic datagram carries only the exact application bytes; zero
+  padding and exact length/deadline metadata exist inside the algebraic symbol.
 - A repair symbol carries a random linear combination of source symbols.
 - A receiver can recover missing source symbols when the linear system has
   sufficient rank.
@@ -103,8 +100,8 @@ feeds inbound datagrams back into it.
 
 `meld.DefaultConfig()` selects the band-form sliding-window coder.
 
-The sender emits every source symbol immediately, then emits repair over a
-trailing coding window. The repair window is elastic: it is capped by
+The sender emits every source symbol immediately, then emits recovery work over
+a trailing coding window. The repair window is elastic: it is capped by
 `CodingWindow`, but reduced when the configured playout budget cannot safely
 cover the full span.
 
@@ -114,14 +111,45 @@ This is the important low-latency property:
 - a received repair packet can help any missing symbol in its window
 - recovery is not blocked on a NACK returning
 
+The automatic recovery path has four complementary actions:
+
+- fungible sliding RLNC equations for unknown or burst-correlated loss;
+- isolated 16-source Cauchy-MDS blocks whose continuously adjusted share reflects
+  measured channel memory, source cadence, deadline geometry,
+  reactive reachability, and recent source-wire cost;
+- exact compact unit closure for persistent isolated holes, or for clustered
+  residuals at their last useful dispatch when repair headroom is sufficient;
+- delayed compact copies, spaced by the measured mean fade length, when a
+  reactive cycle cannot fit but a second proactive copy can.
+
+Every action spends the shared recovery allowance; none creates a second user
+configuration or bypasses the source-first byte ledger.
+
+During an automatic MDS epoch, all 16 systematics announce one stable source
+range. The sender accumulates the same proactive credit that normally produces
+moving-window equations, then releases bounded Cauchy rows when the block closes.
+The receiver keeps those rows in an isolated fixed decoder, folds in exact values
+learned from every recovery lane, and injects decoded sources into the common
+ordered sliding decoder. Stable boundaries and isolated state prevent one row
+from changing meaning as the sliding window advances.
+
+A new epoch also compares one full algebraic row with a bounded 64-source mean
+encoded systematic. A cold probe requires the row to cost no more than two mean
+systematics; after repeated burst or outage evidence, sustained selection may use
+the established three-systematic crossover. This keeps the decision media-agnostic:
+full-width sources can select MDS, while a padded row cannot crowd out several
+compact delayed-copy opportunities on a memoryless ragged source.
+
 The receiver delivers source symbols in order once they are known. If a symbol
 misses its deadline, it is declared lost and the cursor advances.
 
 ## Generation Fallback
 
 The generation coder still exists and is used by the multipath path. It partitions
-source symbols into generations, sends systematic symbols, and emits repair for
-each generation.
+source symbols into bounded generations, sends systematic symbols, and emits
+Cauchy-MDS repair for each generation. Any generation-width set of source and
+repair rows reconstructs the block; the cap keeps systematic and parity points
+disjoint in GF(256).
 
 Generation mode is useful for:
 
@@ -142,15 +170,56 @@ Relevant config:
 - `TargetFailure`: decode-failure probability target.
 - `RepairWithinBudget`: cap proactive repair inside the sender rate budget.
 - `MaxBitrate`: aggregate media+repair ceiling.
+- `CongestionControl`: optionally replace the static ceiling with a delay/ECN
+  budget. Sliding mode seeds startup from its measured application-limited
+  source-plus-recovery offer so the first feedback does not collapse a live
+  stream to a two-packet window.
 - `BufferMicros`: deadline budget.
 
-The controller uses feedback to estimate loss and burstiness. On the sliding path,
-early cold-start repair is intentionally conservative because the first symbols
-cannot be saved by feedback that has not arrived yet.
+The controller uses feedback to estimate loss and burstiness. On the sliding
+path, early cold-start repair is intentionally conservative because the first
+symbols cannot be saved by feedback that has not arrived yet. Once measurements
+are credible, memoryless loss with sufficient slack favors compact exact closure;
+correlated loss normally favors equations whose value is not tied to one erased
+source. A correlated residual switches to compact units only when feedback takes
+at least four live-band spans, the deadline holds the 1.5-cycle closure gate, and
+retained content shows an equation costs more than three units.
+When no feedback cycle fits, a measured burst may instead enable one compact copy
+delayed by the estimated fade duration.
+If outage-aware estimation classifies a run beyond the recovery horizon, the
+receiver reports that run separately from the censored burst estimate. For the
+next two deadline budgets, and only while no reactive cycle fits and ordinary
+recoverable-burst evidence is absent, the sender moves one quarter of already-
+earned proactive RLNC equations across the measured span. This is time diversity,
+not extra redundancy: the code-rate credit is consumed when the equation is
+scheduled, source traffic remains first, and the pending queue is bounded by the
+coding window. A first isolated outage shorter than one fifth of
+`min(RTT, BufferMicros)` starts at one eighth instead; repeated outage evidence
+restores the quarter share. This adjacent-regime probe prevents a short ge6 tail
+from selecting the full deep-fade action.
+
+The same feedback continuously controls an automatic epoch share. The sender
+tracks Q8 demand, repeated burst correlation, and confirmed outage memory. A
+new sender begins with a decaying uncertainty prior; ordinary loss receives a
+small exploration share, repeated mean bursts of at least 2.0 symbols raise it,
+and an `OutageRun` of at least 16 symbols requests the strongest allocation.
+Clean offered reports release the demand, more quickly when a reactive cycle can
+take over; idle feedback freezes it. There is no timed epoch mode or user-selected
+transition.
+
+At each safe 16-source boundary, demand maps continuously to a epoch fraction
+of already-earned proactive credit. A viable reactive cycle multiplies the share
+by one eighth, and post-propagation slack above 75 ms scales it by
+`75 ms / slack`; neither condition disables MDS. Cadence, block-fill deadline,
+effective-band and measured row/source economics remain hard safety
+checks. An announced block always finishes with stable geometry, and the next
+block immediately recomputes its share from live observations.
 
 Repair is not allowed to create unbounded latency. When the rate budget binds,
 repair is shed before source media. The host pacer then smooths what remains and
-backpressures `Write` when the queue would exceed the deadline budget.
+backpressures `Write` when the queue would exceed the deadline budget. Its queue
+order is source, feedback-proven exact repair, then fungible recovery; all three
+still spend the same aggregate rate budget.
 
 ## Feedback
 
@@ -167,9 +236,20 @@ Conceptually, feedback includes:
 - pre-recovery wire loss
 - frame decodability counters
 - keyframe decodability counters
+- a bounded missing-neighborhood bitmap
+- largest receiver-classified outage run in the report interval
 
-The rank deficit can trigger reactive repair when it can still help. The loss and
-burstiness estimates tune future proactive repair.
+The rank deficit can trigger reactive repair when it can still help. A missing
+bitmap can close residual holes exactly when the return transmission fits. The
+sender gives in-flight coding one feedback opportunity for isolated loss, but a
+clustered residual switches to exact values before another feedback interval
+would make them late, provided the measured source rate leaves enough recovery
+headroom to preserve fungible coding.
+The loss and burstiness estimates tune future proactive repair and
+decide whether named retransmission is appropriate for the observed channel. The
+separate outage run preserves fade geometry deliberately excluded from those rate
+estimators, allowing the sender to change equation timing or sustain a
+fixed-block epoch without poisoning its loss-rate set-point.
 
 Pre-recovery wire loss is not decremented when repair later reconstructs a symbol.
 That makes it the honest congestion/loss signal.
@@ -207,8 +287,8 @@ This is how the protocol avoids treating every packet equally. Parameter sets,
 RAP anchors, base references, and recovery-critical metadata can receive stronger
 protection than disposable enhancement data.
 
-Recovery-refresh labels are currently observational. The rejected
-refresh-island sparse-repair policy is not part of the deployable path.
+Recovery-refresh labels describe the source dependency structure. They do not
+trigger a separate whole-refresh-island repair schedule.
 
 ## Encoder Control
 
@@ -217,6 +297,13 @@ The sender exposes an advisory `EncoderControl`:
 ```go
 ctrl := sender.EncoderControl()
 ```
+
+`TargetBitrateBps` asks an attached encoder to reduce source payload when the
+current source plus the bounded recovery allowance cannot fit inside the live
+total-rate budget. The calculation prices systematic headers and recovery serialization,
+uses sustained-overload/clear hysteresis, and bounds recovery's share so packet
+completeness cannot be bought by collapsing source quality. A zero value means no
+active reduction request.
 
 `RecoveryCadenceFrames` asks an attached encoder to bound recovery distance when
 feedback shows long bursts causing frame damage. The encoder may implement that
@@ -237,9 +324,7 @@ The pacer:
 - keeps source FIFO
 - does not run its own congestion controller
 
-Rejected packet-placement interleaving experiments are not part of the pacer.
-The pacer is intentionally a rate and queue discipline, not a dependency-layout
-optimizer.
+The pacer is a rate and queue discipline, not a dependency-layout optimizer.
 
 ## Encryption
 
@@ -265,16 +350,16 @@ Multipath uses a coding-native model: source and repair symbols are spread acros
 paths and decoded from the union. This is diversity coding, not ST 2022-7-style
 duplication.
 
-The public multipath API currently routes through the generation core. Sliding
-multipath remains future work.
+The public multipath API uses the generation core; the sliding core is single-path.
 
 ## Wire Model
 
 The main wire object is a symbol. A symbol can be:
 
-- systematic source
-- dense repair over a window
-- sparse repair over explicit ids
+- compact systematic source
+- dense repair over a window, optionally transmitted without its zero tail
+- sparse repair over explicit ids, with the same optional compaction
+- compact exact unit repair
 
 Important symbol fields include:
 
@@ -292,6 +377,18 @@ Important symbol fields include:
 Feedback and control messages are separate wire objects. See
 [Wire Format](wireformat.md) for the current encoding.
 
+Wire version 1 makes exact source length and deadline part of every coded
+equation and uses bounded Cauchy-MDS keys for generation and isolated epoch
+repair. Systematic packets carry exact source bytes, or omit the explicit length
+only when the payload already has full symbol width. A repair may omit a trailing
+zero run from its application region; the coded length/deadline suffix stays on
+the wire, and the receiver restores the zeros before GF arithmetic. This
+preserves the coefficient vector, equation, and rank while avoiding full-width
+packets for short application chunks. The same format defines
+persistence-gated missing repair, exact unit repair, and stable 16-source block
+announcements with isolated epoch rows. Feedback must carry the complete
+version-1 layout.
+
 ## Invariants
 
 The implementation is tested around these invariants:
@@ -304,16 +401,3 @@ The implementation is tested around these invariants:
 - deterministic core behavior under explicit clocks
 
 The rank oracle and glassbench are part of the protocol's validation strategy.
-
-## What Is Intentionally Not In The Protocol Surface
-
-The following were explored and removed or kept internal:
-
-- deployable placement/interleaver profiles
-- refresh-island sparse repair switch
-- manual protected-repair phasing knobs
-- fixed-keyint source shortcuts as a protocol strategy
-- full emitted-stream lookahead simulators as a sender model
-
-They remain documented only in decision notes so future work does not repeat the
-same local optimization loop.

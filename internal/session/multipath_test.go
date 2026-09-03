@@ -67,13 +67,13 @@ func TestMultipathPMTUDDiscoversEachPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMultipathReceiver: %v", err)
 	}
-	defer rx.Close()
+	defer func() { _ = rx.Close() }()
 
 	tx, err := NewMultipathSender(rx.LocalAddrs(), cfg, nil)
 	if err != nil {
 		t.Fatalf("NewMultipathSender: %v", err)
 	}
-	defer tx.Close()
+	defer func() { _ = tx.Close() }()
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
@@ -90,7 +90,7 @@ func TestMultipathPMTUDDiscoversEachPath(t *testing.T) {
 // delivered chunks off rx until n arrive or the deadline passes. Returns the set of
 // delivered ids (which must be a strict in-order prefix) and any out-of-order/byte
 // mismatch flag.
-func streamAndCollect(t *testing.T, tx multipathWriter, rx *MultipathReceiver, n int, sym int) (got map[uint32]bool, ordered, byteExact bool) {
+func streamAndCollect(t *testing.T, tx multipathWriter, rx *MultipathReceiver, n, sym int) (got map[uint32]bool, ordered, byteExact bool) {
 	t.Helper()
 	got = map[uint32]bool{}
 	ordered, byteExact = true, true
@@ -102,7 +102,10 @@ func streamAndCollect(t *testing.T, tx multipathWriter, rx *MultipathReceiver, n
 			msg := make([]byte, sym)
 			binary.BigEndian.PutUint32(msg, uint32(i))
 			rand.New(rand.NewSource(int64(i))).Read(msg[4:])
-			tx.Write(msg)
+			if _, err := tx.Write(msg); err != nil {
+				t.Errorf("write %d: %v", i, err)
+				return
+			}
 			time.Sleep(time.Millisecond)
 		}
 		tx.Flush()
@@ -112,7 +115,9 @@ func streamAndCollect(t *testing.T, tx multipathWriter, rx *MultipathReceiver, n
 	deadline := time.Now().Add(8 * time.Second)
 	buf := make([]byte, sym)
 	for len(got) < n && time.Now().Before(deadline) {
-		rx.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+		if err := rx.SetReadDeadline(time.Now().Add(300 * time.Millisecond)); err != nil {
+			t.Fatalf("set read deadline: %v", err)
+		}
 		nn, err := rx.Read(buf)
 		if err != nil || nn < 4 {
 			continue
@@ -162,13 +167,13 @@ func TestMultipathCleanDelivery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newMultipathReceiver: %v", err)
 	}
-	defer rx.Close()
+	defer func() { _ = rx.Close() }()
 
 	tx, err := NewMultipathSender(rx.LocalAddrs(), cfg, nil)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer tx.Close()
+	defer func() { _ = tx.Close() }()
 
 	const n = 500
 	got, ordered, byteExact := streamAndCollect(t, tx, rx, n, cfg.SymbolSize)
@@ -215,13 +220,13 @@ func TestMultipathSurvivesBadPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newMultipathReceiver: %v", err)
 	}
-	defer rx.Close()
+	defer func() { _ = rx.Close() }()
 
 	tx, err := NewMultipathSender(rx.LocalAddrs(), cfg, nil)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer tx.Close()
+	defer func() { _ = tx.Close() }()
 
 	const n = 800
 	got, ordered, byteExact := streamAndCollect(t, tx, rx, n, cfg.SymbolSize)

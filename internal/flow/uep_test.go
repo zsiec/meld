@@ -30,7 +30,7 @@ func coinU(seed uint64, parts ...uint32) float64 {
 // either with unequal protection (uep: each unit written at its shaper-assigned tier)
 // or flat protection (every unit at the base tier). Both are held to the SAME rate
 // ceiling (cfg.MaxBitrate), so it is an equal-budget comparison. Returns the decodable-
-// keyframe rate (the headline WP6 metric), decodable-frame-rate, and the realized
+// keyframe rate, decodable-frame rate, and the realized
 // repair overhead.
 func runUEP(t *testing.T, cfg Config, units []shape.Unit, uep bool, lossP float64, seed uint64) (keyframeRate, frameRate, overhead float64, ordered bool) {
 	t.Helper()
@@ -98,7 +98,10 @@ func runUEP(t *testing.T, cfg Config, units []shape.Unit, uep bool, lossP float6
 			pri = u.Class.Wire()
 		}
 		for c := 0; c < nch; c++ {
-			s.WriteUnit(now, makeChunkN(nextID), pri)
+			// The synthetic unit sizes are expressed in cfg.SymbolSize chunks. Feed
+			// full chunks here so the equal-rate budget remains tight now that the
+			// protocol no longer pads short systematic payloads on the wire.
+			s.WriteUnit(now, simChunk(cfg.SymbolSize, nextID), pri)
 			nextID++
 			pump()
 			now = now.Add(testTick)
@@ -138,14 +141,8 @@ func runUEP(t *testing.T, cfg Config, units []shape.Unit, uep bool, lossP float6
 	keyframeRate = shape.DecodableKeyframeRate(units, unitDelivered)
 	frameRate = shape.DecodableFrameRate(units, unitDelivered)
 	st := s.Stats()
-	sent := st.Repair
-	if st.Throttled < sent {
-		sent -= st.Throttled
-	} else {
-		sent = 0
-	}
 	if st.Source > 0 {
-		overhead = 100 * float64(sent) / float64(st.Source)
+		overhead = 100 * float64(st.Repair) / float64(st.Source)
 	}
 	return keyframeRate, frameRate, overhead, ordered
 }
@@ -167,13 +164,13 @@ func TestUEPSweep(t *testing.T) {
 	}
 }
 
-// TestUEPMoneyTest is the WP6 in-core money test: at a TIGHT, equal budget over a heavy
+// TestUEPProtectsKeyframesAtEqualBudget verifies that at a tight, equal budget over a heavy
 // (40%) i.i.d.-loss channel, unequal protection keeps the keyframes — and thus the GOPs
 // they anchor — decodable, where flat protection spreads the same budget across the many
 // disposable leaves, fails to hold the keyframes, and collapses. Run over several loss
 // patterns; UEP's decodable-keyframe rate must beat flat's every time, and hold a high
 // absolute level. Delivery stays in order under both (an invariant check).
-func TestUEPMoneyTest(t *testing.T) {
+func TestUEPProtectsKeyframesAtEqualBudget(t *testing.T) {
 	units := shape.GenerateGOP(16, 16)
 	cfg := Config{Flow: 1, SymbolSize: 256, GenSize: 16, Redundancy: 0, BufferMicros: 200_000, MaxBitrate: 4_000_000}
 	const lossP = 0.40

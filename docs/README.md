@@ -9,18 +9,14 @@ point; these files are the deeper references.
   and adapts.
 - [Integration](integration.md): how to use the Go API, choose config values,
   attach media descriptors, enable encryption, and read stats.
-- [Benchmarking](bench.md): the macro frontier methodology and the current
-  SRT/RIST comparison results.
-- [Publishable Benchmarks](publishing-benchmarks.md): benchmark battery,
-  fairness guards, cost/gain metrics, suites, artifacts, and publication
-  criteria.
+- [Benchmarking](bench.md): benchmark suites, fairness rules, artifacts, and
+  publication criteria.
 - [Specification](spec/README.md): LaTeX working specification for the Meld
   protocol and wire version 1.
 
 ## Protocol Components
 
-- [Coding](coding.md): the RLNC code family, sliding-window band decoder,
-  redundancy sizing, and rejected code-family alternatives.
+- [Coding](coding.md): sliding RLNC, bounded generation MDS, and redundancy sizing.
 - [Sliding Window](sliding-window.md): the default low-latency coder path.
 - [Wire Format](wireformat.md): symbol, repair, feedback, descriptor, and control
   packet encoding.
@@ -37,19 +33,7 @@ point; these files are the deeper references.
 - [AV1](media/av1.md)
 - [JPEG XS](media/jpegxs.md)
 
-## Decision Notes
-
-Decision notes preserve benchmark outcomes and cleanup rationale. They are not a
-replacement for the protocol docs, but they explain why certain branches are no
-longer active.
-
-- [Refresh-island sparse repair](decisions/2026-06-27-refresh-island-repair.md)
-- [Burst48 source thesis](decisions/2026-06-27-burst48-source-thesis.md)
-- [Macro frontier discovery](decisions/2026-06-27-macro-frontier-discovery.md)
-- [Cleanup after frontier discovery](decisions/2026-06-27-cleanup-after-frontier.md)
-- [Publish benchmark battery](decisions/2026-06-27-publish-benchmark-battery.md)
-
 ## Generated Output
 
 Benchmark output should be written under `scratchpad/`. That directory is ignored
-by git. Commit only curated summaries, decision notes, and docs updates.
+by git. Commit only curated summaries and documentation updates.

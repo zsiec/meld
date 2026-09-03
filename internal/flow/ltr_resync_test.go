@@ -1,6 +1,6 @@
 package flow
 
-// LTR-resync experiment (Phase 1 oracle; pre-registered in scratchpad/ltr-resync/PREREG.md).
+// LTR-resync experiment.
 //
 // The burst-frontier failure mode is dependency-island death (rap_anchor /
 // first_base_chain attribution in the burst48 glassbench runs), not repair scarcity
@@ -13,14 +13,12 @@ package flow
 //
 // This file scores that policy against the status quo through the REAL sliding
 // transport (the meld-auto profile) over a seeded Gilbert-Elliott burst channel with
-// real propagation delay, wire serialization, and delivery jitter (the simLink
-// physics the "sim lies" post-mortem demands for any latency-dependent claim). The
+// real propagation delay, wire serialization, and delivery jitter. The
 // closed loop is modeled at the test level: unit-resolution events reach the
 // synthetic encoder owd + one feedback interval after the receiver's in-order
-// delivery stream resolves them — the lag the Phase-2 wire field
-// (Feedback.NewestDecodableLTR) would have. Decodability is scored by the
-// WP6-validated shape.Decodable closure oracle over the units actually delivered
-// whole — the same arbiter model glassbench uses (proven ffprobe-exact in WP6) —
+// delivery stream resolves them — the lag of Feedback.NewestDecodableLTR.
+// Decodability is scored by the shape.Decodable closure oracle over the units
+// actually delivered whole — the same arbiter model glassbench uses —
 // cross-checked against an online closure walk.
 //
 // Three arms, identical transport, identical seeded channel; only the source
@@ -134,9 +132,11 @@ type ltrEncoder struct {
 }
 
 func newLTREncoder(policy resyncPolicy, keyint int, factor float64, holdFrames int) *ltrEncoder {
-	return &ltrEncoder{policy: policy, keyint: keyint, recoveryFactor: factor, holdFrames: holdFrames,
+	return &ltrEncoder{
+		policy: policy, keyint: keyint, recoveryFactor: factor, holdFrames: holdFrames,
 		recoveryClass: shape.ClassBase,
-		spsUnit:       -1, prevAnchor: -1, slotAcked: -1, lastResync: -1, sinceResync: 1 << 30}
+		spsUnit:       -1, prevAnchor: -1, slotAcked: -1, lastResync: -1, sinceResync: 1 << 30,
+	}
 }
 
 // resyncAllowed applies the hold-down and the worth-it gate to a pending damage verdict.
@@ -186,7 +186,7 @@ func (e *ltrEncoder) addUnit(u shape.Unit, chunks int, anchor, ltrCand bool) []c
 		RAP:         u.RAP,
 		Discardable: u.Discardable,
 		NonPicture:  !u.Picture,
-		LTR:         ltrCand, // candidates ride the wire so the Phase-2 loop can name them
+		LTR:         ltrCand, // candidates ride the wire so the feedback loop can name them
 	}
 	out := make([]chunkWrite, chunks)
 	for c := 0; c < chunks; c++ {
@@ -199,8 +199,10 @@ func (e *ltrEncoder) addUnit(u shape.Unit, chunks int, anchor, ltrCand bool) []c
 func (e *ltrEncoder) emitSPSIDR() []chunkWrite {
 	sps := e.addUnit(shape.Unit{Class: shape.ClassParamSet, Confidence: shape.Signaled}, ltrChunksSPS, true, false)
 	e.spsUnit = int64(e.units[len(e.units)-1].u.ID)
-	idr := e.addUnit(shape.Unit{Class: shape.ClassRAP, RAP: true, Picture: true,
-		Confidence: shape.Signaled, RefersTo: []uint32{uint32(e.spsUnit)}}, ltrChunksIDR, true, true)
+	idr := e.addUnit(shape.Unit{
+		Class: shape.ClassRAP, RAP: true, Picture: true,
+		Confidence: shape.Signaled, RefersTo: []uint32{uint32(e.spsUnit)},
+	}, ltrChunksIDR, true, true)
 	idrID := e.units[len(e.units)-1].u.ID
 	e.prevAnchor = int64(idrID)
 	e.lastResync = int64(idrID)
@@ -225,8 +227,10 @@ func (e *ltrEncoder) emitFrame() []chunkWrite {
 		case policyLTR:
 			if e.slotAcked >= 0 {
 				chunks := int(math.Ceil(e.recoveryFactor * ltrChunksP))
-				out := e.addUnit(shape.Unit{Class: e.recoveryClass, Picture: true,
-					Confidence: shape.Signaled, RefersTo: []uint32{uint32(e.slotAcked)}}, chunks, true, true)
+				out := e.addUnit(shape.Unit{
+					Class: e.recoveryClass, Picture: true,
+					Confidence: shape.Signaled, RefersTo: []uint32{uint32(e.slotAcked)},
+				}, chunks, true, true)
 				id := e.units[len(e.units)-1].u.ID
 				e.prevAnchor = int64(id)
 				e.lastResync = int64(id)
@@ -250,13 +254,17 @@ func (e *ltrEncoder) emitFrame() []chunkWrite {
 	if e.frameIdx%ltrAnchorGap == 0 {
 		e.anchorCount++
 		cand := e.anchorCount%ltrCandEvery == 0
-		out = e.addUnit(shape.Unit{Class: shape.ClassBase, Picture: true,
-			Confidence: shape.Signaled, RefersTo: []uint32{uint32(e.prevAnchor)}}, ltrChunksP, true, cand)
+		out = e.addUnit(shape.Unit{
+			Class: shape.ClassBase, Picture: true,
+			Confidence: shape.Signaled, RefersTo: []uint32{uint32(e.prevAnchor)},
+		}, ltrChunksP, true, cand)
 		e.prevAnchor = int64(e.units[len(e.units)-1].u.ID)
 	} else {
-		out = e.addUnit(shape.Unit{Class: shape.ClassDisposable, Picture: true, TemporalID: 2,
+		out = e.addUnit(shape.Unit{
+			Class: shape.ClassDisposable, Picture: true, TemporalID: 2,
 			Discardable: true, Confidence: shape.Signaled,
-			RefersTo: []uint32{uint32(e.prevAnchor)}}, ltrChunksLeaf, false, false)
+			RefersTo: []uint32{uint32(e.prevAnchor)},
+		}, ltrChunksLeaf, false, false)
 	}
 	e.frameIdx++
 	return out
@@ -392,7 +400,7 @@ func (l ltrLink) run(t *testing.T) ltrResult {
 	now := clock.Timestamp(0)
 	vs.onResolved = func(unitID uint32, dec bool) {
 		// The verdict reaches the encoder after the modeled feedback path: one-way
-		// propagation plus a feedback interval (the Phase-2 wire field's lag).
+		// propagation plus a feedback interval (the wire feedback lag).
 		events = append(events, resolveEvent{at: now.Add(l.owdMicros + feedbackIntervalMicros), unitID: unitID, dec: dec})
 	}
 
@@ -514,7 +522,7 @@ func (l ltrLink) run(t *testing.T) ltrResult {
 		vs.nextID++
 	}
 
-	// Score with the WP6 oracle (the arbiter), cross-checked against the online walk.
+	// Score with the closure oracle, cross-checked against the online walk.
 	units := make([]shape.Unit, len(enc.units))
 	deliveredWhole := make(map[uint32]bool, len(enc.units))
 	for i, u := range enc.units {
@@ -563,8 +571,7 @@ func ltrExperimentConfig(budgetMicros int64) Config {
 	}
 }
 
-// TestLTRResyncExperiment is the Phase-1 pre-registered experiment (see
-// scratchpad/ltr-resync/PREREG.md). It is a diagnostic sweep, env-gated like the
+// TestLTRResyncExperiment is a diagnostic sweep, env-gated like the
 // other heavy experiments (MELD_LATENCY, AUTORED_SWEEP); it asserts the safety
 // invariants plus clean-cell dormancy and logs the decision table. Run:
 //

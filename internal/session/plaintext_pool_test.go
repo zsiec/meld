@@ -19,17 +19,21 @@ func TestEncryptedDeliveryRecyclesPlaintext(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewReceiver: %v", err)
 	}
-	defer rx.Close()
+	defer func() { _ = rx.Close() }()
 	tx, err := NewSender(rx.LocalAddr(), cfg, sec)
 	if err != nil {
 		t.Fatalf("NewSender: %v", err)
 	}
-	defer tx.Close()
+	defer func() { _ = tx.Close() }()
 
 	const n = 800
-	chunkLen := cfg.SymbolSize - 16
+	maxChunkLen := cfg.SymbolSize - 16
 	want := make([][]byte, n)
 	for i := range want {
+		// Vary the plaintext length across the full supported range. Version 1
+		// protects the corresponding ciphertext length inside FEC, so decrypt must
+		// return this exact length.
+		chunkLen := 4 + (i*131)%(maxChunkLen-3)
 		b := make([]byte, chunkLen)
 		binary.BigEndian.PutUint32(b, uint32(i))
 		for j := 4; j < chunkLen; j++ {
@@ -39,7 +43,10 @@ func TestEncryptedDeliveryRecyclesPlaintext(t *testing.T) {
 	}
 	go func() {
 		for i := 0; i < n; i++ {
-			tx.Write(want[i]) // read-only access (no race)
+			if _, err := tx.Write(want[i]); err != nil {
+				t.Errorf("write %d: %v", i, err)
+				return
+			}
 			time.Sleep(time.Millisecond)
 		}
 		tx.Flush()
@@ -49,7 +56,9 @@ func TestEncryptedDeliveryRecyclesPlaintext(t *testing.T) {
 	short := make([]byte, 8) // forces a partial copy + recycle
 	got := 0
 	for got < n {
-		rx.SetReadDeadline(time.Now().Add(3 * time.Second))
+		if err := rx.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+			t.Fatalf("set read deadline: %v", err)
+		}
 		buf := full
 		if got%5 == 0 {
 			buf = short // exercise the short-read recycle path

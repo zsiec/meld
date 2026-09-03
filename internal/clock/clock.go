@@ -36,7 +36,7 @@ type Clock interface {
 // RealClock is the production Clock: absolute Unix microseconds. It is absolute
 // (not since-construction) so that two independently-constructed clocks on one host
 // share an epoch. Cross-host, two hosts' clocks disagree by an unknown offset; the
-// session's clock-offset handshake (N4) estimates it and translates the receiver's
+// session's clock-offset handshake estimates it and translates the receiver's
 // time into the sender's frame, so the core's deadline comparison stays correct.
 type RealClock struct{}
 
@@ -48,7 +48,7 @@ func (c *RealClock) Now() Timestamp { return Timestamp(time.Now().UnixMicro()) }
 
 // Offset wraps a Clock, adding a fixed microsecond offset. It models a second host
 // whose clock disagrees with the first by a constant, so the cross-host clock-offset
-// handshake (N4) can be exercised without two machines.
+// handshake can be exercised without two machines.
 type Offset struct {
 	base Clock
 	off  int64

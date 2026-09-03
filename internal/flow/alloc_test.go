@@ -6,10 +6,9 @@ import (
 	"github.com/zsiec/meld/internal/clock"
 )
 
-// Allocation gates for the flow warm path. CLAUDE.md: "no allocation on the warm path once
-// buffers are sized." There was no such gate anywhere; these measure the PER-SYMBOL warm-path
-// allocation by differencing two stream lengths, which cancels the fixed per-run construction
-// cost and isolates the steady-state cost the mandate is about.
+// Allocation gates for the flow warm path. These measure per-symbol warm-path allocation by
+// differencing two stream lengths, canceling fixed per-run construction cost and isolating
+// steady-state behavior.
 
 // captureSymbols runs a sender over n source writes with no loss and returns every datagram it
 // emitted, so the receiver-side gate can replay a real wire stream.

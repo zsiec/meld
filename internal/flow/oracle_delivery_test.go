@@ -191,13 +191,23 @@ func analyzeOracle(p oracleParams, delivered map[uint32]bool, tape []tapEntry, w
 	sort.SliceStable(ord, func(i, j int) bool { return ord[i].at.Before(ord[j].at) })
 
 	recoveredAt := map[uint32]clock.Timestamp{}
-	dec := code.NewDecoder(symSize, 0, p.n)
+	dec := code.NewDecoder(codedSymbolSize(symSize), 0, p.n)
 	for _, e := range ord {
 		var rec []code.Recovered
-		if e.sym.Kind == wire.Systematic {
-			rec = dec.AddSystematic(e.sym.SrcIndex, e.sym.Payload)
-		} else {
-			rec = dec.AddRepair(e.sym.WindowBase, int(e.sym.N), e.sym.RepairKey, e.sym.Payload)
+		switch e.sym.Kind {
+		case wire.Systematic, wire.UnitRepair:
+			n, ok := systematicSourceLength(e.sym, symSize)
+			if !ok {
+				continue
+			}
+			value := makeCodedSource(e.sym.Payload[:n], symSize, clock.Timestamp(e.sym.Deadline))
+			rec = dec.AddSystematic(e.sym.SrcIndex, value)
+		case wire.Repair:
+			value, ok := expandRepairPayload(e.sym, symSize)
+			if !ok {
+				continue
+			}
+			rec = dec.AddRepair(e.sym.WindowBase, int(e.sym.N), e.sym.RepairKey, value)
 		}
 		for _, rc := range rec {
 			if _, seen := recoveredAt[rc.ID]; !seen {

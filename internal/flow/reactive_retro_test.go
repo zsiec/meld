@@ -1,8 +1,7 @@
 package flow
 
-// Tests for the all-regimes pass (prereg: scratchpad/all-regimes/PREREG.md):
-// retrospective coded repair for the sliding profile (RepairAt over the stuck
-// cursor window), loss-onset event feedback, and the honest reactive-capability
+// Tests for retrospective coded repair in the sliding profile (RepairAt over the stuck
+// cursor window), loss-onset event feedback, and the honest reactive-cycle
 // model that gates the singleton/anchor extras.
 
 import (
@@ -12,11 +11,11 @@ import (
 	"github.com/zsiec/meld/internal/wire"
 )
 
-// TestSlidingRetroReactiveRecoversSlidBurst is the D2 money test at flow level: a
+// TestSlidingRetroReactiveRecoversSlidBurst verifies at flow level that a
 // burst wipes a span (source AND its trailing repair) while the stream keeps
 // flowing, so by the time feedback reports the stuck cursor the band has slid far
-// past the holes. The former trailing-band reactive could not, structurally, carry
-// innovation for that window; retrospective repair recovers it fully within a
+// past the holes. Retrospective repair must still carry innovation for that window
+// and recover it fully within a
 // generous budget.
 func TestSlidingRetroReactiveRecoversSlidBurst(t *testing.T) {
 	t.Parallel()
@@ -26,8 +25,10 @@ func TestSlidingRetroReactiveRecoversSlidBurst(t *testing.T) {
 		src    = 500
 		budget = 150_000 // 2.5x RTT: reactive is honestly capable
 	)
-	cfg := Config{Flow: 1, SymbolSize: testSym, Sliding: true, CodingWindow: 32,
-		Redundancy: 0.05, TargetFailure: 1e-2, BufferMicros: budget}
+	cfg := Config{
+		Flow: 1, SymbolSize: testSym, Sliding: true, CodingWindow: 32,
+		Redundancy: 0.05, TargetFailure: 1e-2, BufferMicros: budget,
+	}
 	// Kill EVERYTHING on the wire (source + repair) for an emission-count window —
 	// a hard burst of ~64 datagrams (~2 bands) mid-stream, then a clean channel.
 	ch := &pathOutageChannel{path: 0, from: 400, to: 464} // PathID 0 == every symbol (single path)
@@ -45,7 +46,7 @@ func TestSlidingRetroReactiveRecoversSlidBurst(t *testing.T) {
 }
 
 // TestRetroReactiveBudgetSweep maps the mechanism to its physics across deadline
-// budgets (the prereg's G5): a burst that kills a full band-and-a-half of emissions
+// budgets: a burst that kills a full band-and-a-half of emissions
 // mid-stream must be fully recovered wherever one honest reactive cycle plus repair
 // transit fits the budget (>= ~1.9xRTT for this geometry), must help partially at
 // 1.5xRTT, and must at minimum keep the four invariants and emit nothing harmful at
@@ -63,13 +64,15 @@ func TestRetroReactiveBudgetSweep(t *testing.T) {
 		fullRecovery bool
 		wantDormant  bool // sub-cycle budget: the retro tier must not spend bytes it cannot land
 	}{
-		{60_000, false, true}, // 1xRTT: cycle 80 ms > budget — dormant by the capability gate
+		{60_000, false, true}, // 1xRTT: cycle 80 ms > budget — dormant by the cycle gate
 		{90_000, false, false},
 		{150_000, true, false},
 		{120_000, true, false},
 	} {
-		cfg := Config{Flow: 1, SymbolSize: testSym, Sliding: true, CodingWindow: 32,
-			Redundancy: 0.05, TargetFailure: 1e-2, BufferMicros: tc.budgetMicros}
+		cfg := Config{
+			Flow: 1, SymbolSize: testSym, Sliding: true, CodingWindow: 32,
+			Redundancy: 0.05, TargetFailure: 1e-2, BufferMicros: tc.budgetMicros,
+		}
 		ch := &pathOutageChannel{path: 0, from: 400, to: 448}
 		res := simLink{cfg: cfg, owdMicros: owd, srcMicros: src, n: n, sliding: true, drop: ch.drop}.run()
 		assertCoreInvariants(t, res, n, "retro budget sweep")
@@ -122,8 +125,10 @@ func TestLossOnsetEventFeedback(t *testing.T) {
 		}
 		now := clock.Timestamp(0)
 		feed := func(id uint32) {
-			sym := wire.Symbol{Flow: 1, Kind: wire.Systematic, WindowBase: genBaseOf(id, 16),
-				SrcIndex: id, N: 16, Deadline: int64(now.Add(cfg.BufferMicros)), Payload: make([]byte, testSym)}
+			sym := wire.Symbol{
+				Flow: 1, Kind: wire.Systematic, WindowBase: genBaseOf(id, 16),
+				SrcIndex: id, N: 16, Deadline: int64(now.Add(cfg.BufferMicros)), Payload: make([]byte, testSym),
+			}
 			if sliding {
 				sym.WindowBase, sym.N = id, 1
 			}
@@ -155,7 +160,7 @@ func TestLossOnsetEventFeedback(t *testing.T) {
 	}
 }
 
-// TestSingletonExtrasDormantWhenReactiveReachable pins the capability gate: where
+// TestSingletonExtrasDormantWhenReactiveReachable pins the reachability gate: where
 // the retro tier can repair an observed-burst-length hole within the budget
 // (cycle + 2×burst duration ≤ budget), the per-chunk singleton and anchor-closure
 // extras stay off (retro-reactive owns reference recovery); below it they engage
@@ -165,8 +170,10 @@ func TestLossOnsetEventFeedback(t *testing.T) {
 // part of the predicate (see extrasReplaceableByReactive).
 func TestSingletonExtrasDormantWhenReactiveReachable(t *testing.T) {
 	write := func(budget, rtt int64, warm bool) uint64 {
-		cfg := Config{Flow: 1, SymbolSize: testSym, Sliding: true, CodingWindow: 16,
-			Redundancy: 0, BufferMicros: budget}
+		cfg := Config{
+			Flow: 1, SymbolSize: testSym, Sliding: true, CodingWindow: 16,
+			Redundancy: 0, BufferMicros: budget,
+		}
 		s := NewSlidingSender(cfg)
 		s.rttMicros = rtt
 		if warm {
@@ -192,7 +199,7 @@ func TestSingletonExtrasDormantWhenReactiveReachable(t *testing.T) {
 	}
 }
 
-// TestReactiveRoundsHonestCycle pins the generation-side capability arithmetic: at
+// TestReactiveRoundsHonestCycle pins the generation-side cycle arithmetic: at
 // RTT 100 ms the old 2xRTT+cadence model priced reactive out of a 200 ms budget
 // (0 rounds); the honest cycle credits one round there and still credits none at a
 // sub-RTT budget (the frontier regime keeps its full proactive margins).

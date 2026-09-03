@@ -12,12 +12,25 @@
 \usepackage{xcolor}
 \usepackage{amsmath}
 \usepackage{amssymb}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,calc,decorations.pathreplacing,fit,positioning,shapes.geometric}
+\usepackage{fancyhdr}
+\usepackage{caption}
+\usepackage{placeins}
+
+\definecolor{meldblue}{HTML}{175A8C}
+\definecolor{meldteal}{HTML}{167D7A}
+\definecolor{meldgold}{HTML}{B7791F}
+\definecolor{meldred}{HTML}{A53F3F}
+\definecolor{meldink}{HTML}{1F2933}
+\definecolor{meldpaper}{HTML}{F4F7FA}
+\definecolor{meldline}{HTML}{AAB7C4}
 
 \hypersetup{
   colorlinks=true,
-  linkcolor=blue!55!black,
-  citecolor=blue!55!black,
-  urlcolor=blue!55!black,
+  linkcolor=meldblue,
+  citecolor=meldteal,
+  urlcolor=meldblue,
   pdftitle={Meld Protocol Specification},
   pdfauthor={Meld Project}
 }
@@ -28,11 +41,62 @@
 \newcommand{\field}[1]{\code{#1}}
 \newcommand{\usec}{\ensuremath{\mu\mathrm{s}}}
 \newcommand{\gf}{\ensuremath{\mathrm{GF}(2^8)}}
+\newcommand{\readerpath}[2]{\textbf{#1} & #2\\}
+\newcommand{\readingnote}[1]{%
+  \par\medskip\noindent
+  \colorbox{meldpaper}{%
+    \parbox{\dimexpr\linewidth-2\fboxsep\relax}{%
+      \small\textbf{\textcolor{meldblue}{Reading note.}} #1}}
+  \par\medskip}
+
+\tikzset{
+  meld box/.style={
+    draw=meldblue,
+    fill=meldpaper,
+    rounded corners=2pt,
+    line width=0.8pt,
+    align=center,
+    minimum height=9mm,
+    inner sep=5pt
+  },
+  meld policy/.style={
+    meld box,
+    draw=meldteal,
+    fill=meldteal!8
+  },
+  meld wire/.style={
+    meld box,
+    draw=meldgold,
+    fill=meldgold!10
+  },
+  meld decision/.style={
+    diamond,
+    draw=meldblue,
+    fill=meldblue!7,
+    line width=0.8pt,
+    align=center,
+    inner sep=2pt,
+    aspect=2.2
+  },
+  meld arrow/.style={-{Latex[length=2.4mm]},line width=0.8pt,draw=meldink},
+  meld feedback/.style={-{Latex[length=2.4mm]},line width=0.8pt,draw=meldteal,dashed},
+  meld boundary/.style={draw=meldline,dashed,line width=0.7pt}
+}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small\textcolor{meldink}{Meld Protocol Specification}}
+\fancyhead[R]{\small\textcolor{meldink}{Wire v\wireversion}}
+\fancyfoot[C]{\small\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+\setlength{\headheight}{14pt}
+\captionsetup{font=small,labelfont=bf}
+\setcounter{tocdepth}{2}
 
 \title{\meld{} Protocol Specification\\
 \large Working Specification for Wire Version \wireversion}
 \author{Meld Project}
-\date{June 27, 2026}
+\date{Working Draft}
 
 \begin{document}
 \maketitle
@@ -48,21 +112,97 @@ implementation requirements for wire version \wireversion.
 \end{abstract}
 
 \tableofcontents
-\newpage
+\clearpage
+\phantomsection
+\addcontentsline{toc}{section}{Visual Index}
+\renewcommand{\listfigurename}{Visual Index}
+\listoffigures
+\clearpage
 
-\section{Status of This Document}
+\section*{Status of This Document}
+\phantomsection
+\addcontentsline{toc}{section}{Status of This Document}
 
 This is a working specification for the current Meld prototype. It is intended to
 be precise enough for independent implementation review, internal conformance
 tests, and future publication as a formal specification. It is not an Internet
 Standards Track document.
 
-Wire version \wireversion{} is the first explicitly versioned Meld wire format.
-Earlier prototype headers were not shipped and have no compatibility obligation.
-Base-layout changes require a future version nibble. Additive fields are appended
-under the extension policy in Section~\ref{sec:versioning}.
+Wire version \wireversion{} is the sole research format. It carries exact source
+length and deadline metadata, bounded Cauchy-MDS keys, sliding RLNC, exact unit
+repair, and isolated epoch repair directly. Implementations reject any other
+version nibble; this specification defines no preceding-layout decoder.
 
-\section{Terminology and Conventions}
+\section*{How to Read This Specification}
+\label{sec:reading-guide}
+\phantomsection
+\addcontentsline{toc}{section}{How to Read This Specification}
+
+The normative protocol is organized around one narrow waist: source and repair
+symbols flow forward, cumulative feedback flows backward, and both peers derive
+coding coefficients from the same wire metadata. The figures in this document
+are explanatory maps. If a figure and normative prose ever differ, the prose and
+field tables control.
+
+\begin{table}[htbp]
+\centering
+\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{>{\raggedright\arraybackslash}p{0.24\linewidth}
+                >{\raggedright\arraybackslash}p{0.66\linewidth}}
+\toprule
+Reader goal & Recommended path \\
+\midrule
+\readerpath{Implement the wire codec}
+  {Versioning (Section~\ref{sec:versioning}), Wire Format
+   (Section~\ref{sec:wire-format}), then the Interoperability Checklist
+   (Section~\ref{sec:interop}).}
+\readerpath{Implement recovery}
+  {Coding Semantics (Section~\ref{sec:coding}), Sender and Receiver Requirements
+   (Sections~\ref{sec:sender}--\ref{sec:receiver}), then Adaptive Control
+   (Section~\ref{sec:adaptive}).}
+\readerpath{Build a session host}
+  {Layering (Section~\ref{sec:layering}), Transport Model
+   (Section~\ref{sec:transport}), then pacing, security, congestion, and rate
+   budgeting.}
+\readerpath{Review behavior or evidence}
+  {Protocol Overview (Section~\ref{sec:overview}), Adaptive Control
+   (Section~\ref{sec:adaptive}), Benchmarking Requirements, then the
+   Interoperability Checklist.}
+\bottomrule
+\end{tabular}
+\caption{Task-oriented reading paths through the specification.}
+\label{tab:reader-paths}
+\end{table}
+
+The diagrams use one redundant visual language throughout the document:
+
+\begin{center}
+\begin{tikzpicture}[font=\scriptsize,node distance=4mm and 5mm]
+  \node[meld box,minimum width=27mm,minimum height=7mm] (host) {host or application};
+  \node[meld policy,right=of host,minimum width=27mm,minimum height=7mm]
+    (policy) {protocol policy};
+  \node[meld wire,right=of policy,minimum width=27mm,minimum height=7mm]
+    (wire) {wire material};
+  \node[draw=meldred,fill=meldred!8,rounded corners=2pt,right=of wire,
+    minimum width=27mm,minimum height=7mm,align=center] (limit) {deadline or\\safety bound};
+  \draw[meld arrow] ($(host.south west)+(0,-4mm)$) -- ++(18mm,0)
+    node[right,font=\scriptsize]{forward effect};
+  \draw[meld feedback] ($(policy.south west)+(0,-4mm)$) -- ++(18mm,0)
+    node[right,font=\scriptsize]{feedback};
+\end{tikzpicture}
+\end{center}
+
+Color is never the sole carrier of meaning: labels, shapes, line style, and arrow
+direction preserve the same distinctions in grayscale.
+
+Normative requirements use the BCP 14 key words defined below. Design rationale,
+examples, figures, and benchmark results explain those requirements but do not
+create additional wire obligations.
+
+\section*{Terminology and Conventions}
+\label{sec:terminology}
+\phantomsection
+\addcontentsline{toc}{section}{Terminology and Conventions}
 
 The key words ``MUST'', ``MUST NOT'', ``REQUIRED'', ``SHALL'', ``SHALL NOT'',
 ``SHOULD'', ``SHOULD NOT'', ``RECOMMENDED'', ``NOT RECOMMENDED'', ``MAY'', and
@@ -78,15 +218,19 @@ The following terms are used throughout:
 
 \begin{description}[leftmargin=2.3cm,style=nextline]
 \item[Source symbol]
-  One fixed-size application chunk after any encryption transform and zero
-  padding to \field{SymbolSize}.
+  One application chunk of at most \field{SymbolSize} bytes after any encryption
+  transform, plus private exact-length and deadline metadata. Algebraic operations
+  zero-pad the application value to \field{SymbolSize}.
 \item[Systematic symbol]
-  A wire symbol carrying one source symbol verbatim.
+  A wire symbol carrying the exact application bytes and source length.
 \item[Repair symbol]
   A \gf{} linear combination of source symbols.
 \item[Sparse repair]
   A repair symbol over an explicit set of source identifiers rather than a
   contiguous coding window.
+\item[Unit repair]
+  One exact source retransmission that enters the decoder as a systematic value
+  but remains repair-class traffic for pacing and accounting.
 \item[Flow]
   One logical media stream, identified by a 32-bit \field{Flow} value.
 \item[Deadline]
@@ -98,13 +242,18 @@ The following terms are used throughout:
   material, or recovery-refresh slice interval.
 \end{description}
 
+\clearpage
+\part{Architecture and Operation}
+
 \section{Design Goals}
 
-\meld{} is optimized for media completion under a playout deadline. The protocol
-does not try to beat SRT or RIST at every buffer depth. Its current measured
-frontier is iid or tail-erasure loss at tight latency budgets, especially when
-the playout budget is less than one RTT. In that region, coded repair can arrive
-before ARQ can return a retransmission.
+\meld{} is optimized for media completion under a playout deadline. Its recovery
+policy measures physical opportunity rather than exposing separate coding or ARQ
+profiles. Proactive equations cover tight deadlines and correlated loss; exact
+closure is used when feedback and return transit can still fit; a burst-spaced
+copy may be used when a feedback cycle cannot fit but a second proactive copy can;
+and a repair epoch is used only when measured deep-fade geometry
+and source cadence make the whole block deadline-admissible.
 
 The design goals are:
 
@@ -128,11 +277,13 @@ default low-latency mechanism and uses feedback to tune future repair
 \cite{srt-rfc,rist-tr061,rist-tr062}.
 
 \section{Layering Model}
+\label{sec:layering}
 
 \meld{} has three layers:
 
 \begin{enumerate}
-\item The application or media layer writes fixed-size media chunks. It MAY attach
+\item The application or media layer writes media chunks up to
+      \field{SymbolSize} bytes. It MAY attach
       a generic frame descriptor describing priority, access-unit boundaries,
       references, random-access points, recovery-refresh markers, temporal layer,
       and discardability.
@@ -144,24 +295,68 @@ default low-latency mechanism and uses feedback to tune future repair
       timers, optional encryption, DPLPMTUD probes, and goroutines.
 \end{enumerate}
 
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[font=\small,node distance=7mm and 11mm]
+  \node[meld box,minimum width=34mm] (app) {Application / media\\packetizer and descriptors};
+  \node[meld policy,below=of app,minimum width=34mm] (flow) {Sans-I/O flow core\\coding, deadlines, policy};
+  \node[meld box,below=of flow,minimum width=34mm] (host) {Session host\\clock, pacer, crypto, timers};
+  \node[meld wire,below=of host,minimum width=34mm] (net) {Unreliable datagram substrate};
+
+  \node[meld box,right=38mm of app,minimum width=34mm] (peerapp) {Peer application\\ordered media delivery};
+  \node[meld policy,below=of peerapp,minimum width=34mm] (peerflow) {Peer Sans-I/O core\\decode and feedback};
+  \node[meld box,below=of peerflow,minimum width=34mm] (peerhost) {Peer session host\\clock and transport I/O};
+  \node[meld wire,below=of peerhost,minimum width=34mm] (peernet) {Peer datagram endpoint};
+
+  \draw[meld arrow] (app) -- node[right,font=\scriptsize]{writes} (flow);
+  \draw[meld arrow] (flow) -- (host);
+  \draw[meld arrow] (host) -- (net);
+  \draw[meld arrow] (peerflow) -- node[right,font=\scriptsize]{delivers} (peerapp);
+  \draw[meld arrow] (peerhost) -- (peerflow);
+  \draw[meld arrow] (peernet) -- (peerhost);
+  \draw[meld arrow] (net) -- node[above,font=\scriptsize]{symbols and control} (peernet);
+  \draw[meld feedback] (peernet) to[bend left=12]
+    node[below,font=\scriptsize]{cumulative feedback} (net);
+
+  \draw[meld boundary]
+    ($(flow.south west)+(-5mm,-3.5mm)$) --
+    ($(peerflow.south east)+(5mm,-3.5mm)$)
+    node[pos=0.5,below,font=\scriptsize,fill=white,inner sep=1pt]
+    {deterministic policy above; host I/O below};
+\end{tikzpicture}
+\caption{Meld layering and the deterministic policy boundary. The two flow cores
+interoperate only through normalized symbols, feedback, and control messages;
+socket and clock ownership remains in each session host.}
+\label{fig:layering}
+\end{figure}
+
 The wire waist between implementations is the \field{Symbol} and \field{Feedback}
 encoding defined in Section~\ref{sec:wire-format}.
 
 \section{Transport Model}
+\label{sec:transport}
 
 \meld{} runs over an unreliable datagram substrate. The substrate MAY drop,
 duplicate, reorder, or ECN-mark datagrams. The receiver MUST treat corruption as
 erasure; corrupted authenticated payloads fail the AEAD check when encryption is
 enabled.
 
-Peers are configured with the same \field{SymbolSize}. A coded symbol payload
-MUST be exactly \field{SymbolSize} bytes after decoding the Meld header. A
-receiver MUST reject a symbol whose payload length differs from its configured
-\field{SymbolSize}. Application chunks shorter than \field{SymbolSize} are
-zero-padded before coding. Applications that need exact media lengths MUST carry
-that length in their media/container format or framing layer.
+Peers are configured with the same \field{SymbolSize}. A contiguous
+or sparse repair payload MUST be exactly \field{SymbolSize}+12 bytes: the
+fixed-width application value followed by a coded 4-byte source length and
+8-byte deadline. A repair MAY instead carry \field{SourceLength}
+application-prefix bytes followed by the
+same 12 coded metadata bytes. The receiver MUST restore zeros from byte offset
+\field{SourceLength} up to but excluding \field{SymbolSize} before decoder
+admission.
+A systematic or unit-repair payload carrying \field{SourceLength} MUST contain
+exactly that many application bytes. A full-width systematic MAY omit the field
+when its payload is exactly \field{SymbolSize}. Receivers MUST reject an
+overlarge source length, an incorrect repair width, or an ambiguous compact
+payload.
 
 \section{Protocol Overview}
+\label{sec:overview}
 
 The sender assigns each source symbol a monotonically increasing 32-bit
 \field{SrcIndex}. It emits a systematic symbol immediately, inserts the source
@@ -180,7 +375,39 @@ superseded by the next report. Reports carry delivery progress, rank deficit,
 pre-recovery channel loss, burstiness, optional multipath statistics, and optional
 media decodability counters.
 
-\section{Versioning and Extension Policy}
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[font=\small,x=1cm,y=1cm]
+  \node[font=\bfseries] at (0,0) (sender) {Sender};
+  \node[font=\bfseries] at (10.5,0) (receiver) {Receiver};
+  \draw[meld boundary] (0,-0.35) -- (0,-6.25);
+  \draw[meld boundary] (10.5,-0.35) -- (10.5,-6.25);
+  \draw[meld arrow] (0,-1.0) -- node[above,fill=white,inner sep=1pt]
+    {systematic source \(S_i\)} (10.5,-1.0);
+  \draw[meld arrow] (0,-2.0) -- node[above,fill=white,inner sep=1pt]
+    {proactive RLNC equation or admitted MDS row} (10.5,-2.0);
+  \draw[meld feedback] (10.5,-3.0) -- node[above,fill=white,inner sep=1pt]
+    {cumulative progress, deficit, loss, burst and outage state} (0,-3.0);
+  \draw[meld arrow] (0,-4.0) -- node[above,fill=white,inner sep=1pt]
+    {optional reactive equation or exact unit, only if useful in time} (10.5,-4.0);
+  \draw[meld arrow] (10.5,-5.0) -- ++(0.55,0)
+    node[right,align=left,font=\scriptsize]{deliver exact source\\in order};
+  \draw[meld boundary,draw=meldred] (-0.5,-5.75) -- (11.2,-5.75)
+    node[pos=0.5,above,fill=white,inner sep=1pt,text=meldred]
+    {source deadline: unresolved \(S_i\) is skipped};
+  \node[rotate=90,font=\scriptsize,text=meldink] at (-0.7,-3.1) {time};
+  \draw[meld arrow] (-0.7,-0.6) -- (-0.7,-5.4);
+\end{tikzpicture}
+\caption{Normal recovery exchange. Proactive work can arrive without waiting for
+feedback; feedback-guided work is admitted only when its complete return path
+still precedes the exact source deadline.}
+\label{fig:recovery-timeline}
+\end{figure}
+
+\clearpage
+\part{Wire Protocol}
+
+\section{Versioning and Message Framing}
 \label{sec:versioning}
 
 Every Meld datagram begins with one byte:
@@ -195,10 +422,9 @@ check the version before interpreting the type. If the version is not understood
 the decoder MUST reject the datagram as an unsupported version rather than
 attempting to parse it as a different type.
 
-Additive optional fields are appended to the tail of an existing message and
-guarded by either a symbol flags bit or a length check. Moving or resizing an
-existing base field is an incompatible base-layout change and requires a future
-version nibble.
+Symbol metadata extensions are guarded by the symbol flags byte and appear in
+the fixed order defined below. Feedback uses one complete version-1 layout; a
+short or overlong report is invalid.
 
 \section{Wire Format}
 \label{sec:wire-format}
@@ -212,7 +438,7 @@ version nibble.
 Type & Message & Description \\
 \midrule
 \endhead
-\code{0x1} & Systematic symbol & One source symbol, verbatim. \\
+\code{0x1} & Systematic symbol & One exact-length source value. \\
 \code{0x2} & Repair symbol & Random linear combination over a contiguous window. \\
 \code{0x3} & Feedback report & Receiver-to-sender cumulative recovery state. \\
 \code{0x4} & Clock probe & Receiver-to-sender probe carrying \field{T0}. \\
@@ -223,14 +449,57 @@ Type & Message & Description \\
 \code{0x9} & MTU probe & Sender-to-receiver padded DPLPMTUD probe. \\
 \code{0xA} & MTU probe acknowledgement & Receiver-to-sender probe acknowledgement. \\
 \code{0xB} & Sparse repair symbol & Random linear combination over an explicit source-id set. \\
+\code{0xC} & Unit repair & One exact source retransmission, accounted as repair. \\
 \bottomrule
 \end{longtable}
 
 \subsection{Symbol Header}
 
-Systematic, repair, and sparse repair messages share a 30-byte base header. The
-base header is followed by optional extensions, any sparse repair source-id list,
-and finally the coded payload.
+Systematic, repair, sparse-repair, and unit-repair messages share a 30-byte base
+header. The base header is followed by optional extensions, any sparse repair
+source-id list, and finally the payload.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[font=\scriptsize,x=1cm,y=1cm]
+  \def\h{0.8}
+  \draw[fill=meldblue!12,draw=meldblue] (0,0) rectangle (0.55,\h)
+    node[midway,rotate=90]{V/T};
+  \draw[fill=meldblue!12,draw=meldblue] (0.55,0) rectangle (2.45,\h)
+    node[midway]{Flow};
+  \draw[fill=meldblue!12,draw=meldblue] (2.45,0) rectangle (3.85,\h)
+    node[midway,align=center]{Epoch\\Path};
+  \draw[fill=meldteal!12,draw=meldteal] (3.85,0) rectangle (5.75,\h)
+    node[midway]{WindowBase};
+  \draw[fill=meldteal!12,draw=meldteal] (5.75,0) rectangle (7.65,\h)
+    node[midway]{SrcIndex};
+  \draw[fill=meldgold!14,draw=meldgold] (7.65,0) rectangle (9.55,\h)
+    node[midway,align=center]{N\\RepairKey};
+  \draw[fill=meldgold!14,draw=meldgold] (9.55,0) rectangle (10.2,\h)
+    node[midway,rotate=90]{Pri};
+  \draw[fill=meldred!9,draw=meldred] (10.2,0) rectangle (13.8,\h)
+    node[midway]{Deadline};
+  \draw[fill=meldblue!12,draw=meldblue] (13.8,0) rectangle (14.5,\h)
+    node[midway,rotate=90]{Flags};
+  \draw[decorate,decoration={brace,mirror,amplitude=4pt},draw=meldink]
+    (0,-0.12) -- (14.5,-0.12)
+    node[midway,below=5pt]{30-byte base header};
+
+  \coordinate (basecenter) at (7.25,0);
+  \node[meld box,minimum width=31mm,minimum height=7mm,below=13mm of
+    basecenter] (ext) {flag-gated extensions\\in fixed order};
+  \node[meld wire,minimum width=27mm,minimum height=7mm,right=5mm of ext]
+    (ids) {sparse IDs\\only for \code{0xB}};
+  \node[meld policy,minimum width=31mm,minimum height=7mm,right=5mm of ids]
+    (payload) {exact or coded payload};
+  \draw[meld arrow] (ext) -- (ids);
+  \draw[meld arrow] (ids) -- (payload);
+\end{tikzpicture}
+\caption{Symbol serialization at a glance. The upper bar is the fixed 30-byte
+base; the lower chain is variable. The field table below remains authoritative
+for byte offsets and sizes.}
+\label{fig:symbol-layout}
+\end{figure}
 
 \begin{longtable}{>{\raggedleft\arraybackslash}p{0.08\linewidth}
                   >{\raggedleft\arraybackslash}p{0.08\linewidth}
@@ -240,7 +509,7 @@ and finally the coded payload.
 Offset & Size & Field & Meaning \\
 \midrule
 \endhead
-0 & 1 & \field{ver|type} & Version nibble plus symbol type \code{0x1}, \code{0x2}, or \code{0xB}. \\
+0 & 1 & \field{ver|type} & Version nibble plus symbol type \code{0x1}, \code{0x2}, \code{0xB}, or \code{0xC}. \\
 1 & 4 & \field{Flow} & Flow identifier. \\
 5 & 2 & \field{Epoch} & Flow generation and encryption key epoch. \\
 7 & 1 & \field{PathID} & Host-stamped path identifier; zero on single-path flows. \\
@@ -250,14 +519,15 @@ Offset & Size & Field & Meaning \\
 18 & 2 & \field{RepairKey} & Seed for coefficient generation. \\
 20 & 1 & \field{Priority} & Protection tier; zero is most disposable. \\
 21 & 8 & \field{Deadline} & Decode-by time in sender-clock microseconds. \\
-29 & 1 & \field{Flags} & Bit 0: send timestamp extension. Bit 1: frame descriptor extension. \\
+29 & 1 & \field{Flags} & Bit 0: send timestamp. Bit 1: frame descriptor. Bit 2: source length or compact-repair prefix width. \\
 \bottomrule
 \end{longtable}
 
 If bit 0 of \field{Flags} is set, an 8-byte signed \field{SendTimestamp} follows
-the base header. If bit 1 is set, a frame descriptor follows the send timestamp
-extension if present, otherwise it follows the base header directly. Extensions
-MUST appear in this fixed order.
+the base header. If bit 1 is set, a frame descriptor follows. If bit 2 is set, a
+4-byte unsigned \field{SourceLength} follows. Extensions MUST appear in this
+fixed order: send timestamp, frame descriptor, then source length. A sparse
+source-id list follows all extensions.
 
 The frame descriptor extension layout is:
 
@@ -271,7 +541,7 @@ Offset & Size & Field & Meaning \\
 \endhead
 0 & 4 & \field{FrameStart} & Source id of the first chunk in the access unit. \\
 4 & 2 & \field{FrameLen} & Number of chunks in the access unit. \\
-6 & 1 & \field{DescFlags} & Bit 0 RAP, bit 1 discardable, bit 2 non-picture, bit 3 recovery-refresh. \\
+6 & 1 & \field{DescFlags} & Bit 0 RAP, bit 1 discardable, bit 2 non-picture, bit 3 recovery-refresh, bit 4 LTR candidate. \\
 7 & 1 & \field{nRefs} & Number of referenced access units. \\
 8 & 4 each & \field{RefStart[]} & Source id of each referenced access unit's first chunk. \\
 \bottomrule
@@ -284,10 +554,17 @@ observed descriptors and source-id ranges.
 
 \subsection{Systematic Symbols}
 
-A systematic symbol uses type \code{0x1}. It carries one source symbol verbatim.
-\field{SrcIndex} is the source identifier. \field{N} SHOULD describe the width of
-the current generation or be one on the sliding path. \field{RepairKey} is unused
-by the systematic equation and SHOULD be zero.
+A systematic symbol uses type \code{0x1}. When \field{SourceLength} is present,
+it carries exactly that many application bytes; a full-width payload MAY omit
+the field. \field{SrcIndex} is the source identifier.
+\field{N} SHOULD describe the width of the current generation or be one on the
+ordinary sliding path. The sender MAY stamp every systematic in a fixed epoch
+with the epoch's common
+\field{WindowBase} and \field{N}=16. This announcement MUST begin with the first
+source in the range and MUST remain identical for all 16 consecutive sources.
+\field{RepairKey} is unused and SHOULD be zero. The receiver
+rebuilds the fixed-width algebraic value by zero-padding, appending
+\field{SourceLength}, and appending \field{Deadline} before decoder admission.
 
 \subsection{Contiguous Repair Symbols}
 
@@ -300,7 +577,11 @@ identify the source ids covered by the repair equation:
 
 \field{RepairKey} seeds the deterministic coefficient generator. The resulting
 payload is the byte-wise \gf{} linear combination of the covered source-symbol
-payloads.
+payloads. The sender MAY omit a
+trailing zero run from the application region, set \field{SourceLength} to the
+transmitted prefix width, and retain the coded 12-byte metadata suffix. This
+serialization MUST expand to the byte-identical full-width equation and SHOULD
+be used only when the four-byte extension yields a net byte saving.
 
 \subsection{Sparse Repair Symbols}
 
@@ -312,11 +593,22 @@ coefficient order. \field{N} MUST be greater than zero and MUST NOT exceed 64.
 Sparse repair is intended for protected dependency neighborhoods where a
 contiguous window would spend repair pressure on unrelated disposable symbols.
 It is still part of \code{meld-auto}; it is not a separate profile.
+Sparse repair uses the same compact-repair representation as
+contiguous repair.
+
+\subsection{Unit Repair Symbols}
+
+A unit repair uses type \code{0xC}. It names one retained source with
+\field{WindowBase}=\field{SrcIndex}, carries \field{N}=1, and carries exactly
+\field{SourceLength} application bytes. It enters the decoder as the named
+systematic value but MUST be paced, admitted, and counted as repair. A sender
+MUST admit it against the same deadline and source-first byte ledger as other
+repair traffic.
 
 \subsection{Feedback Report}
 
-A feedback report uses type \code{0x3}. The base report is 53 bytes. Additional
-tail groups are length-gated.
+A feedback report uses type \code{0x3}. Its 53-byte prefix is followed by one
+bounded path section and a required fixed-order suffix.
 
 \begin{longtable}{>{\raggedleft\arraybackslash}p{0.08\linewidth}
                   >{\raggedleft\arraybackslash}p{0.08\linewidth}
@@ -334,10 +626,18 @@ Offset & Size & Field & Meaning \\
 15 & 2 & \field{Deficit} & Extra independent symbols needed at the cursor. \\
 17 & 2 & \field{EcnCE} & CE-marked fraction this interval, parts per 65535. \\
 19 & 2 & \field{LossRate} & Smoothed pre-recovery erasure estimate, parts per 65535. \\
-21 & 32 & \field{Deficits[32]} & Rank deficits for the next 32 generations or windows, saturating at 255. \\
+21 & 32 & \field{Deficits[32]} & Generation deficits or sliding closure continuation. \\
 53 & 2 & \field{CongestionLoss} & Pre-recovery wire-loss count since the last report. \\
 55 & 2 & \field{Burstiness} & Mean loss-run length in Q8; 256 denotes iid. \\
-57 & 1 & \field{nPaths} & Number of paths in the multipath tail; zero means absent or single path. \\
+57 & 1 & \field{nPaths} & Number of paths reported; zero means single path. \\
+next & $2n$ & \field{PathLoss[nPaths]} & Per-path loss fractions, present when \field{nPaths} is nonzero. \\
+next & $2(n+1)$ & \field{SlotDist[nPaths+1]} & Aligned-slot erasure-count histogram, present when \field{nPaths} is nonzero. \\
+next & 16 & media counters & \field{Frames}, \field{DecodableFrames}, \field{Keyframes}, and \field{DecodableKeyframes}, each uint32. \\
+next & 6 & LTR state & \field{NewestDecodableLTR} (uint32) and \field{BrokenAnchors} (uint16). \\
+next & 1 & \field{DeadPaths} & Receiver-classified path-outage bitmap. \\
+next & 8 & \field{Missing} & Rank-closing free-column bitmap from \field{DecodedLowEdge}. \\
+next & 2 & \field{SettledLost} & Reorder-settled source losses since the previous report. \\
+next & 2 & \field{OutageRun} & Largest receiver-classified outage run since the prior report, in source symbols. \\
 \bottomrule
 \end{longtable}
 
@@ -346,13 +646,36 @@ When \field{nPaths} is non-zero, it MUST be at most 8. It is followed by
 histogram of aligned-slot erasure counts. \field{SlotDist[j]} is the fraction of
 slots in which exactly \(j\) of \(n\) paths erased their symbol.
 
-After the per-path section, a 16-byte media-damage tail MAY be present. It
-contains four uint32 counters: \field{Frames}, \field{DecodableFrames},
-\field{Keyframes}, and \field{Decodable\allowbreak{}Keyframes}. A sender uses
-these counters to distinguish ordinary packet loss from dependency damage.
+A single-path feedback report is exactly 93 bytes. An \(n\)-path report is
+exactly \(95+4n\) bytes.
 
-Feedback is cumulative. A sender MUST treat absent tail fields as zero or unknown,
-not as protocol failure.
+After the per-path section, every fixed-order field shown above MUST be present.
+In generation mode, \field{Deficits[i]} is the saturating rank deficit of the
+generation at cursor offset \(i\). In sliding mode, \field{Missing} covers source
+offsets 0--63 from \field{DecodedLowEdge}; \field{Deficits} contains four
+big-endian 64-bit continuation words for offsets 64--319. A run representation
+instead begins with bytes \code{ff 43 <count> 00}, sets bit \code{0x80} in byte
+31, and stores one to six big-endian \code{(uint16 start, uint16 length)} pairs
+at byte 4. Runs MUST be ordered and non-overlapping, MUST begin at offset 64 or
+later, and MUST end at or before offset 2048.
+
+Every named id is an unresolved free column below decode coverage. Each exact
+answer therefore removes one independent degree of freedom. Unresolved pivot
+columns, unsent ids, and merely in-flight ids MUST NOT be reported. A sender MAY
+answer named ids with exact unit repair, bounded by \field{Deficit} and deadline
+admission.
+
+\field{OutageRun} is distinct from \field{Burstiness}. A receiver that classifies
+a run beyond its measured recovery horizon MAY censor that run from rate sizing,
+but reports its full saturated length here so a sender can preserve fade geometry.
+The field resets after each report; zero means no qualifying run was observed.
+
+The media counters distinguish ordinary packet loss from dependency damage.
+\field{SettledLost} supplies reorder-tolerant clean/dirty evidence and MUST NOT
+replace the raw loss observations used for repair sizing.
+
+Feedback is cumulative. A decoder MUST reject a truncated report or unexpected
+trailing bytes.
 
 \subsection{Clock Probe and Echo}
 
@@ -398,11 +721,75 @@ Type & Direction & Payload bytes & Payload layout \\
 \bottomrule
 \end{longtable}
 
-\section{Coding Semantics}
+\clearpage
+\part{Recovery and Adaptation}
 
-\meld{} uses random linear network coding over \gf{}. A source symbol is a unit
-vector equation. A repair symbol is an equation whose coefficient vector is
-derived deterministically from \field{RepairKey} and the covered source ids.
+\section{Coding Semantics}
+\label{sec:coding}
+
+\meld{} uses linear coding over \gf{}. An algebraic source is
+\field{SymbolSize}+12 bytes: a zero-padded application prefix, the exact source
+length as big-endian uint32, and the exact deadline as big-endian int64. A source
+symbol is a unit-vector equation. A repair symbol is an equation whose
+coefficient vector is derived deterministically from \field{RepairKey} and the
+covered source ids.
+
+\subsection{Worked erasure-recovery example}
+
+The following one-erasure example is informative. Suppose the receiver obtains
+exact sources $S_0$ and $S_2$, loses $S_1$, and receives one innovative repair
+
+\[
+  R = a_0 S_0 + a_1 S_1 + a_2 S_2, \qquad a_1 \ne 0.
+\]
+
+All arithmetic is byte-wise in \gf{}. The receiver eliminates the known columns
+and recovers the missing source as
+
+\[
+  S_1 = a_1^{-1}\left(R-a_0S_0-a_2S_2\right).
+\]
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[font=\small,node distance=8mm and 10mm]
+  \node[meld box,minimum width=22mm] (s0) {$S_0$\\received exact};
+  \node[draw=meldred,fill=meldred!8,rounded corners=2pt,right=7mm of s0,
+    minimum width=22mm,minimum height=9mm,align=center] (s1) {$S_1$\\erased};
+  \node[meld box,right=7mm of s1,minimum width=22mm] (s2) {$S_2$\\received exact};
+  \node[meld wire,below=11mm of s1,minimum width=52mm] (repair)
+    {$R=a_0S_0+a_1S_1+a_2S_2$\\received innovative equation};
+  \node[meld policy,right=9mm of repair,minimum width=29mm] (solve)
+    {eliminate known columns\\solve remaining rank};
+  \node[meld box,right=9mm of solve,minimum width=22mm] (recovered)
+    {$S_1$\\recovered exact};
+
+  \draw[meld arrow] (s0.south) -- (repair.north west);
+  \draw[meld arrow,draw=meldred] (s1.south) -- (repair.north);
+  \draw[meld arrow] (s2.south) -- (repair.north east);
+  \draw[meld arrow] (repair) -- (solve);
+  \draw[meld arrow] (solve) -- (recovered);
+\end{tikzpicture}
+\caption{Rank recovery in the smallest useful example. In the general case,
+each received exact source eliminates a column and every innovative repair adds
+one equation; the decoder succeeds when the unresolved system reaches full rank.}
+\label{fig:rank-example}
+\end{figure}
+
+The production decoder applies the same rank rule to larger moving or fixed
+systems. It does not assume one loss, and it does not infer coefficients from
+arrival order: peers regenerate them from the repair metadata.
+
+\subsection{Sliding-window RLNC}
+\label{sec:sliding-rlnc}
+
+Sliding-window random linear network coding (RLNC) is the baseline recovery
+mechanism. The sender emits each source systematically, retains it in a bounded
+live encoder, and may immediately spend earned proactive credit on repair; it
+does not wait for a generation to close. At each repair opportunity, the sender
+stamps the trailing covered range as \field{WindowBase} and \field{N}. The
+effective span may contract below the configured maximum when source cadence,
+one-way propagation, and the deadline cannot admit the full band.
 
 For contiguous repair, the covered ids are the consecutive ids named by
 \field{WindowBase} and \field{N}. For sparse repair, the covered ids are the
@@ -410,13 +797,165 @@ explicit \field{SparseIDs} list. A receiver MUST treat a repair symbol as useful
 only if its equation is innovative relative to the receiver's current linear
 system.
 
-The default low-latency path is sliding-window coding. The implementation MAY
-retain a generation-mode fallback, but peers MUST interoperate through the same
-symbol and feedback waist. A receiver follows the sender-stamped
-\field{WindowBase} and \field{N}; it MUST NOT assume a fixed generation width
-when stamped widths vary.
+As delivery advances, old columns retire and newly created sources enter the
+band. Consecutive repair symbols may therefore cover overlapping but non-identical
+ranges. The receiver MUST use the range stamped on each symbol rather than infer
+one fixed generation. An innovative RLNC equation is \emph{fungible}: it supplies
+one degree of freedom toward any unresolved source in its covered range instead
+of betting on one named erasure. This makes sliding RLNC prompt under isolated
+loss, reorder, changing loss rate, and feedback-guided top-up.
+
+The tradeoff is that independently generated RLNC rows provide a high-probability
+rank result rather than the fixed-matrix guarantee below. A long correlated fade
+can also erase a run of systematics and the immediately adjacent moving equations
+that covered them. Widening the moving range indefinitely is not a remedy because
+the oldest covered source may expire before the range finishes traversing the
+path.
+
+\subsection{Automatic fixed-block Cauchy-MDS}
+\label{sec:auto-mds}
+
+Epoch repair is a bounded actuator inside the same sliding flow, not a
+second profile and not a session-wide mode switch. The controller continuously
+assigns a fraction of ordinary proactive credit to fixed geometry and recomputes
+that fraction at every safe block boundary. When the fraction is nonzero,
+sixteen consecutive systematics announce one stable source range from the first
+source onward. Credit assigned to Cauchy-MDS is accumulated over exactly that
+range and released when the sixteenth source closes the block; the remainder is
+emitted immediately as moving-window RLNC. Reactive feasibility and long slack
+reduce the fixed fraction but do not disable the MDS actuator.
+
+Repair keys whose two high bits are set name bounded Cauchy-epoch rows. For a
+generation of at most 254 source symbols, the row index and systematic points
+MUST remain disjoint in \gf{}, so any generation-width set of systematic and MDS
+rows reconstructs the generation. Other key namespaces use the deterministic
+RLNC coefficient generator.
+
+An epoch repair epoch inside a sliding flow MUST contain exactly 16
+consecutive sources and MUST use the stable range announced by its systematic
+symbols. Its contiguous MDS repairs MUST carry that same \field{WindowBase} and
+\field{N}=16. A receiver MUST route these rows to a fixed decoder separate from
+its moving sliding-band system. It MUST feed exact
+covered values learned by direct reception, unit repair, or any other decoder into
+that fixed system, and MUST inject recovered values into the common ordered
+decoder. It MUST NOT mix an epoch row into a matrix whose covered columns move.
+The receiver MUST bound simultaneous block state and retire a block after the
+common delivery cursor passes its end.
+
+The sender compares the encoded cost of one full algebraic repair row,
+$C_{\mathrm{row}}$, with the mean encoded systematic cost over the most recent
+64 source symbols, $\overline{C}_{\mathrm{src},64}$:
+
+\[
+  C_{\mathrm{row}} \leq
+  \begin{cases}
+    2\,\overline{C}_{\mathrm{src},64}, & \text{cold start or unconfirmed loss},\\
+    3\,\overline{C}_{\mathrm{src},64}, & \text{confirmed burst or outage memory}.
+  \end{cases}
+\]
+
+An automatic sender SHOULD NOT open a new fixed epoch when this inequality is
+false. Unconfirmed exploration is intentionally cheaper than sustained selection
+because no channel-memory evidence yet justifies displacing compact opportunities. This
+gate compares wire opportunities rather than media types: full-width sources
+remain eligible, while a padded equation cannot displace several recent compact
+source datagrams. An implementation MAY use an equivalent bounded recent estimator,
+but MUST NOT infer eligibility from codec identity.
+
+\begin{table}[htbp]
+\centering
+\renewcommand{\arraystretch}{1.17}
+\begin{tabular}{>{\raggedright\arraybackslash}p{0.18\linewidth}
+                >{\raggedright\arraybackslash}p{0.36\linewidth}
+                >{\raggedright\arraybackslash}p{0.36\linewidth}}
+\toprule
+Property & Sliding-window RLNC & Automatic epoch repair \\
+\midrule
+Role & Always-present baseline recovery geometry. & Temporary automatic
+actuator within the sliding flow. \\
+Source set & Elastic trailing band; adjacent rows may overlap different columns. &
+Exactly 16 consecutive, source-announced columns for the whole epoch. \\
+Row availability & As soon as covered sources exist and proactive credit is
+earned. & After all 16 sources exist and the stable block closes. \\
+Rank behavior & Each innovative pseudorandom row adds one degree of freedom with
+high probability. & Each distinct admitted Cauchy row has the fixed-matrix MDS
+guarantee. \\
+Best opportunity & Prompt protection, isolated or changing loss, reorder, and
+reactive top-up. & Measured correlated fade; retained at a minority share when a
+reactive cycle can also fit. \\
+Primary cost & Moving coverage can share the loss fate of a long fade. & Block
+fill delay, full-row byte cost, and a bounded close-time release burst. \\
+\bottomrule
+\end{tabular}
+\caption{The two coding geometries used by the single \code{meld-auto} profile.
+They share source sequence, proactive credit, rate budget, and ordered delivery.}
+\label{tab:coding-geometries}
+\end{table}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[font=\small,node distance=7mm and 8mm]
+  \node[font=\bfseries,text=meldteal] (sliding-label) {Sliding RLNC};
+  \node[meld policy,right=12mm of sliding-label,minimum width=48mm] (w0)
+    {$S_i,\ S_{i+1},\ \ldots,\ S_{i+k-1}$};
+  \node[meld wire,right=of w0,minimum width=26mm] (r0) {row $R_a$};
+  \node[meld policy,below=7mm of w0,minimum width=48mm] (w1)
+    {$S_{i+1},\ S_{i+2},\ \ldots,\ S_{i+k}$};
+  \node[meld wire,right=of w1,minimum width=26mm] (r1) {row $R_b$};
+  \draw[meld arrow] (w0) -- (r0);
+  \draw[meld arrow] (w1) -- (r1);
+  \draw[meld feedback] (w0.south west) -- node[left,font=\scriptsize]
+    {advance} (w1.north west);
+
+  \node[font=\bfseries,text=meldgold,below=32mm of sliding-label] (mds-label)
+    {Epoch repair};
+  \node[meld policy,right=12mm of mds-label,minimum width=48mm] (block)
+    {$S_j,\ S_{j+1},\ \ldots,\ S_{j+15}$};
+  \node[meld wire,right=of block,minimum width=26mm] (rows)
+    {$M_0,M_1,\ldots$};
+  \draw[meld arrow] (block) -- node[above,font=\scriptsize]{after close} (rows);
+  \node[draw=meldgold,dashed,rounded corners=2pt,fit=(block)(rows),inner sep=3mm,
+    label={[font=\scriptsize,text=meldink]below:stable columns for every row}] {};
+\end{tikzpicture}
+\caption{Moving versus fixed repair geometry. Sliding rows become available
+continuously as the trailing range advances. An MDS epoch waits for one stable
+16-source range, then every row uses those same columns.}
+\label{fig:sliding-versus-mds}
+\end{figure}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[font=\small,node distance=10mm and 16mm]
+  \node[meld box,minimum width=31mm] (exact) {Exact covered source\\direct, unit, or decoded};
+  \node[meld wire,above right=9mm and 18mm of exact,minimum width=31mm]
+    (mdsrow) {epoch rows\\stable 16-source range};
+  \node[meld policy,right=25mm of exact,minimum width=35mm] (fixed)
+    {Isolated fixed decoder\\bounded block state};
+  \node[meld wire,below=13mm of exact,minimum width=31mm] (rlnc)
+    {Moving RLNC rows\\elastic source range};
+  \node[meld policy,right=25mm of rlnc,minimum width=35mm] (band)
+    {Main band decoder\\common ordered cursor};
+  \node[meld box,right=18mm of band,minimum width=27mm] (delivery)
+    {Exact ordered\\source delivery};
+
+  \draw[meld arrow] (mdsrow) -- (fixed);
+  \draw[meld arrow] (exact) -- node[above,font=\scriptsize]{exact values} (fixed);
+  \draw[meld arrow] (exact) -- (band);
+  \draw[meld arrow] (rlnc) -- (band);
+  \draw[meld arrow] (fixed) -- node[right,font=\scriptsize,align=left]
+    {decoded exact\\values} (band);
+  \draw[meld arrow] (band) -- (delivery);
+  \node[right=2mm of fixed,align=left,font=\scriptsize,text=meldred]
+    {fixed equations never\\enter the moving matrix};
+\end{tikzpicture}
+\caption{Decoder isolation during an epoch repair epoch. Exact source
+values are shared, but epoch equations and moving RLNC equations remain in
+different linear systems. Ordered delivery has one cursor.}
+\label{fig:decoder-isolation}
+\end{figure}
 
 \section{Sender Requirements}
+\label{sec:sender}
 
 A conforming sender:
 
@@ -431,6 +970,35 @@ A conforming sender:
       target decode-failure probability.
 \item SHOULD send reactive top-up repair when feedback reports a live rank
       deficit and the repair can still arrive before the relevant deadline.
+\item SHOULD prefer fungible equations on a burst-correlated path, and MAY use a
+      delayed compact copy when no feedback cycle fits but measured burst spacing,
+      one-way transit, and byte headroom all fit the exact source deadline.
+\item MAY move a bounded share of already-earned fungible equations across a
+      receiver-reported \field{OutageRun} when no reactive cycle fits. Such a
+      scheduler MUST NOT increase repair credit, MUST retain source-first
+      admission, and MUST bound pending work by its coding-window limit.
+\item MAY allocate ordinary proactive credit to automatic 16-source block-MDS
+      repair when measured source cadence proves the block plus one-way transit
+      and guard fit the deadline, and
+      post-propagation slack is positive. The encoded full-row cost SHOULD be no
+      greater than twice the bounded recent mean encoded systematic cost during
+      channel-shape uncertainty, or three times that cost after confirmed
+      burst/outage memory. It MUST announce the stable range from the first
+      source, MUST NOT manufacture repair credit, and MUST cap the close-time
+      burst by measured source headroom.
+\item SHOULD control epoch repair with the continuous demand, attack,
+      release, and fixed-share mapping in
+      Section~\ref{sec:sliding-fixed-transition}. Reactive feasibility and long
+      post-propagation slack SHOULD reduce that share, but MUST NOT by themselves
+      disable the epoch lane. The share MUST remain stable within an
+      announced block and SHOULD be recomputed at the next block boundary. A
+      sender MUST stop opening new blocks when geometry, economics,
+      or deadline-admission bounds cease to hold; an already announced block
+      SHOULD finish at its stable boundary.
+\item MAY use compact exact closure for a feedback-proven burst residual when a
+      closure round fits. An automatic sender SHOULD retain fungible repair unless
+      the measured feedback horizon materially exceeds its live coding span and
+      exact retained lengths make unit repair materially cheaper.
 \item MUST cap or throttle repair when a configured aggregate rate budget would
       otherwise be exceeded, unless an operator has explicitly disabled that cap.
 \item SHOULD preserve source FIFO under congestion and reduce repair before
@@ -443,13 +1011,17 @@ avoid speculative placement, and rely on feedback-driven repair that can still
 land in time.
 
 \section{Receiver Requirements}
+\label{sec:receiver}
 
 A conforming receiver:
 
 \begin{enumerate}
 \item MUST reject unknown wire versions.
 \item MUST reject symbols for the wrong flow.
-\item MUST reject coded payloads whose length differs from configured
+\item MUST reject a full repair payload whose length differs from
+      \field{SymbolSize}+12, a compact repair whose length differs from
+      \field{SourceLength}+12, and systematic/unit payloads inconsistent with
+      \field{SourceLength}. It MUST reject \field{SourceLength} greater than
       \field{SymbolSize}.
 \item MUST bound decode state so a forged source id or window cannot force
       unbounded allocation or cursor walking.
@@ -460,11 +1032,46 @@ A conforming receiver:
       changes.
 \end{enumerate}
 
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[font=\scriptsize,node distance=6mm and 7mm]
+  \node[meld wire,minimum width=27mm] (datagram) {wire datagram};
+  \node[meld box,right=of datagram,minimum width=31mm] (validate)
+    {validate version, type,\\length, flow, and bounds};
+  \node[meld policy,right=of validate,minimum width=29mm] (normalize)
+    {normalize exact width,\\metadata, coefficients};
+  \node[meld policy,right=of normalize,minimum width=32mm] (decode)
+    {main band or isolated\\fixed-block decoder};
+  \node[draw=meldred,fill=meldred!8,rounded corners=2pt,below=8mm of validate,
+    minimum width=26mm,minimum height=8mm,align=center] (reject)
+    {reject malformed\\peer input};
+  \node[meld box,below=22mm of decode,minimum width=31mm] (exact)
+    {exact recovered values\\in common source order};
+  \node[meld policy,left=9mm of exact,minimum width=30mm] (cursor)
+    {advance delivery cursor\\deliver or deadline-skip};
+  \node[meld box,left=9mm of cursor,minimum width=25mm] (app)
+    {application\\delivery};
+
+  \draw[meld arrow] (datagram) -- (validate);
+  \draw[meld arrow] (validate) -- (normalize);
+  \draw[meld arrow] (normalize) -- (decode);
+  \draw[meld arrow,draw=meldred] (validate) -- node[right]{invalid} (reject);
+  \draw[meld arrow] (decode) -- (exact);
+  \draw[meld arrow] (exact) -- (cursor);
+  \draw[meld arrow] (cursor) -- (app);
+\end{tikzpicture}
+\caption{Conceptual receiver admission path. Wire validation and normalization
+precede algebraic state; all successful recovery paths converge on one ordered,
+deadline-aware delivery cursor.}
+\label{fig:receiver-admission}
+\end{figure}
+
 Receivers SHOULD count pre-recovery wire loss from systematic source-id gaps
 before successful decoding hides those gaps. This preserves an honest congestion
 and repair-sizing signal.
 
 \section{Adaptive Control Loop}
+\label{sec:adaptive}
 
 \code{meld-auto} is the only deployable profile. It classifies the current
 frontier online using:
@@ -475,15 +1082,164 @@ frontier online using:
 \item pre-recovery loss rate,
 \item loss-run burstiness,
 \item reorder behavior,
-\item optional multipath erasure correlation, and
-\item optional media decodability damage.
+\item optional multipath erasure correlation,
+\item optional media decodability damage,
+\item receiver-classified outage length, and
+\item measured source-wire bytes, retained source extent, source cadence, and
+      feedback horizon relative to the live coding-band span.
 \end{itemize}
 
+\readingnote{Table~\ref{tab:signal-action-map} is an informative navigation aid.
+It groups related observables with the decisions they can influence; it does not
+replace the admission requirements in Section~\ref{sec:sender}.}
+
+\begin{table}[htbp]
+\centering
+\renewcommand{\arraystretch}{1.18}
+\begin{tabular}{>{\raggedright\arraybackslash}p{0.25\linewidth}
+                >{\raggedright\arraybackslash}p{0.27\linewidth}
+                >{\raggedright\arraybackslash}p{0.38\linewidth}}
+\toprule
+Observable family & Question answered & Decisions it can influence \\
+\midrule
+RTT, one-way transit, jitter, deadline & Can a feedback-and-return cycle land in time? &
+Reactive top-up, exact closure, proactive-only fallback. \\
+\field{DecodedLowEdge}, rank deficit, live span & What unresolved algebra remains useful? &
+Repair timing, amount, coverage, and retirement. \\
+Pre-recovery loss, mean burst, \field{OutageRun} & Is loss isolated, correlated, or a deep fade? &
+Sliding pressure, outage diversity, delayed copy, epoch allocation. \\
+Source wire bytes, cadence, retained extent & What does each recovery opportunity cost and cover? &
+Compact repair, unit closure, and block economics. \\
+Per-path loss and erasure histogram & Do paths fail together? &
+Path placement and joint-tail repair sizing. \\
+Frame decodability and dependency descriptors & Which missing material causes media damage? &
+Sparse protection, temporal shedding, and encoder advice. \\
+\bottomrule
+\end{tabular}
+\caption{Informative signal-to-action map for \code{meld-auto}. Every action
+remains subject to source-first pacing, rate headroom, and exact deadline
+admission.}
+\label{tab:signal-action-map}
+\end{table}
+\FloatBarrier
+
+\subsection{Continuous recovery allocation}
+\label{sec:sliding-fixed-transition}
+
+The controller does not make a binary sliding-versus-MDS choice. It maintains
+three Q8 observations in $[0,256]$: fixed-geometry demand $D$, consecutive
+correlation confidence $C$, and confirmed memory $M$. The first feedback
+establishes channel-shape uncertainty and sets the demand target to 192.
+Thereafter:
+
+\begin{enumerate}
+\item an ordinary lossy report has exploration target 16;
+\item a lossy report whose mean burst is at least 2.0 symbols increments $C$ by
+      86, saturating at 256; one report is the noise floor, while the excess maps
+      linearly from target 16 to target 192;
+\item reaching $C=256$ promotes $M$ to 256;
+\item a receiver-classified \field{OutageRun} of at least 16 symbols immediately
+      promotes $M$ to 256 and sets target 256; and
+\item an offered non-correlated report decreases $C$ by 86. Confirmed memory
+      decreases by one per offered report when no reactive cycle fits, or by 11
+      when a reactive cycle can take over. An idle report changes neither value.
+\end{enumerate}
+
+For correlation confidence $C$, the informative target is
+
+\[
+ T_C = 16 + 176\,
+       \frac{\max(C-86,0)}{170}.
+\]
+
+The active target $T$ is the greatest applicable exploration target and
+$T_C$ evaluated for both correlation confidence $C$ and confirmed memory $M$.
+Decisive cold-start, confirmed-correlation, or outage
+evidence may set $D$ directly to $T$. Other upward changes close three quarters
+of the gap per report. A downward change subtracts
+$\lceil(D-T)/4\rceil$ when a reactive cycle fits or $T\leq16$, and
+$\lceil(D-T)/16\rceil$ otherwise. These continuous attack and release rules
+provide hysteresis without a fixed-duration mode hold.
+
+At a safe block boundary, define the unscaled fixed share
+
+\[
+ F_0 = \frac{1}{16} + \frac{15}{16}
+       \operatorname{clamp}_{[0,1]}\!\left(\frac{D-16}{192-16}\right).
+\]
+
+If a complete reactive cycle fits, the sender multiplies this share by $1/8$.
+If post-propagation slack $S=\field{BufferMicros}-\mathrm{RTT}/2$ exceeds 75 ms,
+it additionally multiplies the share by $75\,\mathrm{ms}/S$. The result is
+clamped to $[1/16,1]$ whenever $D>0$. Thus MDS remains in the automatic repair
+portfolio in reactive and long-slack regions, while immediate sliding repair
+receives most of the credit there.
+
+A new fixed block additionally requires positive slack, an effective band of at
+least 16 symbols, a measured source cadence, the row-cost inequality in
+Section~\ref{sec:auto-mds}, and
+
+\[
+  15\,t_{\mathrm{source}} + \mathrm{RTT}/2 + 5\,\mathrm{ms}
+  \leq \field{BufferMicros}.
+\]
+
+The selected share is frozen for the announced 16-source block. A fractional
+ledger assigns each already-earned proactive opportunity to epoch repair or moving
+RLNC; it creates no repair credit. The sender still emits sources first and caps
+the close-time row release to 90\% of measured source headroom. The next block
+recomputes the share from live observations. If demand reaches zero or a safety
+or economics condition fails, no new fixed block opens, but an announced block
+always finishes at its stable boundary.
+
 The sender uses those signals to choose repair aggressiveness, sparse repair
-eligibility, reactive repair timing, rate-budget throttling, temporal-layer
-shedding if enabled, and an optional encoder recovery-cadence request. The
-control loop is continuous; changing network conditions should move the sender
-between regimes without requiring a named user profile.
+eligibility, isolated fixed-geometry repair epochs, exact closure, delayed burst copies,
+reactive repair timing,
+rate-budget throttling, temporal-layer shedding if enabled, and optional encoder
+requests. The control loop is continuous; changing network conditions should
+move the sender between regimes without requiring a named user profile.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[font=\small,node distance=9mm and 20mm,scale=0.90,transform shape]
+  \node[meld box,minimum width=42mm] (signals)
+    {Source arrival or feedback update\\refresh observable path state};
+  \node[meld policy,below=of signals,minimum width=42mm] (ledger)
+    {Emit source first\\compute remaining byte and deadline headroom};
+  \node[meld policy,below=11mm of ledger,minimum width=42mm] (score)
+    {Update Q8 demand, correlation,\\and confirmed memory};
+  \node[meld decision,below=14mm of score] (block)
+    {Block geometry, deadline,\\and row cost safe?};
+  \node[meld policy,right=28mm of block,minimum width=40mm] (mds)
+    {Freeze next 16-source mix\\epoch repair + moving RLNC};
+  \node[meld decision,below=14mm of block] (copy)
+    {Measured fade-spaced\\exact copy fits?};
+  \node[meld policy,right=28mm of copy,minimum width=40mm] (delayed)
+    {Schedule one bounded\\compact delayed copy};
+  \node[meld policy,below=13mm of copy,minimum width=42mm] (default)
+    {Use immediate or outage-diverse\\fungible sliding equations};
+
+  \draw[meld arrow] (signals) -- (ledger);
+  \draw[meld arrow] (ledger) -- (score);
+  \draw[meld arrow] (score) -- (block);
+  \draw[meld arrow] (block) -- node[above,font=\scriptsize]{yes} (mds);
+  \draw[meld arrow] (block) -- node[right,font=\scriptsize]{no} (copy);
+  \draw[meld arrow] (copy) -- node[above,font=\scriptsize]{yes} (delayed);
+  \draw[meld arrow] (copy) -- node[right,font=\scriptsize]{no} (default);
+
+  \node[draw=meldline,dashed,rounded corners=2pt,fit=(ledger)(score)(mds)(delayed)(default),
+    inner sep=5mm,label={[font=\scriptsize,text=meldink]below:
+    every branch shares the source-first governor and exact deadline admission}] {};
+\end{tikzpicture}
+\caption{Conceptual automatic recovery allocation for \meld{}. Reactive
+feasibility scales the fixed share inside the score rather than disabling the
+block branch. This is a reading map for the normative sender requirements, not a
+second configurable state machine.}
+\label{fig:auto-selector}
+\end{figure}
+
+\clearpage
+\part{Media and Session Services}
 
 \section{Media Descriptor}
 
@@ -605,6 +1361,9 @@ priority over repair. Optional media shedding is limited to discardable temporal
 layers and occurs before source-id assignment so it does not create transport
 holes.
 
+\clearpage
+\part{Conformance and Evidence}
+
 \section{Benchmarking Requirements}
 
 Meld performance claims SHOULD be evaluated at the glass-to-glass level:
@@ -612,36 +1371,30 @@ decoded frames, decodable frame percentage, decodable keyframe percentage, same
 source bytes and packets across transports, RTT, playout budget relative to RTT,
 loss model, and oracle rows.
 
-The current curated frontier evidence is non-normative but important:
-
-\begin{itemize}
-\item At 10\% iid loss with a 0.75x RTT playout budget across 50, 100, and
-      200 ms RTT cells, \code{meld-auto} reached 144.0 decoded frames while the
-      best ARQ row, RIST, reached 121.1 frames, a +22.9 frame delta.
-\item At 5\% iid loss with the same 0.75x RTT budget, \code{meld-auto} reached
-      143.8--144.0 frames and held a roughly +10 frame advantage.
-\item At 1x RTT and 1.5x RTT budgets, ARQ catches up and the Meld advantage
-      compresses.
-\item Burst48 and Burst96 experiments did not produce a stable deployable Meld
-      target under the current source structure and repair budget.
-\end{itemize}
-
-New optimizations SHOULD be judged by movement of the \code{meld-auto} macro
-frontier against SRT, RIST, and oracle rows rather than isolated packet-level
-improvements.
+Each result SHOULD record the source identity, implementation revision,
+toolchain, transport versions, impairment model, capacity, matched seed set,
+and forward and reverse wire cost.  Claims SHOULD use the automatic profile and
+include source and ideal oracle rows.  Dated measurements are generated
+artifacts, not part of this protocol specification.
 
 \section{Interoperability Checklist}
+\label{sec:interop}
 
 An independent implementation of wire version \wireversion{} should verify:
 
 \begin{enumerate}
 \item Version/type nibble parsing rejects unknown versions before unknown types.
-\item Symbol, feedback, clock, handshake, and MTU message types round-trip.
-\item Systematic and repair payloads are exactly \field{SymbolSize}.
+\item Symbol, unit-repair, feedback, clock, handshake, and MTU message types round-trip.
+\item Systematic and unit payloads preserve exact source length; repair payloads
+      add the 12-byte metadata suffix and recover exact length and deadline.
+      A compact repair expands to the byte-identical full-width equation.
 \item Contiguous and sparse repair equations use identical coefficient generation
       for the same source ids and \field{RepairKey}.
-\item Feedback tails are decoded only when present and absent tails default to
-      zero or unknown.
+\item Feedback reports require the complete version-1 suffix and reject
+      truncation or trailing bytes.
+\item Epoch repair systematics announce one stable 16-source range; fixed
+      rows decode in isolated bounded state, recover exact ordered sources, and
+      retire when the common cursor passes the block.
 \item Frame descriptors preserve source-id ranges and reference starts.
 \item Deadlines skip missing source ids without blocking later recovered ids.
 \item Encrypted flows seal before coding and open after decoding.

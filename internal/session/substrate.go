@@ -19,7 +19,7 @@ var ErrNilSubstrate = errors.New("meld: session: nil substrate")
 // listening *net.UDPConn satisfies it as-is; a dialed (connected) socket needs the thin
 // dialedSubstrate wrapper below, since a connected socket rejects WriteTo.
 //
-// Why this is the substrate fork's seam (PLAN §5): the host owns the substrate, the core
+// The host owns the substrate while the core
 // owns the protocol, and the boundary between them is exactly these four methods. Either
 // substrate — UDP or QUIC-datagram — plugs in without the core changing a line.
 type Substrate interface {
@@ -66,7 +66,7 @@ func writeDatagram(s Substrate, p []byte, addr net.Addr) error {
 // embedded *net.UDPConn (ReadFrom on a connected socket returns the fixed remote address).
 type dialedSubstrate struct{ *net.UDPConn }
 
-func (d dialedSubstrate) WriteTo(p []byte, _ net.Addr) (int, error) { return d.UDPConn.Write(p) }
+func (d dialedSubstrate) WriteTo(p []byte, _ net.Addr) (int, error) { return d.Write(p) }
 
 // dialUDP dials remote ("host:port") and returns it as a connected UDP Substrate.
 func dialUDP(remote string) (Substrate, error) {
@@ -95,7 +95,7 @@ func listenUDP(bind string) (Substrate, error) {
 func closeConns(subs []Substrate) {
 	for _, s := range subs {
 		if s != nil {
-			s.Close()
+			_ = s.Close()
 		}
 	}
 }

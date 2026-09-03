@@ -22,6 +22,6 @@ clean:
 	else \
 		rm -f meld-protocol.aux meld-protocol.bbl meld-protocol.bcf \
 			meld-protocol.blg meld-protocol.fdb_latexmk meld-protocol.fls \
-			meld-protocol.log meld-protocol.out meld-protocol.run.xml \
+			meld-protocol.lof meld-protocol.log meld-protocol.out meld-protocol.run.xml \
 			meld-protocol.synctex.gz meld-protocol.toc meld-protocol.pdf; \
 	fi

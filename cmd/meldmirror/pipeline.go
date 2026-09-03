@@ -158,7 +158,7 @@ func newLossyProxy(rxAddr string, lossPct float64, seed int64) (*lossyProxy, err
 	}
 	raddr, err := net.ResolveUDPAddr("udp", rxAddr)
 	if err != nil {
-		pc.Close()
+		_ = pc.Close()
 		return nil, err
 	}
 	p := &lossyProxy{conn: pc, rxAddr: raddr, rng: rand.New(rand.NewSource(seed)), lossPct: lossPct}
@@ -183,7 +183,7 @@ func (p *lossyProxy) run() {
 		}
 		if src.Port == p.rxAddr.Port && src.IP.Equal(p.rxAddr.IP) {
 			if p.sender != nil { // feedback receiver -> sender, lossless
-				p.conn.WriteToUDP(buf[:n], p.sender)
+				_, _ = p.conn.WriteToUDP(buf[:n], p.sender)
 			}
 			continue
 		}
@@ -193,6 +193,6 @@ func (p *lossyProxy) run() {
 			continue
 		}
 		atomic.AddInt64(&p.fwd, 1)
-		p.conn.WriteToUDP(buf[:n], p.rxAddr)
+		_, _ = p.conn.WriteToUDP(buf[:n], p.rxAddr)
 	}
 }

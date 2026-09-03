@@ -25,7 +25,7 @@
 // release guard. Run NTP on both boxes anyway; the anchor only has to be stable
 // within a run. SRT/RIST anchor comparisons ride txbench's adapters (separate
 // module — those C stacks are outside this repo's dependency allowlist); see
-// docs/soak.md for the pre-registered protocol and bars.
+// docs/soak.md for the measurement protocol and acceptance bars.
 package main
 
 import (
@@ -189,7 +189,7 @@ func sendOneRun(to, arm string, runID uint32, mbps float64, dur time.Duration, b
 	if err != nil {
 		return senderReport{}, err
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	payload := make([]byte, cfg.SymbolSize)
 	copy(payload, soakMagic)
@@ -311,7 +311,7 @@ func receiveOneRun(listen string, budget time.Duration, base func() meld.Config)
 	if err != nil {
 		return rxReport{}, err
 	}
-	defer r.Close()
+	defer func() { _ = r.Close() }()
 
 	rp := rxReport{Total: -1}
 	buf := make([]byte, 64*1024)

@@ -1,10 +1,8 @@
 package flow
 
-// Repair-byte attribution (scratchpad/all-regimes/PREREG-cost.md): the sliding
-// profile accounts every repair emission to exactly one mechanism, so cost work
-// trims what measurement indicts. The flow-level split below is DIAGNOSTIC
-// (real-timing splits come from glassbench); the invariant is the load-bearing
-// assertion.
+// The sliding profile accounts every repair emission to exactly one mechanism.
+// The flow-level split below is diagnostic; the accounting invariant is the
+// load-bearing assertion.
 
 import (
 	"testing"
@@ -13,17 +11,19 @@ import (
 	"github.com/zsiec/meld/internal/wire"
 )
 
-// TestProtectedGroupConsolidation pins the M-D' mechanism (PREREG-cost.md
-// Amendments 1-2): on a WIDE band, center-tier protected chunks share ONE
+// TestProtectedGroupConsolidation verifies that, on a wide band, center-tier
+// protected chunks share one
 // consolidated sparse repair per group (≤ protectedGroupMaxIDs ids, ≤ half a
 // band of span) instead of a per-chunk singleton, while tiers above center keep
 // true singletons; on a NARROW (deadline-clipped, sub-RTT) band the band rate
 // cannot carry the delegated multi-loss cover, so per-chunk singletons persist
-// — the 0.75×RTT frontier-guard failure Amendment 2 records.
+// to retain real multi-loss protection.
 func TestProtectedGroupConsolidation(t *testing.T) {
 	run := func(budget int64) (sparse, singles int, st SenderStats) {
-		cfg := Config{Flow: 1, SymbolSize: testSym, Sliding: true, CodingWindow: 32,
-			Redundancy: 0, BufferMicros: budget}
+		cfg := Config{
+			Flow: 1, SymbolSize: testSym, Sliding: true, CodingWindow: 32,
+			Redundancy: 0, BufferMicros: budget,
+		}
 		s := NewSlidingSender(cfg)
 		s.interMicros = 1_000 // prime the cadence estimate so effectiveBand is deterministic from write 1
 		now := clock.Timestamp(0)
@@ -102,8 +102,10 @@ func TestRepairAttributionInvariant(t *testing.T) {
 		{"burst-2p5x", 30_000, 150_000, geDrop(0xA13, 0.10, 12)},
 	}
 	for _, tc := range cases {
-		cfg := Config{Flow: 1, SymbolSize: testSym, Sliding: true, CodingWindow: 64,
-			Redundancy: 0.05, TargetFailure: 1e-3, BufferMicros: tc.bud}
+		cfg := Config{
+			Flow: 1, SymbolSize: testSym, Sliding: true, CodingWindow: 64,
+			Redundancy: 0.05, TargetFailure: 1e-3, BufferMicros: tc.bud,
+		}
 		res := simLink{cfg: cfg, owdMicros: tc.owd, srcMicros: 500, n: 2_000, sliding: true, drop: tc.drop}.run()
 		st := res.sstats
 		sum := st.RepairProactive + st.RepairProactiveCold + st.RepairSingleton + st.RepairSparse + st.RepairDeficit

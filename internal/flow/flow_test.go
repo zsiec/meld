@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/zsiec/meld/internal/clock"
+	"github.com/zsiec/meld/internal/code"
 	"github.com/zsiec/meld/internal/wire"
 )
 
@@ -184,7 +185,7 @@ func TestFlowRecoverableLoss(t *testing.T) {
 // symbols per generation (the variance regime fixed-ratio coding cannot cover) but
 // leaves repair intact: the receiver's rank-deficit feedback must drive the sender
 // to send extra repair until every generation decodes — full recovery beyond the
-// proactive budget (WP3).
+// proactive budget.
 func TestFlowReactiveRepair(t *testing.T) {
 	cfg := testConfig()
 	const n = 320
@@ -232,7 +233,8 @@ func TestFlowReactiveRepairEntirelyLostGeneration(t *testing.T) {
 		case wire.Systematic:
 			return sym.SrcIndex < uint32(cfg.GenSize)
 		case wire.Repair:
-			return sym.RepairKey < proactive
+			key, mds := code.BlockRepairIndex(sym.RepairKey)
+			return mds && key < proactive
 		default:
 			return false
 		}

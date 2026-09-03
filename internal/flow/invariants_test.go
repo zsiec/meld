@@ -8,7 +8,7 @@ import (
 	"github.com/zsiec/meld/internal/wire"
 )
 
-// The four invariants every flow/multipath sim must uphold (CLAUDE.md): (1) no duplicate
+// The four invariants every flow/multipath simulation must uphold: (1) no duplicate
 // delivered, (2) in-order output, (3) nothing past deadline, (4) completeness under
 // recoverable loss. They are checked piecemeal across the suite; this is the consolidated,
 // seeded property fuzz that runs them together over the cross product of loss model × loss
@@ -24,7 +24,7 @@ func assertCoreInvariants(t *testing.T, res simResult, n int, label string) {
 	}
 	// (3): nothing delivered past its deadline.
 	if res.lateDeliv {
-		t.Fatalf("%s: a symbol was delivered past its deadline", label)
+		t.Fatalf("%s: symbol %d was delivered %dµs past its deadline", label, res.lateID, res.lateByMicros)
 	}
 	// Correctness / the coded-recovery oracle: never deliver the wrong bytes for an id.
 	if res.corrupt {
@@ -53,12 +53,16 @@ func TestInvariantsFuzz(t *testing.T) {
 	for li, loss := range losses {
 		for ji, jit := range jitters {
 			// i.i.d. channel.
-			resI := simLink{cfg: cfg, owdMicros: 20_000, srcMicros: 1_000, n: n, jitterMicros: jit,
-				drop: uniformDrop(uint64(li*7+ji*13+1)*0x9E3779B1, loss)}.run()
+			resI := simLink{
+				cfg: cfg, owdMicros: 20_000, srcMicros: 1_000, n: n, jitterMicros: jit,
+				drop: uniformDrop(uint64(li*7+ji*13+1)*0x9E3779B1, loss),
+			}.run()
 			assertCoreInvariants(t, resI, n, fmt.Sprintf("iid loss=%.0f%% jit=%dms", loss*100, jit/1000))
 			// Gilbert-Elliott (burst 6) at the same mean loss.
-			resG := simLink{cfg: cfg, owdMicros: 20_000, srcMicros: 1_000, n: n, jitterMicros: jit,
-				drop: geDrop(int64(li*100+ji+1), loss, 6)}.run()
+			resG := simLink{
+				cfg: cfg, owdMicros: 20_000, srcMicros: 1_000, n: n, jitterMicros: jit,
+				drop: geDrop(int64(li*100+ji+1), loss, 6),
+			}.run()
 			assertCoreInvariants(t, resG, n, fmt.Sprintf("ge loss=%.0f%% jit=%dms", loss*100, jit/1000))
 		}
 	}

@@ -21,12 +21,14 @@ type reportCase struct {
 	Clip                string  `json:"clip"`
 	Loss                float64 `json:"loss"`
 	GEBurst             float64 `json:"ge_burst_packets"`
+	GEBurstClock        string  `json:"ge_burst_clock"`
 	RTTMs               int     `json:"rtt_ms"`
 	RTTMult             int     `json:"rtt_mult"`
 	BufferMs            int     `json:"buffer_ms"`
 	BudgetMs            int     `json:"budget_ms"`
 	BitrateMbps         float64 `json:"bitrate_mbps"`
 	MaxMbps             float64 `json:"max_mbps"`
+	WireMbps            float64 `json:"wire_mbps"`
 	ChunkSize           int     `json:"chunk_size"`
 	Reps                int     `json:"reps"`
 	Arms                string  `json:"arms"`
@@ -71,31 +73,42 @@ type reportResult struct {
 }
 
 type reportSeed struct {
-	Case                string
-	Arm                 string
-	Rep                 int
-	Seed                int64
-	FF                  int
-	FramePct            float64
-	KeyPct              float64
-	Chunks              int
-	TotalChunks         int
-	TxSource            uint64
-	TxRepair            uint64
-	TxReactive          uint64
-	TxThrottled         uint64
-	RxDelivered         uint64
-	RxRecovered         uint64
-	RxLost              uint64
-	RxEvicted           uint64
-	RelayEnq            int64
-	RelaySent           int64
-	FirstMissingUnit    int64
-	FirstMissingPicture int64
-	FirstMissingKey     int64
-	FirstBrokenUnit     int64
-	FirstBrokenRef      int64
-	TraceFile           string
+	Case                  string
+	Arm                   string
+	Rep                   int
+	Seed                  int64
+	FF                    int
+	FramePct              float64
+	KeyPct                float64
+	Chunks                int
+	TotalChunks           int
+	TxSource              uint64
+	TxRepair              uint64
+	TxReactive            uint64
+	TxThrottled           uint64
+	RepairExact           uint64
+	RepairBurstDuplicate  uint64
+	RepairOutageDiversity uint64
+	RepairEpoch           uint64
+	EpochBlocks           uint64
+	EpochDemandQ8         uint16
+	EpochCorrelationQ8    uint16
+	EpochMemoryQ8         uint16
+	EpochShareQ8          uint16
+	RepairCompacted       uint64
+	RepairBytesSaved      uint64
+	RxDelivered           uint64
+	RxRecovered           uint64
+	RxLost                uint64
+	RxEvicted             uint64
+	RelayEnq              int64
+	RelaySent             int64
+	FirstMissingUnit      int64
+	FirstMissingPicture   int64
+	FirstMissingKey       int64
+	FirstBrokenUnit       int64
+	FirstBrokenRef        int64
+	TraceFile             string
 }
 
 type failureAttribution struct {
@@ -173,7 +186,6 @@ type feedbackTraceEvent struct {
 	BrokenAnchors      uint16  `json:"broken_anchors,omitempty"`
 	Missing            uint64  `json:"missing,omitempty"`
 	SettledLost        uint16  `json:"settled_lost,omitempty"`
-	HasSettled         bool    `json:"has_settled,omitempty"`
 }
 
 // arrivalTraceEvent is one chunk's FIRST arrival at the receiver-side sink.
@@ -189,18 +201,29 @@ type seedTraceScore struct {
 }
 
 type seedTraceStats struct {
-	Chunks      int    `json:"chunks"`
-	TotalChunks int    `json:"total_chunks"`
-	TxSource    uint64 `json:"tx_source"`
-	TxRepair    uint64 `json:"tx_repair"`
-	TxReactive  uint64 `json:"tx_reactive"`
-	TxThrottled uint64 `json:"tx_throttled"`
-	RxDelivered uint64 `json:"rx_delivered"`
-	RxRecovered uint64 `json:"rx_recovered"`
-	RxLost      uint64 `json:"rx_lost"`
-	RxEvicted   uint64 `json:"rx_evicted"`
-	RelayEnq    int64  `json:"relay_enq"`
-	RelaySent   int64  `json:"relay_sent"`
+	Chunks                int    `json:"chunks"`
+	TotalChunks           int    `json:"total_chunks"`
+	TxSource              uint64 `json:"tx_source"`
+	TxRepair              uint64 `json:"tx_repair"`
+	TxReactive            uint64 `json:"tx_reactive"`
+	TxThrottled           uint64 `json:"tx_throttled"`
+	RepairExact           uint64 `json:"repair_exact"`
+	RepairBurstDuplicate  uint64 `json:"repair_burst_duplicate"`
+	RepairOutageDiversity uint64 `json:"repair_outage_diversity"`
+	RepairEpoch           uint64 `json:"repair_epoch"`
+	EpochBlocks           uint64 `json:"epoch_blocks"`
+	EpochDemandQ8         uint16 `json:"epoch_demand_q8"`
+	EpochCorrelationQ8    uint16 `json:"epoch_correlation_q8"`
+	EpochMemoryQ8         uint16 `json:"epoch_memory_q8"`
+	EpochShareQ8          uint16 `json:"epoch_share_q8"`
+	RepairCompacted       uint64 `json:"repair_compacted"`
+	RepairBytesSaved      uint64 `json:"repair_bytes_saved"`
+	RxDelivered           uint64 `json:"rx_delivered"`
+	RxRecovered           uint64 `json:"rx_recovered"`
+	RxLost                uint64 `json:"rx_lost"`
+	RxEvicted             uint64 `json:"rx_evicted"`
+	RelayEnq              int64  `json:"relay_enq"`
+	RelaySent             int64  `json:"relay_sent"`
 }
 
 type sourceTrace struct {
@@ -353,7 +376,6 @@ func (t *seedTrace) recordFeedback(datagram []byte) {
 		BrokenAnchors:      fb.BrokenAnchors,
 		Missing:            fb.Missing,
 		SettledLost:        fb.SettledLost,
-		HasSettled:         fb.HasSettled,
 	})
 }
 
@@ -404,6 +426,17 @@ func (r *benchReport) addSeed(c *chunked, arm string, rep int, seed int64, ff in
 		row.TxRepair = m.txStats.Repair
 		row.TxReactive = m.txStats.ReactiveRepair
 		row.TxThrottled = m.txStats.Throttled
+		row.RepairExact = m.txStats.RepairExact
+		row.RepairBurstDuplicate = m.txStats.RepairBurstDuplicate
+		row.RepairOutageDiversity = m.txStats.RepairOutageDiversity
+		row.RepairEpoch = m.txStats.RepairEpoch
+		row.EpochBlocks = m.txStats.EpochBlocks
+		row.EpochDemandQ8 = m.txStats.EpochDemandQ8
+		row.EpochCorrelationQ8 = m.txStats.EpochCorrelationQ8
+		row.EpochMemoryQ8 = m.txStats.EpochMemoryQ8
+		row.EpochShareQ8 = m.txStats.EpochShareQ8
+		row.RepairCompacted = m.txStats.RepairCompacted
+		row.RepairBytesSaved = m.txStats.RepairBytesSaved
 		row.RxDelivered = m.rxStats.Delivered
 		row.RxRecovered = m.rxStats.Recovered
 		row.RxLost = m.rxStats.Lost
@@ -416,18 +449,29 @@ func (r *benchReport) addSeed(c *chunked, arm string, rep int, seed int64, ff in
 
 	tr.Score = seedTraceScore{FFFrames: ff, FramePct: sc.frameRate, KeyPct: sc.keyRate}
 	tr.Stats = seedTraceStats{
-		Chunks:      row.Chunks,
-		TotalChunks: row.TotalChunks,
-		TxSource:    row.TxSource,
-		TxRepair:    row.TxRepair,
-		TxReactive:  row.TxReactive,
-		TxThrottled: row.TxThrottled,
-		RxDelivered: row.RxDelivered,
-		RxRecovered: row.RxRecovered,
-		RxLost:      row.RxLost,
-		RxEvicted:   row.RxEvicted,
-		RelayEnq:    row.RelayEnq,
-		RelaySent:   row.RelaySent,
+		Chunks:                row.Chunks,
+		TotalChunks:           row.TotalChunks,
+		TxSource:              row.TxSource,
+		TxRepair:              row.TxRepair,
+		TxReactive:            row.TxReactive,
+		TxThrottled:           row.TxThrottled,
+		RepairExact:           row.RepairExact,
+		RepairBurstDuplicate:  row.RepairBurstDuplicate,
+		RepairOutageDiversity: row.RepairOutageDiversity,
+		RepairEpoch:           row.RepairEpoch,
+		EpochBlocks:           row.EpochBlocks,
+		EpochDemandQ8:         row.EpochDemandQ8,
+		EpochCorrelationQ8:    row.EpochCorrelationQ8,
+		EpochMemoryQ8:         row.EpochMemoryQ8,
+		EpochShareQ8:          row.EpochShareQ8,
+		RepairCompacted:       row.RepairCompacted,
+		RepairBytesSaved:      row.RepairBytesSaved,
+		RxDelivered:           row.RxDelivered,
+		RxRecovered:           row.RxRecovered,
+		RxLost:                row.RxLost,
+		RxEvicted:             row.RxEvicted,
+		RelayEnq:              row.RelayEnq,
+		RelaySent:             row.RelaySent,
 	}
 	tr.Missing = ms
 	tr.Source = sourceTimeline(c, seqs)
@@ -520,7 +564,7 @@ func failureAttributionFor(c *chunked, seqs map[uint32]bool, tr *seedTrace, ms m
 	}
 	deliveredUnits := c.deliveredUnits(seqs)
 	decodable := shape.Decodable(c.units, deliveredUnits)
-	targetUnit := int64(-1)
+	var targetUnit int64
 	switch {
 	case ms.firstBrokenRef >= 0:
 		out.Kind = "broken_dependency"
@@ -741,12 +785,16 @@ func className(c shape.PriorityClass) string {
 	}
 }
 
-func writeJSON(path string, v any) error {
+func writeJSON(path string, v any) (err error) {
 	f, err := os.Create(path)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() {
+		if closeErr := f.Close(); err == nil {
+			err = closeErr
+		}
+	}()
 	enc := json.NewEncoder(f)
 	enc.SetIndent("", "  ")
 	return enc.Encode(v)
@@ -786,17 +834,28 @@ func (r *benchReport) write() error {
 	return r.writeSummaryMD()
 }
 
-func (r *benchReport) writeResultsCSV() error {
+func finishCSVFile(f *os.File, w *csv.Writer, result *error) {
+	w.Flush()
+	if *result == nil {
+		*result = w.Error()
+	}
+	if err := f.Close(); *result == nil {
+		*result = err
+	}
+}
+
+func (r *benchReport) writeResultsCSV() (err error) {
 	f, err := os.Create(filepath.Join(r.dir, "results.csv"))
 	if err != nil {
 		return err
 	}
-	defer f.Close()
 	w := csv.NewWriter(f)
-	defer w.Flush()
-	w.Write([]string{"case", "arm", "ff_mean", "frame_pct_mean", "key_pct_mean", "repair_mean", "reactive_mean", "failed", "seeds"})
+	defer finishCSVFile(f, w, &err)
+	if err := w.Write([]string{"case", "arm", "ff_mean", "frame_pct_mean", "key_pct_mean", "repair_mean", "reactive_mean", "failed", "seeds"}); err != nil {
+		return err
+	}
 	for _, row := range r.results {
-		w.Write([]string{
+		if err := w.Write([]string{
 			row.Case, row.Arm,
 			fmt.Sprintf("%.3f", row.FFMean),
 			fmt.Sprintf("%.6f", row.FramePctMean),
@@ -805,22 +864,25 @@ func (r *benchReport) writeResultsCSV() error {
 			fmt.Sprintf("%.3f", row.ReactiveMean),
 			strconv.Itoa(row.Failed),
 			strconv.Itoa(row.Seeds),
-		})
+		}); err != nil {
+			return err
+		}
 	}
-	return w.Error()
+	return nil
 }
 
-func (r *benchReport) writeSeedsCSV() error {
+func (r *benchReport) writeSeedsCSV() (err error) {
 	f, err := os.Create(filepath.Join(r.dir, "per_seed.csv"))
 	if err != nil {
 		return err
 	}
-	defer f.Close()
 	w := csv.NewWriter(f)
-	defer w.Flush()
-	w.Write([]string{"case", "arm", "rep", "seed", "ff", "frame_pct", "key_pct", "chunks", "total_chunks", "tx_source", "tx_repair", "tx_reactive", "tx_throttled", "rx_delivered", "rx_recovered", "rx_lost", "rx_evicted", "relay_enq", "relay_sent", "first_missing_unit", "first_missing_picture", "first_missing_key", "first_broken_unit", "first_broken_ref", "trace_file"})
+	defer finishCSVFile(f, w, &err)
+	if err := w.Write([]string{"case", "arm", "rep", "seed", "ff", "frame_pct", "key_pct", "chunks", "total_chunks", "tx_source", "tx_repair", "tx_reactive", "tx_throttled", "repair_exact", "repair_burst_duplicate", "repair_outage_diversity", "repair_epoch", "epoch_blocks", "epoch_demand_q8", "epoch_correlation_q8", "epoch_memory_q8", "epoch_share_q8", "repair_compacted", "repair_bytes_saved", "rx_delivered", "rx_recovered", "rx_lost", "rx_evicted", "relay_enq", "relay_sent", "first_missing_unit", "first_missing_picture", "first_missing_key", "first_broken_unit", "first_broken_ref", "trace_file"}); err != nil {
+		return err
+	}
 	for _, s := range r.seeds {
-		w.Write([]string{
+		if err := w.Write([]string{
 			s.Case, s.Arm, strconv.Itoa(s.Rep), strconv.FormatInt(s.Seed, 10),
 			strconv.Itoa(s.FF),
 			fmt.Sprintf("%.6f", s.FramePct),
@@ -828,34 +890,46 @@ func (r *benchReport) writeSeedsCSV() error {
 			strconv.Itoa(s.Chunks), strconv.Itoa(s.TotalChunks),
 			strconv.FormatUint(s.TxSource, 10), strconv.FormatUint(s.TxRepair, 10),
 			strconv.FormatUint(s.TxReactive, 10), strconv.FormatUint(s.TxThrottled, 10),
+			strconv.FormatUint(s.RepairExact, 10), strconv.FormatUint(s.RepairBurstDuplicate, 10),
+			strconv.FormatUint(s.RepairOutageDiversity, 10),
+			strconv.FormatUint(s.RepairEpoch, 10),
+			strconv.FormatUint(s.EpochBlocks, 10),
+			strconv.FormatUint(uint64(s.EpochDemandQ8), 10),
+			strconv.FormatUint(uint64(s.EpochCorrelationQ8), 10),
+			strconv.FormatUint(uint64(s.EpochMemoryQ8), 10),
+			strconv.FormatUint(uint64(s.EpochShareQ8), 10),
+			strconv.FormatUint(s.RepairCompacted, 10), strconv.FormatUint(s.RepairBytesSaved, 10),
 			strconv.FormatUint(s.RxDelivered, 10), strconv.FormatUint(s.RxRecovered, 10),
 			strconv.FormatUint(s.RxLost, 10), strconv.FormatUint(s.RxEvicted, 10),
 			strconv.FormatInt(s.RelayEnq, 10), strconv.FormatInt(s.RelaySent, 10),
 			strconv.FormatInt(s.FirstMissingUnit, 10), strconv.FormatInt(s.FirstMissingPicture, 10),
 			strconv.FormatInt(s.FirstMissingKey, 10), strconv.FormatInt(s.FirstBrokenUnit, 10),
 			strconv.FormatInt(s.FirstBrokenRef, 10), s.TraceFile,
-		})
+		}); err != nil {
+			return err
+		}
 	}
-	return w.Error()
+	return nil
 }
 
-func writeFailureReportCSV(path string, rows []failureReportRow) error {
+func writeFailureReportCSV(path string, rows []failureReportRow) (err error) {
 	f, err := os.Create(path)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
 	w := csv.NewWriter(f)
-	defer w.Flush()
-	w.Write([]string{
+	defer finishCSVFile(f, w, &err)
+	if err := w.Write([]string{
 		"case", "arm", "rep", "seed", "ff", "frame_pct", "key_pct",
 		"failure_kind", "failure_cause", "failure_unit", "failure_seq_start", "dependency_island", "dependency_ref",
 		"target_chunks", "missing_chunks", "repair_covering", "repair_in_time", "repair_dropped", "repair_survived",
 		"repair_erased", "source_dependency", "dependency_delivered", "dependency_decodable", "trace_file",
-	})
+	}); err != nil {
+		return err
+	}
 	for _, row := range rows {
 		fa := row.Failure
-		w.Write([]string{
+		if err := w.Write([]string{
 			row.Case, row.Arm, strconv.Itoa(row.Rep), strconv.FormatInt(row.Seed, 10),
 			strconv.Itoa(row.FF), fmt.Sprintf("%.6f", row.FramePct), fmt.Sprintf("%.6f", row.KeyPct),
 			fa.Kind, fa.Cause, strconv.FormatInt(fa.UnitID, 10), strconv.FormatInt(fa.SeqStart, 10), fa.Island, strconv.FormatInt(fa.DependencyRef, 10),
@@ -863,9 +937,11 @@ func writeFailureReportCSV(path string, rows []failureReportRow) error {
 			strconv.Itoa(fa.RepairDropped), strconv.Itoa(fa.RepairSurvived), strconv.FormatBool(fa.RepairErased),
 			strconv.FormatBool(fa.SourceDependency), strconv.FormatBool(fa.DependencyDelivered), strconv.FormatBool(fa.DependencyDecodable),
 			row.Trace,
-		})
+		}); err != nil {
+			return err
+		}
 	}
-	return w.Error()
+	return nil
 }
 
 func writeFailureReportMD(path string, rows []failureReportRow, limit int) error {
@@ -937,7 +1013,7 @@ func (r *benchReport) writeMatrixMD() error {
 
 func (r *benchReport) writeSummaryMD() error {
 	bestMeld, haveMeld := bestResult(r.results, func(a string) bool { return strings.HasPrefix(a, "meld") })
-	bestARQ, haveARQ := bestResult(r.results, func(a string) bool { return a == "libsrt" || a == "librist" })
+	bestCompetitor, haveCompetitor := bestResult(r.results, isCompetitorArm)
 	var b strings.Builder
 	fmt.Fprintf(&b, "# Glassbench Report\n\n")
 	fmt.Fprintf(&b, "This report is meant to support a Bret-Victor-style ladder workflow: macro result, per-seed spread, then concrete seed traces.\n\n")
@@ -946,13 +1022,13 @@ func (r *benchReport) writeSummaryMD() error {
 	fmt.Fprintf(&b, "- `failure_report.csv` / `failure_report.md`: per-seed dependency-island failure attribution\n")
 	fmt.Fprintf(&b, "- `matrix.md`: arm table and worst-seed links\n")
 	fmt.Fprintf(&b, "- `seed_trace_*.json`: source timeline, missing runs, and Meld relay source/repair events\n\n")
-	if haveMeld && haveARQ {
-		delta := bestMeld.FFMean - bestARQ.FFMean
-		fmt.Fprintf(&b, "Best Meld: `%s` %.1f ff frames. Best ARQ: `%s` %.1f ff frames. Delta: %.1f.\n\n",
-			bestMeld.Arm, bestMeld.FFMean, bestARQ.Arm, bestARQ.FFMean, delta)
+	if haveMeld && haveCompetitor {
+		delta := bestMeld.FFMean - bestCompetitor.FFMean
+		fmt.Fprintf(&b, "Best Meld: `%s` %.1f ff frames. Best SRT/RIST competitor: `%s` %.1f ff frames. Delta: %.1f.\n\n",
+			bestMeld.Arm, bestMeld.FFMean, bestCompetitor.Arm, bestCompetitor.FFMean, delta)
 		if delta < 0 {
 			if seed, ok := worstSeedForArm(r.seeds, bestMeld.Arm); ok {
-				fmt.Fprintf(&b, "Bad macro cell: Meld trails ARQ. Start with worst `%s` seed: [%s](%s).\n\n",
+				fmt.Fprintf(&b, "Bad macro cell: Meld trails the best competitor. Start with worst `%s` seed: [%s](%s).\n\n",
 					bestMeld.Arm, seed.TraceFile, seed.TraceFile)
 			}
 		}

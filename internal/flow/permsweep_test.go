@@ -1,7 +1,6 @@
 package flow
 
-// Config-permutation performance sweep (pre-registered: scratchpad
-// PREREG-permsweep.md): paired, paced (1 MiB/s), timing-jittered (2 ms) simLink
+// Config-permutation performance sweep: paired, paced (1 MiB/s), timing-jittered (2 ms) simLink
 // cells across budget × loss × RTT, comparing knob permutations against the
 // default sliding profile. Reports per-cell delivery, overhead, p99 and the
 // PAIRED per-seed delivery delta vs default; the A/A arm (default under disjoint
@@ -30,21 +29,21 @@ type sweepArm struct {
 }
 
 func sweepDefaultCfg(budget int64) Config {
-	return Config{Flow: 1, SymbolSize: 256, Sliding: true, CodingWindow: 64,
+	return Config{
+		Flow: 1, SymbolSize: 256, Sliding: true, CodingWindow: 64,
 		Redundancy: 0.15, TargetFailure: 1e-3, BufferMicros: budget,
 		OutageAware: true, AutoReorderHoldoff: true, RepairWithinBudget: true,
-		ProtectedRepairPhasing: true}
+		ProtectedRepairPhasing: true,
+	}
 }
 
-// sweepArms is the arm set under comparison; edited between sweep passes (results
-// of each pass are archived by the runner).
+// sweepArms is the arm set under comparison.
 func sweepArms() []sweepArm {
 	return []sweepArm{
 		{"default", func(c *Config) {}},
 		{"AA", func(c *Config) {}}, // same config, disjoint timing seed: the noise floor
-		// Arc-8 step-1 reproduction pass (PREREG Amendment 8): the arc-3
-		// RE-REFUTED holdoff wiring, re-scored on the ARBITERED metric before the
-		// isolation work — nothing else in the arm set for a clean reproduction.
+		// Fixed holdoff is retained as the comparison against automatic/default
+		// reorder handling.
 		{"hold8", func(c *Config) { c.ReorderHoldoffMicros = 8_000 }},
 	}
 }
@@ -106,9 +105,11 @@ func TestPermutationSweep(t *testing.T) {
 					if arm.name == "AA" {
 						tseed = seed*577 + 41 // disjoint timing draw, same channel
 					}
-					sl := simLink{cfg: cfg, owdMicros: cell.owd, srcMicros: src,
+					sl := simLink{
+						cfg: cfg, owdMicros: cell.owd, srcMicros: src,
 						n: n, sliding: cfg.Sliding, drop: sweepDrop(cell, seed),
-						paceBytesPerSec: pace, timingJitterMicros: tjit, timingSeed: tseed}
+						paceBytesPerSec: pace, timingJitterMicros: tjit, timingSeed: tseed,
+					}
 					var res simResult
 					if cfg.Sliding {
 						res = sl.runCores(NewSlidingSender(cfg), NewSlidingReceiver(cfg))

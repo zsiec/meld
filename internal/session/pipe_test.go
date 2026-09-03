@@ -90,9 +90,9 @@ func TestSeamOverPipe(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newReceiver: %v", err)
 	}
-	defer rx.Close()
+	defer func() { _ = rx.Close() }()
 	tx, _ := newSender(txEnd, cfg, clock.NewRealClock(), nil)
-	defer tx.Close()
+	defer func() { _ = tx.Close() }()
 
 	// The coder's unit is a fixed-size symbol, so each chunk is exactly SymbolSize bytes
 	// with a per-chunk pattern; delivery must be byte-exact and in order.
@@ -110,7 +110,9 @@ func TestSeamOverPipe(t *testing.T) {
 	}
 	tx.Flush()
 
-	rx.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if err := rx.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
 	buf := make([]byte, cfg.SymbolSize)
 	for i := 0; i < n; i++ {
 		m, err := rx.Read(buf)
@@ -134,12 +136,12 @@ func TestSeamOverPipeLargeSymbolNotTruncated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newReceiver: %v", err)
 	}
-	defer rx.Close()
+	defer func() { _ = rx.Close() }()
 	tx, err := newSender(txEnd, cfg, clock.NewRealClock(), nil)
 	if err != nil {
 		t.Fatalf("newSender: %v", err)
 	}
-	defer tx.Close()
+	defer func() { _ = tx.Close() }()
 
 	want := make([]byte, cfg.SymbolSize)
 	for i := range want {
@@ -150,7 +152,9 @@ func TestSeamOverPipeLargeSymbolNotTruncated(t *testing.T) {
 	}
 	tx.Flush()
 
-	rx.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if err := rx.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
 	got := make([]byte, cfg.SymbolSize)
 	n, err := rx.Read(got)
 	if err != nil {
@@ -168,7 +172,7 @@ func TestCleartextOversizedWriteRejected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newSender: %v", err)
 	}
-	defer tx.Close()
+	defer func() { _ = tx.Close() }()
 
 	tooLarge := make([]byte, cfg.SymbolSize+1)
 	for name, write := range map[string]func([]byte) (int, error){
@@ -207,7 +211,7 @@ func TestShortWriteSubstrateFailsWrite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newSender: %v", err)
 	}
-	defer tx.Close()
+	defer func() { _ = tx.Close() }()
 
 	payload := make([]byte, cfg.SymbolSize)
 	n, err := tx.Write(payload)

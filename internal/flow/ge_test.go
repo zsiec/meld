@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-// N2 burst-aware sizer oracles.
+// Burst-aware sizer oracles.
 
 // geTailFloat is the exact float reference for geTailGreater: the same forward HMM
 // erasure-count recursion in float64. The fixed-point DP must agree with it.
@@ -78,7 +78,7 @@ func geErasures(rng *rand.Rand, n int, pGB, pBG, piB float64) int {
 	return e
 }
 
-// TestGESizerHoldsWhereBinomialFails is the money test: on a bursty channel at the
+// TestGESizerHoldsWhereBinomialFails verifies that on a bursty channel at the
 // SAME mean loss, the i.i.d. binomial sizer silently misses its target decode-failure
 // probability by a wide margin, while the burst-aware GE sizer holds it.
 func TestGESizerHoldsWhereBinomialFails(t *testing.T) {

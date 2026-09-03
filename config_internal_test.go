@@ -37,12 +37,11 @@ func TestDefaultConfigUsesSlidingMainProfile(t *testing.T) {
 	}
 }
 
-func TestConfigCheckWarnsSlidingCongestionControl(t *testing.T) {
+func TestConfigCheckAcceptsSlidingCongestionControl(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Sliding = true
 	cfg.CongestionControl = true
-	warns := cfg.Check()
-	if len(warns) == 0 {
-		t.Fatal("Sliding+CongestionControl should warn that CC is generation-mode only")
+	if warns := cfg.Check(); len(warns) != 0 {
+		t.Fatalf("supported Sliding+CongestionControl returned warnings: %v", warns)
 	}
 }

@@ -27,6 +27,11 @@ type lossRunObserver struct {
 	clSinceFB uint32
 	// meanBurstQ8 is the smoothed mean loss-run length, Q8 (256 == i.i.d.; → Burstiness).
 	meanBurstQ8 uint32
+	// outageRunSinceFB is the largest run in the current report interval that
+	// exceeded the measured recovery horizon. Outage composure excludes that dead
+	// interior from rate sizing, but the automatic repair-time selector still needs
+	// to know that recurrent fades exist.
+	outageRunSinceFB uint16
 }
 
 // observeSlack folds one directly-received symbol's remaining life at arrival
@@ -37,7 +42,7 @@ type lossRunObserver struct {
 // classifying (and censoring) recoverable bursts mid-storm. The max-hold keeps the
 // threshold anchored to the path's true slack; the slow decay still tracks a genuine
 // budget/route change downward.
-func (o *lossRunObserver) observeSlack(now clock.Timestamp, dl clock.Timestamp) {
+func (o *lossRunObserver) observeSlack(now, dl clock.Timestamp) {
 	s := dl.Sub(now)
 	if s < 0 {
 		s = 0
@@ -53,13 +58,9 @@ func (o *lossRunObserver) observeSlack(now clock.Timestamp, dl clock.Timestamp) 
 // counters (WireLost, clSinceFB — NEVER censored), the two-regime classification
 // (a run beyond the recovery horizon is an OUTAGE — telemetry always; censored from
 // the sizing estimators when aware, because no redundancy setting could have
-// recovered its interior), and the burst-length EWMA for the GE sizer. An outage run
-// is censored WHOLE: a tail-keep variant (leave the ≤horizon recoverable edge in the
-// estimators) was built and REJECTED by the paired sweep — it measured worse on BOTH
-// delivery and overhead, because the kept tail slams the max-hold loss estimate for
-// several windows while the edge recovery is actually driven by the lag-free
-// per-window deficit estimates, not the global rate. Recoverable bursts
-// (sub-threshold runs) still feed the burst EWMA, preserving the edge-margin signal.
+// recovered its interior), and the burst-length EWMA for the GE sizer. Outage runs
+// are censored as a whole; their recoverable edges are handled by lag-free
+// per-window deficit estimates. Sub-threshold runs still feed the burst EWMA.
 func (o *lossRunObserver) observeRun(run uint32, intervalUs int64, aware bool, stats *ReceiverStats) {
 	o.countRun(run, stats)
 	o.observeRunEstimates(run, intervalUs, aware, stats)
@@ -89,6 +90,11 @@ func (o *lossRunObserver) observeRunEstimates(run uint32, intervalUs int64, awar
 		outage = true
 		stats.Outages++
 		stats.OutageSymbols += uint64(run)
+		if run >= 0xFFFF {
+			o.outageRunSinceFB = 0xFFFF
+		} else if uint16(run) > o.outageRunSinceFB {
+			o.outageRunSinceFB = uint16(run)
+		}
 		if aware {
 			o.lossExcl += int(run) // pause channel time across the outage in the loss window
 		}
@@ -280,7 +286,7 @@ type deadlineFit struct {
 // updateRef refines the fit from one stamped (id, deadline). Stamps at or below the
 // ref are ignored (stale), as is a HIGHER id with an EARLIER deadline: writes are
 // monotone, so that is not a fit sample — it is a retrospective repair stamped with
-// its (historic) window-end deadline, arriving while the frontier is dark. Anchoring
+// its inferred window-end deadline, arriving while the frontier is dark. Anchoring
 // on it would drag every extrapolated deadline into the past and mass-evict a
 // recoverable window (the premature-drop oracle catches exactly this).
 func (f *deadlineFit) updateRef(id uint32, dl clock.Timestamp) {

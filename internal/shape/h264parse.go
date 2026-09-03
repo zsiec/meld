@@ -4,8 +4,8 @@ package shape
 // slice header (Exp-Golomb over the RBSP) to recover slice_type and the picture order
 // count, so a B-frame's two bracketing anchors can be identified by display order (POC).
 // No pixel/residual decode. Spec: ITU-T H.264 §7.3.2.1.1 (SPS), §7.3.3 (slice header),
-// §8.2.1 (POC, pic_order_cnt_type 0). switchframe (the sibling lab) parses NALs but
-// decodes via openh264, so there is no Go reference for this — it is written to spec.
+// §8.2.1 (POC, pic_order_cnt_type 0). This is the minimal in-tree subset needed by
+// the AVC dependency shaper.
 
 // bitReader reads bits MSB-first over an RBSP, returning 0 past the end (so a truncated
 // header degrades to zeros rather than panicking — the no-panic rule).
@@ -120,12 +120,13 @@ func parseSPS(nal []byte) (spsInfo, bool) {
 		return spsInfo{}, false
 	}
 	s.pocType = int(r.ue())
-	if s.pocType == 0 {
+	switch s.pocType {
+	case 0:
 		s.log2MaxPocLsb = int(r.ue()) + 4
 		if s.log2MaxPocLsb < 4 || s.log2MaxPocLsb > 16 {
 			return spsInfo{}, false
 		}
-	} else if s.pocType == 1 {
+	case 1:
 		r.bit() // delta_pic_order_always_zero_flag
 		r.se()  // offset_for_non_ref_pic
 		r.se()  // offset_for_top_to_bottom_field

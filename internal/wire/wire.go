@@ -5,18 +5,12 @@
 // either side of this seam. New behavior is a new field here, never a special
 // case inside the core.
 //
-// # Versioning (the forcing function)
+// # Versioning
 //
 // The leading byte packs a 4-bit format VERSION in its high nibble and the
 // message-type tag in its low nibble: byte0 = (Version<<4) | type. A decoder that
-// sees a version it does not understand returns ErrVersion rather than misparsing —
-// so an additive field landing in a later revision never decodes as silent garbage
-// in an older peer. The extension policy (docs/wireformat.md): a BASE-LAYOUT change
-// bumps the version nibble; an ADDITIVE optional field appends to the tail under the
-// same version, gated by a Symbol Flags bit (symbols) or a length check (feedback),
-// so an older decoder reads the base it knows and ignores the rest. This is why N0
-// lands before N1/N2/N4 each add a field — they fill reserved/tail space by policy
-// instead of colliding.
+// sees any other version returns ErrVersion. Version 1 is the authoritative
+// research format; the codec intentionally carries no alternate-layout decoder.
 //
 // The codec never panics on malformed input (Meld's no-panic-in-library rule):
 // short, mis-versioned, or corrupt buffers return an error. All multi-byte fields
@@ -44,8 +38,8 @@ var (
 )
 
 // Version is the current wire-format version, carried in the high nibble of every
-// datagram's leading byte. Bump it ONLY for an incompatible base-layout change;
-// additive fields use the tail-extension policy (see the package doc) and do not.
+// datagram's leading byte. This repository defines version 1 directly; research
+// changes rewrite that format in place.
 const Version = 1
 
 // Message-type tags (the low nibble of the leading byte).
@@ -53,7 +47,7 @@ const (
 	typeSystematic      = 0x01
 	typeRepair          = 0x02
 	typeFeedback        = 0x03
-	typeClockProbe      = 0x04 // receiver → sender clock-offset probe (N4)
+	typeClockProbe      = 0x04 // receiver → sender clock-offset probe
 	typeClockEcho       = 0x05 // sender → receiver echo of the probe
 	typeHandshakeInit   = 0x06 // initiator → responder handshake message 1 (docs/encryption.md)
 	typeHandshakeResp   = 0x07 // responder → initiator handshake message 2
@@ -61,6 +55,7 @@ const (
 	typeMTUProbe        = 0x09 // sender → receiver padded DPLPMTUD probe (RFC 8899)
 	typeMTUProbeAck     = 0x0A // receiver → sender probe acknowledgement
 	typeSparseRepair    = 0x0B // repair over an explicit sparse source-id set
+	typeUnitRepair      = 0x0C // exact source retransmission, paced/accounted as repair
 	typeMask            = 0x0F
 )
 
@@ -78,34 +73,39 @@ func splitLead(b0 uint8) (typeTag uint8, err error) {
 	switch t {
 	case typeSystematic, typeRepair, typeFeedback, typeClockProbe, typeClockEcho,
 		typeHandshakeInit, typeHandshakeResp, typeHandshakeCookie,
-		typeMTUProbe, typeMTUProbeAck, typeSparseRepair:
+		typeMTUProbe, typeMTUProbeAck, typeSparseRepair, typeUnitRepair:
 		return t, nil
 	default:
 		return 0, ErrType
 	}
 }
 
-// symbolHeader is the BASE header length preceding a Symbol payload (v1, including the
-// 1-byte host-stamped PathID). Two optional, Flags-gated extensions follow the base in a
-// fixed order: an 8-byte send timestamp (flagSendTS) then a 9-byte frame descriptor
-// (flagDesc). The Flags bits live in the header's Flags byte (h[29]).
+// symbolHeader is the header length preceding a Symbol payload (v1, including the
+// 1-byte host-stamped PathID). Three optional, Flags-gated extensions follow the base in a
+// fixed order: an 8-byte send timestamp (flagSendTS), a variable frame descriptor
+// (flagDesc), then a 4-byte source length (flagSourceLen). The Flags bits live in
+// the header's Flags byte (h[29]).
 const (
 	symbolHeader = 30
 	sendTSLen    = 8 // flagSendTS extension: SendTimestamp (int64)
+	sourceLenLen = 4 // flagSourceLen extension: source length or compact-repair prefix width
 	// flagDesc extension (variable): FrameStart(4) + FrameLen(2) + descFlags(1) + nRefs(1)
 	// + nRefs×RefStart(4). descHeadLen is the fixed head; descMaxRefs caps the count so a
 	// forged nRefs cannot over-read (a B-frame needs 2 references; AV1's buffer holds 7).
-	descHeadLen  = 8
-	descMaxRefs  = 15
-	sparseMaxIDs = 64
-	flagSendTS   = 0x01
-	flagDesc     = 0x02
+	descHeadLen   = 8
+	descMaxRefs   = 15
+	sparseMaxIDs  = 64
+	flagSendTS    = 0x01
+	flagDesc      = 0x02
+	flagSourceLen = 0x04
+	flagMask      = flagSendTS | flagDesc | flagSourceLen
 	// descFlags bits inside the frame-descriptor extension's flags byte.
 	descRAP             = 0x01
 	descDiscardable     = 0x02
 	descNonPicture      = 0x04
 	descRecoveryRefresh = 0x08
 	descLTR             = 0x10
+	descFlagMask        = descRAP | descDiscardable | descNonPicture | descRecoveryRefresh | descLTR
 )
 
 // MaxFeedbackGens is the number of consecutive generations (from the delivery
@@ -113,22 +113,21 @@ const (
 // every deficient generation in parallel rather than only the blocking one.
 const MaxFeedbackGens = 32
 
-// feedbackLen is the v1 BASE feedback length (through Deficits). feedbackLenExt adds the
-// CongestionLoss (N1) and Burstiness (N2) tail fields; after it comes the variable per-path
-// multipath section (N5): one nPaths byte, then nPaths PathLoss values, then nPaths+1
-// SlotDist values. A media-damage tail follows that per-path section. Per the extension
-// policy (package doc), the encoder always writes the fullest form and the decoder reads
-// each tail group only when present — so a peer that knows only an earlier prefix ignores
-// the rest, no version bump.
+// feedbackLen is the fixed prefix through Deficits. feedbackLenExt includes
+// CongestionLoss and Burstiness; the variable path section and fixed policy tail
+// follow it. DecodeFeedback requires the complete current layout.
 const (
 	feedbackLen           = 21 + MaxFeedbackGens
 	feedbackLenExt        = feedbackLen + 4
 	feedbackMediaStatsLen = 16
 	feedbackLTRLen        = 6 // NewestDecodableLTR (4) + BrokenAnchors (2), after the media stats
+	feedbackOutageRunLen  = 2 // largest receiver-classified outage run since the prior report
+	feedbackFixedTailLen  = feedbackMediaStatsLen + feedbackLTRLen + 1 + 8 + 2 + feedbackOutageRunLen
 	feedbackMaxPaths      = 8 // bound on the per-path section (a forged nPaths cannot allocate unboundedly)
 )
 
-// Kind distinguishes a verbatim source symbol from a coded repair symbol.
+// Kind distinguishes exact source values, algebraic repair equations, and
+// repair-class exact retransmissions.
 type Kind uint8
 
 // Symbol kinds.
@@ -141,6 +140,10 @@ const (
 	// ids. It is used for protected/reference-layer repair without coding unrelated
 	// disposable columns in the same contiguous span.
 	SparseRepair
+	// UnitRepair carries one exact-length source retransmission. It enters the
+	// decoder as a systematic value but remains repair-class traffic for source-
+	// first pacing and accounting.
+	UnitRepair
 )
 
 // Symbol is the normalized coded symbol crossing the waist. For a Systematic
@@ -148,7 +151,7 @@ const (
 // symbol, WindowBase+N delimit the window the combination spans and RepairKey
 // regenerates the GF(2^8) coefficients (internal/code.GenCoeffs). For a
 // SparseRepair symbol, SparseIDs lists the source columns explicitly and N is
-// len(SparseIDs).
+// len(SparseIDs). For UnitRepair, SrcIndex names the exact retransmitted source.
 //
 // Priority and Deadline are the (currently minimal) slice of the generic media
 // descriptor the core acts on for unequal protection and deadline eviction; the
@@ -167,14 +170,20 @@ type Symbol struct {
 	Priority   uint8    // descriptor: protection tier (0 = most disposable)
 	Deadline   int64    // descriptor: decode-by, in clock microseconds
 	// SendTimestamp, when non-zero, is the sender's clock time (microseconds) at
-	// emission, carried in an 8-byte header extension flagged by flagSendTS (N4
-	// refinement): with the receiver's receive time it gives a per-symbol one-way
+	// emission, carried in an 8-byte header extension flagged by flagSendTS. With the
+	// receiver's receive time it gives a per-symbol one-way
 	// delay whose VARIATION is offset-invariant, refining the clock-offset estimate
 	// and exposing per-symbol latency. Zero ⇒ not carried (the base 30-byte header).
 	SendTimestamp int64
+	// HasSourceLength gates SourceLength. For Systematic and UnitRepair it is the
+	// exact unpadded coded-source length after any host encryption transform. For
+	// Repair and SparseRepair it is the transmitted application-prefix width; the
+	// receiver restores omitted zero padding before GF arithmetic.
+	HasSourceLength bool
+	SourceLength    uint32
 
 	// HasFrameDesc gates the frame-descriptor extension (flagDesc): the access-unit
-	// dependency the receiver uses to compute loss propagation parse-free (WP6). The
+	// dependency the receiver uses to compute loss propagation without codec parsing. The
 	// sender stamps it on SYSTEMATIC symbols only — coding rebuilds payloads, not
 	// headers, so a recovered symbol carries no descriptor, and the receiver infers the
 	// frames it did not directly receive. FrameStart is the access unit's FIRST source id
@@ -216,6 +225,8 @@ func EncodeSymbol(dst []byte, s Symbol) []byte {
 			n = int(^uint16(0))
 		}
 		s.N = uint16(n)
+	case UnitRepair:
+		typeTag = typeUnitRepair
 	}
 	var h [symbolHeader]byte
 	h[0] = lead(typeTag)
@@ -235,6 +246,9 @@ func EncodeSymbol(dst []byte, s Symbol) []byte {
 	}
 	if s.HasFrameDesc {
 		h[29] |= flagDesc
+	}
+	if s.HasSourceLength {
+		h[29] |= flagSourceLen
 	}
 	dst = append(dst, h[:]...)
 	if s.SendTimestamp != 0 {
@@ -262,8 +276,8 @@ func EncodeSymbol(dst []byte, s Symbol) []byte {
 			head[6] |= descLTR
 		}
 		n := len(s.FrameRefs)
-		if n > 255 {
-			n = 255
+		if n > descMaxRefs {
+			n = descMaxRefs
 		}
 		head[7] = byte(n)
 		dst = append(dst, head[:]...)
@@ -272,6 +286,11 @@ func EncodeSymbol(dst []byte, s Symbol) []byte {
 			binary.BigEndian.PutUint32(r[:], s.FrameRefs[i])
 			dst = append(dst, r[:]...)
 		}
+	}
+	if s.HasSourceLength {
+		var n [sourceLenLen]byte
+		binary.BigEndian.PutUint32(n[:], s.SourceLength)
+		dst = append(dst, n[:]...)
 	}
 	if s.Kind == SparseRepair {
 		n := int(s.N)
@@ -306,6 +325,8 @@ func DecodeSymbol(b []byte) (Symbol, error) {
 		s.Kind = Repair
 	case typeSparseRepair:
 		s.Kind = SparseRepair
+	case typeUnitRepair:
+		s.Kind = UnitRepair
 	default:
 		return Symbol{}, ErrType
 	}
@@ -318,6 +339,9 @@ func DecodeSymbol(b []byte) (Symbol, error) {
 	s.RepairKey = binary.BigEndian.Uint16(b[18:])
 	s.Priority = b[20]
 	s.Deadline = int64(binary.BigEndian.Uint64(b[21:]))
+	if b[29]&^flagMask != 0 {
+		return Symbol{}, ErrInvalid
+	}
 	off := symbolHeader
 	if b[29]&flagSendTS != 0 {
 		if len(b) < off+sendTSLen {
@@ -334,6 +358,9 @@ func DecodeSymbol(b []byte) (Symbol, error) {
 		s.FrameStart = binary.BigEndian.Uint32(b[off:])
 		s.FrameLen = binary.BigEndian.Uint16(b[off+4:])
 		df := b[off+6]
+		if df&^descFlagMask != 0 {
+			return Symbol{}, ErrInvalid
+		}
 		s.FrameRAP = df&descRAP != 0
 		s.FrameRecoveryRefresh = df&descRecoveryRefresh != 0
 		s.FrameDiscardable = df&descDiscardable != 0
@@ -341,6 +368,9 @@ func DecodeSymbol(b []byte) (Symbol, error) {
 		s.FrameLTR = df&descLTR != 0
 		n := int(b[off+7])
 		off += descHeadLen
+		if n > descMaxRefs {
+			return Symbol{}, ErrInvalid
+		}
 		if len(b) < off+n*4 {
 			return Symbol{}, ErrShort
 		}
@@ -351,6 +381,14 @@ func DecodeSymbol(b []byte) (Symbol, error) {
 				off += 4
 			}
 		}
+	}
+	if b[29]&flagSourceLen != 0 {
+		if len(b) < off+sourceLenLen {
+			return Symbol{}, ErrShort
+		}
+		s.HasSourceLength = true
+		s.SourceLength = binary.BigEndian.Uint32(b[off:])
+		off += sourceLenLen
 	}
 	if s.Kind == SparseRepair {
 		n := int(s.N)
@@ -380,7 +418,7 @@ type Feedback struct {
 	DecodedLowEdge uint32 // everything below this source id is recovered + delivered
 	HighestSeen    uint32 // highest source id observed (gap = work outstanding)
 	Deficit        uint16 // extra independent symbols the live window needs
-	EcnCE          uint16 // CE-marked fraction of received symbols this interval, parts per 65535 (N3 / L4S)
+	EcnCE          uint16 // CE-marked fraction of received symbols this interval, parts per 65535
 	// LossRate is the receiver's smoothed estimate of the channel erasure rate
 	// (the fraction of symbols the network dropped), measured from gaps in the
 	// dense systematic source-id sequence and reported as parts per 65535. The
@@ -388,16 +426,16 @@ type Feedback struct {
 	// internal/flow): a conservative (max-filtered) estimate so a burst is
 	// covered, not just the mean.
 	LossRate uint16
-	// Deficits[i] is the rank deficit of the i-th generation from the delivery
-	// cursor (Deficits[0] is the blocking generation, == Deficit). The sender
-	// repairs every deficient generation in parallel, not just the blocking one,
-	// so a backlog of deficient generations recovers concurrently — the coded
-	// analog of an ARQ NACK covering all gaps at once. A deficit > 255 saturates.
+	// In generation mode, Deficits[i] is the rank deficit of the i-th generation
+	// from the delivery cursor (Deficits[0] is the blocking generation, ==
+	// Deficit). In sliding mode the same fixed 32 bytes extend Missing with either
+	// four bitmap words or a compact run representation. See docs/wireformat.md.
+	// The profile-specific union keeps feedback at a fixed size.
 	Deficits [MaxFeedbackGens]uint8
 
-	// --- tail extension (N0 extension policy: appended, length-gated) ---
+	// --- channel observations ---
 
-	// CongestionLoss is the PRE-recovery wire-loss count since the last report (N1):
+	// CongestionLoss is the pre-recovery wire-loss count since the last report:
 	// source symbols the network dropped, measured before the decoder and NEVER
 	// decremented on a successful decode. This is the honest congestion signal a
 	// future delay/loss CC loop consumes (RFC 9265) — distinct from LossRate (which
@@ -405,12 +443,12 @@ type Feedback struct {
 	// pre-recovery, so coding cannot hide the signal.
 	CongestionLoss uint16
 	// Burstiness is the receiver's smoothed mean loss-run length in Q8 fixed-point
-	// (units of 1/256 symbol; 256 == an i.i.d. channel, > 256 == bursty) (N2). With
+	// (units of 1/256 symbol; 256 == an i.i.d. channel, > 256 == bursty). With
 	// LossRate it gives the sender a 2-parameter Gilbert estimate (marginal loss +
 	// mean burst) to size repair against the burst tail, not the binomial tail.
 	Burstiness uint16
 
-	// --- multipath tail extension (N5: appended, length-gated, variable per N paths) ---
+	// --- variable multipath observations ---
 
 	// PathLoss is the receiver's per-path marginal erasure rate (one entry per path, parts
 	// per 65535 like LossRate) — the per-path delivery signal that weights the scheduler's
@@ -424,7 +462,7 @@ type Feedback struct {
 	PathLoss []uint16
 	SlotDist []uint16
 
-	// --- media-damage tail extension (N6: appended, length-gated) ---
+	// --- media-damage observations ---
 
 	// Frames/DecodableFrames and Keyframes/DecodableKeyframes are cumulative receiver-side
 	// media decodability counters derived from WriteFrame descriptors. They let the sender's
@@ -436,7 +474,7 @@ type Feedback struct {
 	Keyframes          uint32
 	DecodableKeyframes uint32
 
-	// --- LTR-resync tail extension (appended, length-gated) ---
+	// --- LTR-resync state ---
 
 	// NewestDecodableLTR is FrameStart+1 of the newest frame flagged FrameLTR that the
 	// receiver has RESOLVED decodable (delivered whole with its dependency closure
@@ -451,8 +489,6 @@ type Feedback struct {
 	// wrapping uint16: the consumer differences successive reports, so wrap is harmless.
 	BrokenAnchors uint16
 
-	// --- path-failover tail extension (appended, length-gated) ---
-
 	// DeadPaths is a bitmap of paths the receiver has classified as in OUTAGE (bit i =
 	// path i): a per-path consecutive lost-slot run beyond the recovery horizon while
 	// other paths delivered. The sender fails systematic placement over to the live
@@ -461,20 +497,13 @@ type Feedback struct {
 	// (always 0 on single-path flows).
 	DeadPaths uint8
 
-	// --- missing-ids tail extension (appended, length-gated) ---
-
-	// Missing is a NACK bitmap for the stuck neighborhood: bit k set means source id
-	// DecodedLowEdge+k is not yet producible at the receiver, masked to ids the
-	// receiver has seen COVERAGE for (below its decode frontier) so an unsent or
-	// merely in-flight id never reads as missing. The sender answers set bits with
-	// UNIT repairs — base=id, n=1, a literal retransmission of the retained source —
-	// because a unit vector closes at the decoder instantly, exempt from the
-	// coupled-span closure delay every wider coded window pays (the burst-autopsy
-	// law: rank arrives at need-rate, VALUES wait on full-rank closure). 0 = nothing
-	// missing / peer predates the extension.
+	// Missing is the first word of the sliding profile's NACK bitmap for the stuck
+	// neighborhood's rank-closing basis: bit k names DecodedLowEdge+k. Deficits
+	// carries the continuation. Named ids are unresolved FREE columns below the
+	// receiver's decode frontier, so every delivered UNIT value removes one
+	// independent degree of freedom. Zero means the first word has no candidate;
+	// continuation candidates may still exist.
 	Missing uint64
-
-	// --- settled-loss tail extension (appended, length-gated) ---
 
 	// SettledLost counts source ids the receiver's SETTLED walk confirmed lost since
 	// the last report: an id counts only after lower-neighborhood arrivals plus a
@@ -484,19 +513,19 @@ type Feedback struct {
 	// CongestionLoss, instantaneous Deficit/Missing) read dirty on almost every
 	// report under real reorder even at zero true loss, permanently blocking the
 	// decay. The settled walk feeds NOTHING else: the sizing estimators keep the
-	// raw-order walks (a settled sizing walk measures truer burst lengths, and the
-	// honest GE set-point then exceeds paced wire headroom — the measured
-	// breaker/set-point limit cycle that refuted the holdoff port twice).
-	// Saturates at 65535. Meaningful only when HasSettled.
+	// raw-order walks. Saturates at 65535.
 	SettledLost uint16
-	// HasSettled reports that the peer emitted the settled-loss tail (the field is
-	// length-gated on the wire, so a zero from an old peer is indistinguishable from
-	// a clean interval without it). Decode-side only.
-	HasSettled bool
+
+	// OutageRun is the largest source-symbol loss run since the prior report that
+	// exceeded the receiver's measured recovery horizon. Unlike Burstiness, which
+	// deliberately excludes such unrecoverable interiors when outage composure is
+	// enabled, this signal preserves fade geometry for automatic repair-time
+	// diversity. It saturates at 65535; zero means no qualifying run was observed.
+	OutageRun uint16
 }
 
-// EncodeFeedback appends the encoded Feedback to dst and returns the slice. It
-// always writes the fullest form (base + CongestionLoss/Burstiness + per-path tail).
+// EncodeFeedback appends the complete version-1 Feedback to dst and returns the
+// slice.
 func EncodeFeedback(dst []byte, f Feedback) []byte {
 	var h [feedbackLenExt]byte
 	h[0] = lead(typeFeedback)
@@ -549,16 +578,17 @@ func encodeFeedbackMediaStats(dst []byte, f Feedback) []byte {
 	dst = append(dst, miss[:]...)
 	var settled [2]byte
 	binary.BigEndian.PutUint16(settled[:], f.SettledLost)
-	return append(dst, settled[:]...)
+	dst = append(dst, settled[:]...)
+	var outage [feedbackOutageRunLen]byte
+	binary.BigEndian.PutUint16(outage[:], f.OutageRun)
+	return append(dst, outage[:]...)
 }
 
-// DecodeFeedback parses a Feedback datagram. The base fields require feedbackLen
-// bytes; the CongestionLoss/Burstiness tail and the variable per-path section
-// (nPaths + PathLoss + SlotDist) are each read only when present (length- and
-// bound-gated), so a shorter encoder decodes cleanly with the absent fields zero. A
-// short, mis-versioned, or non-feedback buffer returns an error and never panics.
+// DecodeFeedback parses the complete version-1 feedback layout. A short,
+// mis-versioned, malformed, or non-feedback buffer returns an error and never
+// panics.
 func DecodeFeedback(b []byte) (Feedback, error) {
-	if len(b) < feedbackLen {
+	if len(b) < feedbackLenExt+1 {
 		return Feedback{}, ErrShort
 	}
 	typeTag, err := splitLead(b[0])
@@ -577,52 +607,51 @@ func DecodeFeedback(b []byte) (Feedback, error) {
 	f.EcnCE = binary.BigEndian.Uint16(b[17:])
 	f.LossRate = binary.BigEndian.Uint16(b[19:])
 	copy(f.Deficits[:], b[21:feedbackLen])
-	if len(b) >= feedbackLenExt {
-		f.CongestionLoss = binary.BigEndian.Uint16(b[feedbackLen:])
-		f.Burstiness = binary.BigEndian.Uint16(b[feedbackLen+2:])
+	f.CongestionLoss = binary.BigEndian.Uint16(b[feedbackLen:])
+	f.Burstiness = binary.BigEndian.Uint16(b[feedbackLen+2:])
+	off := feedbackLenExt
+	n := int(b[off])
+	off++
+	if n > feedbackMaxPaths {
+		return Feedback{}, ErrInvalid
 	}
-	// Variable per-path section (length- and bound-gated so a forged nPaths cannot allocate
-	// unboundedly or over-read): nPaths byte, then PathLoss[n], then SlotDist[n+1].
-	if off := feedbackLenExt; len(b) > off {
-		n := int(b[off])
-		off++
-		if n > 0 && n <= feedbackMaxPaths && len(b) >= off+n*2+(n+1)*2 {
-			f.PathLoss = make([]uint16, n)
-			for i := 0; i < n; i++ {
-				f.PathLoss[i] = binary.BigEndian.Uint16(b[off:])
-				off += 2
-			}
-			f.SlotDist = make([]uint16, n+1)
-			for i := 0; i <= n; i++ {
-				f.SlotDist[i] = binary.BigEndian.Uint16(b[off:])
-				off += 2
-			}
+	if n > 0 {
+		pathBytes := n*2 + (n+1)*2
+		if len(b) < off+pathBytes {
+			return Feedback{}, ErrShort
 		}
-		if len(b) >= off+feedbackMediaStatsLen {
-			f.Frames = binary.BigEndian.Uint32(b[off:])
-			f.DecodableFrames = binary.BigEndian.Uint32(b[off+4:])
-			f.Keyframes = binary.BigEndian.Uint32(b[off+8:])
-			f.DecodableKeyframes = binary.BigEndian.Uint32(b[off+12:])
-			off += feedbackMediaStatsLen
-			if len(b) >= off+feedbackLTRLen {
-				f.NewestDecodableLTR = binary.BigEndian.Uint32(b[off:])
-				f.BrokenAnchors = binary.BigEndian.Uint16(b[off+4:])
-				off += feedbackLTRLen
-				if len(b) > off {
-					f.DeadPaths = b[off]
-					off++
-					if len(b) >= off+8 {
-						f.Missing = binary.BigEndian.Uint64(b[off:])
-						off += 8
-						if len(b) >= off+2 {
-							f.SettledLost = binary.BigEndian.Uint16(b[off:])
-							f.HasSettled = true
-						}
-					}
-				}
-			}
+		f.PathLoss = make([]uint16, n)
+		for i := range f.PathLoss {
+			f.PathLoss[i] = binary.BigEndian.Uint16(b[off:])
+			off += 2
+		}
+		f.SlotDist = make([]uint16, n+1)
+		for i := range f.SlotDist {
+			f.SlotDist[i] = binary.BigEndian.Uint16(b[off:])
+			off += 2
 		}
 	}
+	if len(b) < off+feedbackFixedTailLen {
+		return Feedback{}, ErrShort
+	}
+	if len(b) != off+feedbackFixedTailLen {
+		return Feedback{}, ErrInvalid
+	}
+	f.Frames = binary.BigEndian.Uint32(b[off:])
+	f.DecodableFrames = binary.BigEndian.Uint32(b[off+4:])
+	f.Keyframes = binary.BigEndian.Uint32(b[off+8:])
+	f.DecodableKeyframes = binary.BigEndian.Uint32(b[off+12:])
+	off += feedbackMediaStatsLen
+	f.NewestDecodableLTR = binary.BigEndian.Uint32(b[off:])
+	f.BrokenAnchors = binary.BigEndian.Uint16(b[off+4:])
+	off += feedbackLTRLen
+	f.DeadPaths = b[off]
+	off++
+	f.Missing = binary.BigEndian.Uint64(b[off:])
+	off += 8
+	f.SettledLost = binary.BigEndian.Uint16(b[off:])
+	off += 2
+	f.OutageRun = binary.BigEndian.Uint16(b[off:])
 	return f, nil
 }
 
@@ -637,7 +666,19 @@ func PeekType(b []byte) (uint8, error) {
 }
 
 // IsSymbol reports whether t (from PeekType) tags a media symbol.
-func IsSymbol(t uint8) bool { return t == typeSystematic || t == typeRepair || t == typeSparseRepair }
+func IsSymbol(t uint8) bool {
+	return t == typeSystematic || t == typeRepair || t == typeSparseRepair || t == typeUnitRepair
+}
+
+// IsSystematic reports whether t (from PeekType) tags a fresh source symbol.
+// Hosts use this distinction to keep recovery traffic from queueing ahead of
+// later source data at a shared transmit pacer.
+func IsSystematic(t uint8) bool { return t == typeSystematic }
+
+// IsUnitRepair reports whether t tags an exact source retransmission. Hosts use
+// this distinction to release deadline-critical exact closure ahead of queued
+// fungible equations while preserving source priority and the aggregate budget.
+func IsUnitRepair(t uint8) bool { return t == typeUnitRepair }
 
 // IsFeedback reports whether t tags a feedback report.
 func IsFeedback(t uint8) bool { return t == typeFeedback }
@@ -649,7 +690,7 @@ func IsClockProbe(t uint8) bool { return t == typeClockProbe }
 func IsClockEcho(t uint8) bool { return t == typeClockEcho }
 
 // ClockProbe is the receiver→sender half of the 2-message clock-offset exchange
-// (N4): the receiver sends its local time T0 and the sender echoes it. All times are
+// the receiver sends its local time T0 and the sender echoes it. All times are
 // microseconds in each host's own clock; the receiver recovers the offset from the
 // round trip and translates its local time into the sender's frame, so the core's
 // deadline comparison is correct cross-host (no clock read in the core).

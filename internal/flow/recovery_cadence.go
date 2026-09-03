@@ -6,6 +6,10 @@ import "github.com/zsiec/meld/internal/wire"
 // side-effect free: a host/encoder may apply it, and if it cannot, the transport
 // loop continues unchanged.
 type EncoderControl struct {
+	// TargetBitrateBps asks the encoder to keep its source payload at or below this
+	// bitrate so the bounded recovery allowance fits inside the live total-rate
+	// budget. Zero means no active reduction request.
+	TargetBitrateBps int64
 	// RecoveryCadenceFrames asks the encoder to bound the distance between recovery
 	// points, in displayed frames. 0 means no active request. An encoder can satisfy
 	// this with keyframes, recovery-point SEI, or intra-refresh, depending on codec.

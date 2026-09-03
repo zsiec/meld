@@ -28,7 +28,7 @@ func uniformDrop(seed uint64, p float64) func(wire.Symbol) bool {
 // operational cliff. The benchmark's astronomical cpu/GB and alloc/GB in that regime are
 // per-GB-DELIVERED with ~0 delivery (a divide-by-near-zero artifact), NOT an unbounded spin.
 // This test pins that distinction: delivery collapses, but the receiver's live-decoder set
-// and the sender's retained set stay BOUNDED (the N1 admit/retire caps hold). A regression
+// and the sender's retained set stay bounded by the admission and retirement caps. A regression
 // that removed those caps — turning the cliff into a true memory runaway — fails here.
 func TestDeadlineCliffResourceBound(t *testing.T) {
 	const (

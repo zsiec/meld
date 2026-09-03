@@ -13,8 +13,8 @@ func TestUsesL4SMarkingOnlyWhenControllerConsumesECN(t *testing.T) {
 	if !usesL4SMarking(flow.Config{CongestionControl: true}) {
 		t.Fatal("generation congestion-control profile should mark ECT(1)")
 	}
-	if usesL4SMarking(flow.Config{CongestionControl: true, Sliding: true}) {
-		t.Fatal("sliding profile ignores ECN today, so it must not mark ECT(1)")
+	if !usesL4SMarking(flow.Config{CongestionControl: true, Sliding: true}) {
+		t.Fatal("sliding congestion-control profile should mark ECT(1)")
 	}
 }
 
@@ -25,7 +25,10 @@ func TestUsesECNReceiveForGenerationRegardlessOfLocalController(t *testing.T) {
 	if !usesECNReceive(flow.Config{CongestionControl: true}) {
 		t.Fatal("generation receiver with CC should enable ECN ancillary reads")
 	}
-	if usesECNReceive(flow.Config{Sliding: true, CongestionControl: true}) {
-		t.Fatal("sliding receiver does not consume ECN today")
+	if !usesECNReceive(flow.Config{Sliding: true, CongestionControl: true}) {
+		t.Fatal("sliding receiver with congestion control should enable ECN ancillary reads")
+	}
+	if usesECNReceive(flow.Config{Sliding: true}) {
+		t.Fatal("sliding receiver without congestion control should not enable unused ECN ancillary reads")
 	}
 }

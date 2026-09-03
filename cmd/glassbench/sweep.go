@@ -16,18 +16,38 @@ import (
 	"github.com/zsiec/meld/internal/shape"
 )
 
-// extend replicates a chunked stream k times with fresh, unique sequence numbers
-// so a delivery-percentage measurement has enough packets to resolve a tight
-// quality bar (99.9% over ~3000 chunks ≈ 3 packets, not the ~1 the native clip
-// allows). Only .chunks is populated — delivery% needs nothing else, and Meld's
-// media-blind WriteUnit path (uep=false) does not touch the unit metadata.
+// extend replicates a chunked stream k times with fresh sequence and unit IDs.
+// Retaining the complete descriptor graph keeps media-aware and media-blind arms
+// on the same longer source timeline while giving feedback-driven transports time
+// to leave cold start.
 func extend(c *chunked, k int) *chunked {
 	if k <= 1 {
 		return c
 	}
-	out := &chunked{chunkSize: c.chunkSize}
+	out := &chunked{chunkSize: c.chunkSize, unitChunks: map[uint32][]uint32{}, format: c.format}
+	var unitStride uint32
+	for _, unit := range c.units {
+		if unit.ID >= unitStride {
+			unitStride = unit.ID + 1
+		}
+	}
 	var seq uint32
 	for rep := 0; rep < k; rep++ {
+		unitOffset := uint32(rep) * unitStride
+		for _, shaped := range c.shaped {
+			copyShaped := shaped
+			copyShaped.Unit.ID += unitOffset
+			copyShaped.Unit.RefersTo = append([]uint32(nil), shaped.Unit.RefersTo...)
+			for i := range copyShaped.Unit.RefersTo {
+				copyShaped.Unit.RefersTo[i] += unitOffset
+			}
+			out.shaped = append(out.shaped, copyShaped)
+			out.units = append(out.units, copyShaped.Unit)
+			for _, originalSeq := range c.unitChunks[shaped.Unit.ID] {
+				out.unitChunks[copyShaped.Unit.ID] = append(out.unitChunks[copyShaped.Unit.ID],
+					uint32(rep*len(c.chunks))+originalSeq)
+			}
+		}
 		for _, pkt := range c.chunks {
 			np := make([]byte, len(pkt))
 			copy(np, pkt)
@@ -60,8 +80,23 @@ func parseFloatList(s string) []float64 {
 	return out
 }
 
-// sweepSupported reports whether the sweep can drive this arm (Meld-auto, the
-// real libsrt, and the real libRIST — the iso-quality baselines).
+// benchmarkSeed gives every benchmark mode the same deterministic seed series.
+// Keeping probe, bisection, direct, and publication runs aligned makes a seed
+// trace reproducible across tools instead of silently sampling a different
+// impairment ensemble.
+func benchmarkSeed(rep int) int64 {
+	return int64(rep)*7919 + 13
+}
+
+func benchmarkSeeds(reps int) []int64 {
+	seeds := make([]int64, 0, max(reps, 0))
+	for rep := 1; rep <= reps; rep++ {
+		seeds = append(seeds, benchmarkSeed(rep))
+	}
+	return seeds
+}
+
+// sweepSupported reports whether the sweep can drive this arm.
 func sweepSupported(arm string) bool {
 	if isMeldArm(arm) {
 		return true
@@ -151,7 +186,7 @@ func runProbe(c *chunked, loss float64, paceUs, meldMax int64, mbps float64, rtt
 			ds := make([]float64, 0, reps)
 			failed := false
 			for s := 1; s <= reps; s++ {
-				d := sweepArm(arm, cl, loss, rtt, budget, paceUs, meldMax, int64(s))
+				d := sweepArm(arm, cl, loss, rtt, budget, paceUs, meldMax, benchmarkSeed(s))
 				if math.IsNaN(d) {
 					failed = true
 					break
@@ -175,7 +210,7 @@ func runProbe(c *chunked, loss float64, paceUs, meldMax int64, mbps float64, rtt
 func measureDeliv(arm string, c *chunked, loss float64, rtt, budget int, paceUs, meldMax int64, reps int) float64 {
 	ds := make([]float64, 0, reps)
 	for s := 1; s <= reps; s++ {
-		d := sweepArm(arm, c, loss, rtt, budget, paceUs, meldMax, int64(s))
+		d := sweepArm(arm, c, loss, rtt, budget, paceUs, meldMax, benchmarkSeed(s))
 		if math.IsNaN(d) {
 			return math.NaN()
 		}
@@ -275,14 +310,20 @@ type macroFrontierOptions struct {
 	PaceUs           int64
 	MeldMax          int64
 	Mbps             float64
+	WireMbps         float64
 	ChunkSize        int
 	TotalPics        int
 	OutDir           string
 	TopN             int
 	JitterMs         int
+	JitterPlanes     []int
+	ShardCount       int
+	ShardIndex       int
 
 	SourceID            string
 	SourceClip          string
+	SourceCodec         string
+	SourceRepeats       int
 	SourceFFFrames      int
 	AVCOpts             shape.AVCOptions
 	AutoEncoderCadence  bool
@@ -291,9 +332,37 @@ type macroFrontierOptions struct {
 	AutoEncoderPSNRMin  float64
 }
 
+func macroJitterPlanes(opts macroFrontierOptions) []int {
+	if len(opts.JitterPlanes) > 0 {
+		return opts.JitterPlanes
+	}
+	return []int{opts.JitterMs}
+}
+
+func macroTotalCells(opts macroFrontierOptions) int {
+	return len(opts.Losses) * len(opts.Bursts) * len(opts.RTTs) * len(opts.Mults) * len(macroJitterPlanes(opts))
+}
+
+func macroShardCells(opts macroFrontierOptions) int {
+	count := opts.ShardCount
+	if count <= 0 {
+		count = 1
+	}
+	index := opts.ShardIndex
+	total := macroTotalCells(opts)
+	if index < 0 || index >= count || total == 0 {
+		return 0
+	}
+	if index >= total {
+		return 0
+	}
+	return 1 + (total-1-index)/count
+}
+
 type macroFrontierRow struct {
 	SourceID                     string
 	SourceClip                   string
+	SourceCodec                  string
 	Case                         string
 	Loss                         float64
 	Burst                        float64
@@ -325,6 +394,17 @@ type macroFrontierRow struct {
 	RepairMean                   float64
 	ReactiveMean                 float64
 	TxThrottledMean              float64
+	RepairExactMean              float64
+	RepairBurstDuplicateMean     float64
+	RepairOutageDiversityMean    float64
+	RepairEpochMean              float64
+	EpochBlocksMean              float64
+	EpochDemandQ8Mean            float64
+	EpochCorrelationQ8Mean       float64
+	EpochMemoryQ8Mean            float64
+	EpochShareQ8Mean             float64
+	RepairCompactedMean          float64
+	RepairBytesSavedMean         float64
 	RepairOverheadPct            float64
 	RelayForwardEnqueuedMean     float64
 	RelayForwardSentMean         float64
@@ -340,6 +420,7 @@ type macroFrontierRow struct {
 type macroGapRow struct {
 	SourceID           string
 	SourceClip         string
+	SourceCodec        string
 	Case               string
 	Loss               float64
 	Burst              float64
@@ -368,6 +449,7 @@ type macroGapRow struct {
 	ARQFFSD            float64
 	ARQRuntimeMs       float64
 	ARQRelaySentBytes  float64
+	Seeds              int
 	DeltaFF            float64
 	DeltaNoise         float64
 	DeltaPct           float64
@@ -394,6 +476,7 @@ type macroSourceCache struct {
 	avcOpts   shape.AVCOptions
 	byteCap   float64
 	minPSNR   float64
+	repeats   int
 	bySource  map[string]*macroSourceVariant
 	cleanups  []func()
 }
@@ -419,7 +502,8 @@ func newMacroSourceCache(base *chunked, opts macroFrontierOptions) *macroSourceC
 		avcOpts:   opts.AVCOpts,
 		byteCap:   opts.AutoEncoderByteCap,
 		minPSNR:   opts.AutoEncoderPSNRMin,
-		bySource:  map[string]*macroSourceVariant{"": &macroSourceVariant{chunked: base}},
+		repeats:   opts.SourceRepeats,
+		bySource:  map[string]*macroSourceVariant{"": {chunked: base}},
 	}
 }
 
@@ -472,6 +556,7 @@ func (m *macroSourceCache) sourceFor(req macroSourceRequest) (*macroSourceVarian
 		cleanup()
 		return nil, err
 	}
+	c = extend(c, m.repeats)
 	v := &macroSourceVariant{chunked: c, mode: x264CadenceIntraRefresh, interval: req.interval, psnr: psnr}
 	m.bySource[key] = v
 	m.cleanups = append(m.cleanups, cleanup)
@@ -499,7 +584,7 @@ func chunkedPayloadBytes(c *chunked) int64 {
 }
 
 func macroAutoEncoderSource(loss, burst float64, rtt int, mult float64, budget int, opts macroFrontierOptions) macroSourceRequest {
-	if !opts.AutoEncoderCadence {
+	if !opts.AutoEncoderCadence || opts.SourceCodec != formatAVC.name() {
 		return macroSourceRequest{}
 	}
 	burstMs := burstDurationMs(burst, opts.ChunkSize, opts.Mbps)
@@ -524,6 +609,26 @@ func runMacroFrontier(c *chunked, opts macroFrontierOptions) error {
 		return fmt.Errorf("empty macro frontier grid: losses=%d bursts=%d rtts=%d mults=%d arms=%d",
 			len(opts.Losses), len(opts.Bursts), len(opts.RTTs), len(opts.Mults), len(opts.Arms))
 	}
+	if opts.ShardCount <= 0 {
+		opts.ShardCount = 1
+	}
+	if opts.ShardIndex < 0 || opts.ShardIndex >= opts.ShardCount {
+		return fmt.Errorf("invalid frontier shard %d of %d", opts.ShardIndex, opts.ShardCount)
+	}
+	jitters := macroJitterPlanes(opts)
+	for _, jitter := range jitters {
+		if jitter < 0 {
+			return fmt.Errorf("negative jitter plane %d", jitter)
+		}
+	}
+	if opts.SourceRepeats < 1 {
+		opts.SourceRepeats = 1
+	}
+	if opts.SourceRepeats > 1 {
+		c = extend(c, opts.SourceRepeats)
+		opts.TotalPics *= opts.SourceRepeats
+		opts.SourceFFFrames *= opts.SourceRepeats
+	}
 	rows := make([]macroFrontierRow, 0)
 	failures := make([]failureReportRow, 0)
 	var failureSink *[]failureReportRow
@@ -534,39 +639,55 @@ func runMacroFrontier(c *chunked, opts macroFrontierOptions) error {
 	defer sources.close()
 	oldBurst := geBurstPkts
 	defer func() { geBurstPkts = oldBurst }()
-	for _, loss := range opts.Losses {
-		for _, burst := range opts.Bursts {
-			geBurstPkts = burst
-			for _, rtt := range opts.RTTs {
-				for _, mult := range opts.Mults {
-					budget := int(mult*float64(rtt) + 0.5)
-					if budget < opts.FloorMs {
-						budget = opts.FloorMs
-					}
-					caseName := macroCaseName(loss, burst, rtt, mult, budget, opts.JitterMs)
-					for _, arm := range opts.Arms {
-						arm = strings.TrimSpace(arm)
-						if arm == "" || !sweepSupported(arm) {
+	oldJitter := jitterDur
+	defer func() { jitterDur = oldJitter }()
+	cellOrdinal := 0
+	for _, jitter := range jitters {
+		jitterDur = time.Duration(jitter) * time.Millisecond
+		cellOpts := opts
+		cellOpts.JitterMs = jitter
+		for _, loss := range opts.Losses {
+			for _, burst := range opts.Bursts {
+				geBurstPkts = burst
+				for _, rtt := range opts.RTTs {
+					for _, mult := range opts.Mults {
+						selected := cellOrdinal%opts.ShardCount == opts.ShardIndex
+						cellOrdinal++
+						if !selected {
 							continue
 						}
-						req := macroSourceRequest{}
-						if arm == "meld-auto" {
-							req = macroAutoEncoderSource(loss, burst, rtt, mult, budget, opts)
+						budget := int(mult*float64(rtt) + 0.5)
+						if budget < opts.FloorMs {
+							budget = opts.FloorMs
 						}
-						source, err := sources.sourceFor(req)
-						if err != nil {
-							return fmt.Errorf("%s %s source %s: %w", caseName, arm, macroSourceRequestKey(req), err)
-						}
-						row := runMacroFrontierCell(source.chunked, caseName, loss, burst, rtt, mult, budget, arm, source.mode, source.interval, opts, failureSink)
-						row.SourcePSNR = source.psnr
-						row.SourceFallback = source.fallback
-						rows = append(rows, row)
-						if row.Failed > 0 || row.Seeds == 0 {
-							fmt.Printf("%-36s %-18s FAILED (%d/%d)\n", caseName, arm, row.Failed, opts.Reps)
-						} else {
-							label := macroArmSourceLabel(arm, row.SourceMode, row.SourceInterval)
-							fmt.Printf("%-36s %-18s ff=%6.1f sd=%4.1f frame=%5.1f key=%5.1f\n",
-								caseName, label, row.FFMean, row.FFStddev, row.FramePctMean*100, row.KeyPctMean*100)
+						caseName := macroCaseName(loss, burst, rtt, mult, budget, jitter)
+						for _, arm := range opts.Arms {
+							arm = strings.TrimSpace(arm)
+							if arm == "" || !sweepSupported(arm) {
+								continue
+							}
+							req := macroSourceRequest{}
+							if arm == "meld-auto" {
+								req = macroAutoEncoderSource(loss, burst, rtt, mult, budget, opts)
+							}
+							source, err := sources.sourceFor(req)
+							if err != nil {
+								return fmt.Errorf("%s %s source %s: %w", caseName, arm, macroSourceRequestKey(req), err)
+							}
+							row, err := runMacroFrontierCell(source.chunked, caseName, loss, burst, rtt, mult, budget, arm, source.mode, source.interval, cellOpts, failureSink)
+							if err != nil {
+								return fmt.Errorf("%s %s: %w", caseName, arm, err)
+							}
+							row.SourcePSNR = source.psnr
+							row.SourceFallback = source.fallback
+							rows = append(rows, row)
+							if row.Failed > 0 || row.Seeds == 0 {
+								fmt.Printf("%-36s %-18s FAILED (%d/%d)\n", caseName, arm, row.Failed, opts.Reps)
+							} else {
+								label := macroArmSourceLabel(arm, row.SourceMode, row.SourceInterval)
+								fmt.Printf("%-36s %-18s ff=%6.1f sd=%4.1f frame=%5.1f key=%5.1f\n",
+									caseName, label, row.FFMean, row.FFStddev, row.FramePctMean*100, row.KeyPctMean*100)
+							}
 						}
 					}
 				}
@@ -580,6 +701,9 @@ func runMacroFrontier(c *chunked, opts macroFrontierOptions) error {
 			return err
 		}
 		if err := writeRunEnvironment(filepath.Join(opts.OutDir, "environment.json"), opts); err != nil {
+			return err
+		}
+		if err := writeJSONFile(filepath.Join(opts.OutDir, "frontier_rows.json"), rows); err != nil {
 			return err
 		}
 		if err := writeMacroFrontierRows(filepath.Join(opts.OutDir, "frontier_rows.csv"), rows); err != nil {
@@ -603,14 +727,38 @@ func runMacroFrontier(c *chunked, opts macroFrontierOptions) error {
 		if err := writeMacroCharts(opts.OutDir, rows, gaps, opts); err != nil {
 			return err
 		}
+		if err := writeJSONFile(filepath.Join(opts.OutDir, "COMPLETE.json"), struct {
+			Rows       int `json:"rows"`
+			Cells      int `json:"cells"`
+			ShardIndex int `json:"shard_index"`
+			ShardCount int `json:"shard_count"`
+		}{len(rows), macroShardCells(opts), opts.ShardIndex, opts.ShardCount}); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
-func runMacroFrontierCell(c *chunked, caseName string, loss, burst float64, rtt int, mult float64, budget int, arm, sourceMode string, sourceInterval int, opts macroFrontierOptions, failures *[]failureReportRow) macroFrontierRow {
+func writeJSONFile(path string, value any) (err error) {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if closeErr := f.Close(); err == nil {
+			err = closeErr
+		}
+	}()
+	enc := json.NewEncoder(f)
+	enc.SetIndent("", "  ")
+	return enc.Encode(value)
+}
+
+func runMacroFrontierCell(c *chunked, caseName string, loss, burst float64, rtt int, mult float64, budget int, arm, sourceMode string, sourceInterval int, opts macroFrontierOptions, failures *[]failureReportRow) (macroFrontierRow, error) {
 	row := macroFrontierRow{
 		SourceID:       opts.SourceID,
 		SourceClip:     opts.SourceClip,
+		SourceCodec:    c.format.name(),
 		Case:           caseName,
 		Loss:           loss,
 		Burst:          burst,
@@ -634,22 +782,32 @@ func runMacroFrontierCell(c *chunked, caseName string, loss, burst float64, rtt 
 	var processUserSum, processSystemSum float64
 	var processRSSSum int64
 	var txSourceSum, repairSum, reactiveSum, txThrottledSum uint64
+	var repairExactSum, repairBurstDuplicateSum, repairOutageDiversitySum, repairEpochSum uint64
+	var epochBlocksSum, epochDemandQ8Sum, epochCorrelationQ8Sum uint64
+	var epochMemoryQ8Sum, epochFixedMixQ8Sum uint64
+	var repairCompactedSum, repairBytesSavedSum uint64
 	var relayFwdEnqSum, relayFwdSentSum, relayFwdDropSum int64
 	var relayFwdSentBytesSum, relayFwdDropBytesSum int64
 	var relayRevSentSum, relayRevSentBytesSum int64
+	var worstTrace *macroTraceCandidate
 	for rep := 1; rep <= opts.Reps; rep++ {
-		seed := int64(rep)*7919 + 13
+		seed := benchmarkSeed(rep)
 		var trace *seedTrace
 		if failures != nil {
 			trace = &seedTrace{Case: reportCase{Name: caseName}, Arm: arm, Rep: rep, Seed: seed}
 		}
 		res := macroRunArmTrace(arm, c, loss, rtt, budget, opts.PaceUs, opts.MeldMax, seed, trace)
+		for attempt := 2; res.seqs == nil && macroExternalArm(arm) && attempt <= 3; attempt++ {
+			fmt.Fprintf(os.Stderr, "%s %s rep %d: external process failed, retrying (%d/3)\n", caseName, arm, rep, attempt)
+			time.Sleep(time.Duration(attempt-1) * 100 * time.Millisecond)
+			res = macroRunArmTrace(arm, c, loss, rtt, budget, opts.PaceUs, opts.MeldMax, seed, trace)
+		}
 		if res.seqs == nil {
 			row.Failed++
 			continue
 		}
-		sc, h264, _ := grade(c, res.seqs)
-		ff, err := ffprobeFrames(h264)
+		sc, stream, _ := grade(c, res.seqs)
+		ff, err := c.ffprobeFrames(stream)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "%s %s rep %d ffprobe: %v\n", caseName, arm, rep, err)
 			row.Failed++
@@ -678,6 +836,17 @@ func runMacroFrontierCell(c *chunked, caseName string, loss, burst float64, rtt 
 			repairSum += res.meld.txStats.Repair
 			reactiveSum += res.meld.txStats.ReactiveRepair
 			txThrottledSum += res.meld.txStats.Throttled
+			repairExactSum += res.meld.txStats.RepairExact
+			repairBurstDuplicateSum += res.meld.txStats.RepairBurstDuplicate
+			repairOutageDiversitySum += res.meld.txStats.RepairOutageDiversity
+			repairEpochSum += res.meld.txStats.RepairEpoch
+			epochBlocksSum += res.meld.txStats.EpochBlocks
+			epochDemandQ8Sum += uint64(res.meld.txStats.EpochDemandQ8)
+			epochCorrelationQ8Sum += uint64(res.meld.txStats.EpochCorrelationQ8)
+			epochMemoryQ8Sum += uint64(res.meld.txStats.EpochMemoryQ8)
+			epochFixedMixQ8Sum += uint64(res.meld.txStats.EpochShareQ8)
+			repairCompactedSum += res.meld.txStats.RepairCompacted
+			repairBytesSavedSum += res.meld.txStats.RepairBytesSaved
 		}
 		if failures != nil {
 			ms := missingSummaryFor(c, res.seqs)
@@ -686,7 +855,10 @@ func runMacroFrontierCell(c *chunked, caseName string, loss, burst float64, rtt 
 			}
 			trace.Source = sourceTimeline(c, res.seqs)
 			trace.Missing = ms
+			trace.MissingRuns = missingRuns(c, res.seqs)
 			trace.Failure = failureAttributionFor(c, res.seqs, trace, ms)
+			trace.Score = seedTraceScore{FFFrames: ff, FramePct: sc.frameRate, KeyPct: sc.keyRate}
+			trace.Stats = macroSeedTraceStats(c, res)
 			*failures = append(*failures, failureReportRow{
 				Case:     caseName,
 				Arm:      macroArmSourceLabel(arm, sourceMode, sourceInterval),
@@ -697,6 +869,15 @@ func runMacroFrontierCell(c *chunked, caseName string, loss, burst float64, rtt 
 				KeyPct:   sc.keyRate,
 				Failure:  trace.Failure,
 			})
+			if isMeldArm(arm) && trace.Failure.Kind != "none" {
+				candidate := &macroTraceCandidate{
+					trace:        trace,
+					failureIndex: len(*failures) - 1,
+				}
+				if candidate.worseThan(worstTrace) {
+					worstTrace = candidate
+				}
+			}
 		}
 		row.Seeds++
 	}
@@ -718,6 +899,17 @@ func runMacroFrontierCell(c *chunked, caseName string, loss, burst float64, rtt 
 		row.RepairMean = float64(repairSum) / n
 		row.ReactiveMean = float64(reactiveSum) / n
 		row.TxThrottledMean = float64(txThrottledSum) / n
+		row.RepairExactMean = float64(repairExactSum) / n
+		row.RepairBurstDuplicateMean = float64(repairBurstDuplicateSum) / n
+		row.RepairOutageDiversityMean = float64(repairOutageDiversitySum) / n
+		row.RepairEpochMean = float64(repairEpochSum) / n
+		row.EpochBlocksMean = float64(epochBlocksSum) / n
+		row.EpochDemandQ8Mean = float64(epochDemandQ8Sum) / n
+		row.EpochCorrelationQ8Mean = float64(epochCorrelationQ8Sum) / n
+		row.EpochMemoryQ8Mean = float64(epochMemoryQ8Sum) / n
+		row.EpochShareQ8Mean = float64(epochFixedMixQ8Sum) / n
+		row.RepairCompactedMean = float64(repairCompactedSum) / n
+		row.RepairBytesSavedMean = float64(repairBytesSavedSum) / n
 		if row.TxSourceMean > 0 {
 			row.RepairOverheadPct = row.RepairMean / row.TxSourceMean
 		}
@@ -743,7 +935,98 @@ func runMacroFrontierCell(c *chunked, caseName string, loss, burst float64, rtt 
 			row.RuntimeMsStddev = math.Sqrt(m2 / float64(row.Seeds-1))
 		}
 	}
-	return row
+	if worstTrace != nil {
+		if err := worstTrace.write(opts.OutDir, caseName, arm, *failures); err != nil {
+			return row, err
+		}
+	}
+	return row, nil
+}
+
+func macroExternalArm(arm string) bool {
+	return isCompetitorArm(arm)
+}
+
+type macroTraceCandidate struct {
+	trace        *seedTrace
+	failureIndex int
+}
+
+// worseThan orders diagnostics by user-visible damage before packet loss. A
+// lower decoded-frame score is the first thing a reader needs to explain;
+// frame/key completeness and missing-chunk count break ties deterministically.
+func (c *macroTraceCandidate) worseThan(other *macroTraceCandidate) bool {
+	if c == nil || c.trace == nil {
+		return false
+	}
+	if other == nil || other.trace == nil {
+		return true
+	}
+	a, b := c.trace, other.trace
+	if a.Score.FFFrames != b.Score.FFFrames {
+		return a.Score.FFFrames < b.Score.FFFrames
+	}
+	if a.Score.FramePct != b.Score.FramePct {
+		return a.Score.FramePct < b.Score.FramePct
+	}
+	if a.Score.KeyPct != b.Score.KeyPct {
+		return a.Score.KeyPct < b.Score.KeyPct
+	}
+	if a.Failure.MissingChunks != b.Failure.MissingChunks {
+		return a.Failure.MissingChunks > b.Failure.MissingChunks
+	}
+	return a.Rep < b.Rep
+}
+
+func (c *macroTraceCandidate) write(dir, caseName, arm string, failures []failureReportRow) error {
+	if c == nil || c.trace == nil {
+		return nil
+	}
+	if dir == "" {
+		return fmt.Errorf("cannot preserve diagnostic trace without a report directory")
+	}
+	if c.failureIndex < 0 || c.failureIndex >= len(failures) {
+		return fmt.Errorf("diagnostic trace failure index %d outside %d rows", c.failureIndex, len(failures))
+	}
+	traceName := fmt.Sprintf("seed_trace_%s_%s_rep%d_seed%d.json",
+		safeName(caseName), safeName(arm), c.trace.Rep, c.trace.Seed)
+	if err := writeJSON(filepath.Join(dir, traceName), c.trace); err != nil {
+		return fmt.Errorf("write worst-seed trace: %w", err)
+	}
+	failures[c.failureIndex].Trace = traceName
+	return nil
+}
+
+func macroSeedTraceStats(c *chunked, res benchRun) seedTraceStats {
+	stats := seedTraceStats{
+		Chunks:      len(res.seqs),
+		TotalChunks: len(c.chunks),
+		RelayEnq:    res.metrics.Relay.ForwardEnqueued,
+		RelaySent:   res.metrics.Relay.ForwardSent,
+	}
+	if res.meld == nil {
+		return stats
+	}
+	stats.TxSource = res.meld.txStats.Source
+	stats.TxRepair = res.meld.txStats.Repair
+	stats.TxReactive = res.meld.txStats.ReactiveRepair
+	stats.TxThrottled = res.meld.txStats.Throttled
+	stats.RepairExact = res.meld.txStats.RepairExact
+	stats.RepairBurstDuplicate = res.meld.txStats.RepairBurstDuplicate
+	stats.RepairOutageDiversity = res.meld.txStats.RepairOutageDiversity
+	stats.RepairEpoch = res.meld.txStats.RepairEpoch
+	stats.EpochBlocks = res.meld.txStats.EpochBlocks
+	stats.EpochDemandQ8 = res.meld.txStats.EpochDemandQ8
+	stats.EpochCorrelationQ8 = res.meld.txStats.EpochCorrelationQ8
+	stats.EpochMemoryQ8 = res.meld.txStats.EpochMemoryQ8
+	stats.EpochShareQ8 = res.meld.txStats.EpochShareQ8
+	stats.RepairCompacted = res.meld.txStats.RepairCompacted
+	stats.RepairBytesSaved = res.meld.txStats.RepairBytesSaved
+	stats.RxDelivered = res.meld.rxStats.Delivered
+	stats.RxRecovered = res.meld.rxStats.Recovered
+	stats.RxLost = res.meld.rxStats.Lost
+	stats.RxEvicted = res.meld.rxStats.Evicted
+	return stats
 }
 
 func decodablePrefixFrames(c *chunked, seqs map[uint32]bool) int {
@@ -760,10 +1043,6 @@ func decodablePrefixFrames(c *chunked, seqs map[uint32]bool) int {
 		frames++
 	}
 	return frames
-}
-
-func macroRunArm(arm string, c *chunked, loss float64, rtt, budget int, paceUs, meldMax, seed int64) benchRun {
-	return macroRunArmTrace(arm, c, loss, rtt, budget, paceUs, meldMax, seed, nil)
 }
 
 func macroRunArmTrace(arm string, c *chunked, loss float64, rtt, budget int, paceUs, meldMax, seed int64, trace *seedTrace) benchRun {
@@ -828,14 +1107,15 @@ func macroGapRows(rows []macroFrontierRow, opts macroFrontierOptions) []macroGap
 	out := make([]macroGapRow, 0, len(byCase))
 	for name, rs := range byCase {
 		meld, haveMeld := selectedMacroMeldRow(rs)
-		arq, haveARQ := bestMacroRow(rs, func(a string) bool { return a == "libsrt" || a == "libsrt-fec" || a == "librist" })
-		if !haveMeld || !haveARQ {
+		competitor, haveCompetitor := bestMacroRow(rs, isCompetitorArm)
+		if !haveMeld || !haveCompetitor {
 			continue
 		}
 		burstMs := burstDurationMs(meld.Burst, opts.ChunkSize, opts.Mbps)
 		out = append(out, macroGapRow{
 			SourceID:           meld.SourceID,
 			SourceClip:         meld.SourceClip,
+			SourceCodec:        meld.SourceCodec,
 			Case:               name,
 			Loss:               meld.Loss,
 			Burst:              meld.Burst,
@@ -857,22 +1137,23 @@ func macroGapRows(rows []macroFrontierRow, opts macroFrontierOptions) []macroGap
 			MeldRuntimeMs:      meld.RuntimeMsMean,
 			MeldRepairOverhead: meld.RepairOverheadPct,
 			MeldRelaySentBytes: meld.RelayForwardSentBytesMean,
-			BestARQ:            arq.Arm,
-			ARQSourcePackets:   arq.SourcePackets,
-			ARQSourceBytes:     arq.SourceBytes,
-			ARQFF:              arq.FFMean,
-			ARQFFSD:            arq.FFStddev,
-			ARQRuntimeMs:       arq.RuntimeMsMean,
-			ARQRelaySentBytes:  arq.RelayForwardSentBytesMean,
-			DeltaFF:            meld.FFMean - arq.FFMean,
-			DeltaNoise:         math.Hypot(meld.FFStddev, arq.FFStddev),
-			DeltaPct:           (meld.FFMean - arq.FFMean) / float64(opts.TotalPics),
-			RuntimeDeltaMs:     meld.RuntimeMsMean - arq.RuntimeMsMean,
-			RelayByteDeltaPct:  pctDeltaFloat(meld.RelayForwardSentBytesMean, arq.RelayForwardSentBytesMean),
+			BestARQ:            competitor.Arm,
+			ARQSourcePackets:   competitor.SourcePackets,
+			ARQSourceBytes:     competitor.SourceBytes,
+			ARQFF:              competitor.FFMean,
+			ARQFFSD:            competitor.FFStddev,
+			ARQRuntimeMs:       competitor.RuntimeMsMean,
+			ARQRelaySentBytes:  competitor.RelayForwardSentBytesMean,
+			Seeds:              min(meld.Seeds, competitor.Seeds),
+			DeltaFF:            meld.FFMean - competitor.FFMean,
+			DeltaNoise:         math.Hypot(meld.FFStddev, competitor.FFStddev),
+			DeltaPct:           (meld.FFMean - competitor.FFMean) / float64(opts.TotalPics),
+			RuntimeDeltaMs:     meld.RuntimeMsMean - competitor.RuntimeMsMean,
+			RelayByteDeltaPct:  pctDeltaFloat(meld.RelayForwardSentBytesMean, competitor.RelayForwardSentBytesMean),
 			MeldFrame:          meld.FramePctMean,
-			ARQFrame:           arq.FramePctMean,
+			ARQFrame:           competitor.FramePctMean,
 			MeldKey:            meld.KeyPctMean,
-			ARQKey:             arq.KeyPctMean,
+			ARQKey:             competitor.KeyPctMean,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -882,6 +1163,15 @@ func macroGapRows(rows []macroFrontierRow, opts macroFrontierOptions) []macroGap
 		return out[i].DeltaFF > out[j].DeltaFF
 	})
 	return out
+}
+
+func isCompetitorArm(arm string) bool {
+	switch arm {
+	case "libsrt", "libsrt-fec", "librist":
+		return true
+	default:
+		return false
+	}
 }
 
 func selectedMacroMeldRow(rows []macroFrontierRow) (macroFrontierRow, bool) {
@@ -911,7 +1201,7 @@ func printMacroFrontierSummary(gaps []macroGapRow, opts macroFrontierOptions) {
 		topN = 8
 	}
 	fmt.Printf("\n# Macro Frontier Summary\n")
-	fmt.Printf("# delta = deployable Meld ffprobe frames - best ARQ ffprobe frames (meld-auto when present)\n\n")
+	fmt.Printf("# delta = deployable Meld ffprobe frames - best SRT/RIST competitor (meld-auto when present)\n\n")
 	printGapBlock("Stable theory-opportunity Meld wins", filterGapRows(gaps, func(g macroGapRow) bool {
 		return g.TheoryMeld && g.DeltaFF > 0 && macroGapStable(g)
 	}), topN)
@@ -948,7 +1238,7 @@ func printGapBlock(title string, gaps []macroGapRow, topN int) {
 		gaps = gaps[:topN]
 	}
 	fmt.Printf("## %s\n", title)
-	fmt.Printf("%-36s %-16s %-16s %8s %8s %8s %8s %7s %8s %8s %8s %8s %7s\n", "case", "meld", "arq", "meld", "arq", "delta", "noise", "stable", "repair", "wire", "run_ms", "src_byte", "psnr")
+	fmt.Printf("%-36s %-16s %-16s %8s %8s %8s %8s %7s %8s %8s %8s %8s %7s\n", "case", "meld", "competitor", "meld", "other", "delta", "noise", "stable", "repair", "wire", "run_ms", "src_byte", "psnr")
 	for _, g := range gaps {
 		fmt.Printf("%-36s %-16s %-16s %8.1f %8.1f %+8.1f %8.1f %7t %8s %8s %+8.0f %8s %7s\n",
 			g.Case, macroMeldLabel(g), g.BestARQ, g.MeldFF, g.ARQFF, g.DeltaFF, g.DeltaNoise, macroGapStable(g),
@@ -984,7 +1274,7 @@ func filterGapRows(rows []macroGapRow, keep func(macroGapRow) bool) []macroGapRo
 }
 
 func macroGapStable(g macroGapRow) bool {
-	return g.DeltaNoise == 0 || math.Abs(g.DeltaFF) > g.DeltaNoise
+	return g.Seeds >= 3 && (g.DeltaNoise == 0 || math.Abs(g.DeltaFF) > g.DeltaNoise)
 }
 
 func macroSourcePacketDelta(g macroGapRow) float64 {
@@ -1063,27 +1353,32 @@ func multName(v float64) string {
 	return strings.ReplaceAll(strings.TrimRight(strings.TrimRight(fmt.Sprintf("%.2f", v), "0"), "."), ".", "p")
 }
 
-func writeMacroFrontierRows(path string, rows []macroFrontierRow) error {
+func writeMacroFrontierRows(path string, rows []macroFrontierRow) (err error) {
 	f, err := os.Create(path)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
 	w := csv.NewWriter(f)
-	defer w.Flush()
-	w.Write([]string{
-		"source_id", "source_clip", "case", "loss", "burst", "rtt_ms", "mult", "budget_ms", "jitter_ms", "arm",
+	defer finishCSVFile(f, w, &err)
+	if err := w.Write([]string{
+		"source_id", "source_clip", "source_codec", "case", "loss", "burst", "rtt_ms", "mult", "budget_ms", "jitter_ms", "arm",
 		"source_mode", "source_interval", "source_packets", "source_bytes", "source_ff_frames", "source_psnr", "source_fallback",
 		"ff_mean", "ff_stddev", "frame_pct_mean", "key_pct_mean", "delivered_mean", "delivery_pct_mean", "continuity_frames_mean",
 		"runtime_ms_mean", "runtime_ms_stddev", "process_user_ms_mean", "process_system_ms_mean", "process_max_rss_kb_mean",
-		"tx_source_mean", "tx_repair_mean", "tx_reactive_mean", "tx_throttled_mean", "repair_overhead_pct",
+		"tx_source_mean", "tx_repair_mean", "tx_reactive_mean", "tx_throttled_mean",
+		"repair_exact_mean", "repair_burst_duplicate_mean", "repair_outage_diversity_mean", "repair_epoch_mean",
+		"epoch_blocks_mean", "epoch_demand_q8_mean", "epoch_correlation_q8_mean", "epoch_memory_q8_mean", "epoch_share_q8_mean",
+		"repair_compacted_mean", "repair_bytes_saved_mean", "repair_overhead_pct",
 		"relay_forward_enqueued_mean", "relay_forward_sent_mean", "relay_forward_dropped_mean", "relay_forward_sent_bytes_mean",
 		"relay_forward_dropped_bytes_mean", "relay_reverse_sent_mean", "relay_reverse_sent_bytes_mean", "failed", "seeds",
-	})
+	}); err != nil {
+		return err
+	}
 	for _, r := range rows {
-		w.Write([]string{
+		if err := w.Write([]string{
 			r.SourceID,
 			r.SourceClip,
+			r.SourceCodec,
 			r.Case,
 			fmt.Sprintf("%.6f", r.Loss),
 			fmt.Sprintf("%.3f", r.Burst),
@@ -1115,6 +1410,17 @@ func writeMacroFrontierRows(path string, rows []macroFrontierRow) error {
 			fmt.Sprintf("%.3f", r.RepairMean),
 			fmt.Sprintf("%.3f", r.ReactiveMean),
 			fmt.Sprintf("%.3f", r.TxThrottledMean),
+			fmt.Sprintf("%.3f", r.RepairExactMean),
+			fmt.Sprintf("%.3f", r.RepairBurstDuplicateMean),
+			fmt.Sprintf("%.3f", r.RepairOutageDiversityMean),
+			fmt.Sprintf("%.3f", r.RepairEpochMean),
+			fmt.Sprintf("%.3f", r.EpochBlocksMean),
+			fmt.Sprintf("%.3f", r.EpochDemandQ8Mean),
+			fmt.Sprintf("%.3f", r.EpochCorrelationQ8Mean),
+			fmt.Sprintf("%.3f", r.EpochMemoryQ8Mean),
+			fmt.Sprintf("%.3f", r.EpochShareQ8Mean),
+			fmt.Sprintf("%.3f", r.RepairCompactedMean),
+			fmt.Sprintf("%.3f", r.RepairBytesSavedMean),
 			fmt.Sprintf("%.6f", r.RepairOverheadPct),
 			fmt.Sprintf("%.3f", r.RelayForwardEnqueuedMean),
 			fmt.Sprintf("%.3f", r.RelayForwardSentMean),
@@ -1125,32 +1431,36 @@ func writeMacroFrontierRows(path string, rows []macroFrontierRow) error {
 			fmt.Sprintf("%.3f", r.RelayReverseSentBytesMean),
 			strconv.Itoa(r.Failed),
 			strconv.Itoa(r.Seeds),
-		})
+		}); err != nil {
+			return err
+		}
 	}
-	return w.Error()
+	return nil
 }
 
-func writeMacroGapRows(path string, rows []macroGapRow) error {
+func writeMacroGapRows(path string, rows []macroGapRow) (err error) {
 	f, err := os.Create(path)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
 	w := csv.NewWriter(f)
-	defer w.Flush()
-	w.Write([]string{
-		"source_id", "source_clip", "case", "loss", "burst", "rtt_ms", "mult", "budget_ms", "jitter_ms", "burst_ms",
+	defer finishCSVFile(f, w, &err)
+	if err := w.Write([]string{
+		"source_id", "source_clip", "source_codec", "case", "loss", "burst", "rtt_ms", "mult", "budget_ms", "jitter_ms", "burst_ms",
 		"theory_meld_opportunity", "best_meld", "meld_source_mode", "meld_source_interval", "meld_source_packets",
-		"arq_source_packets", "source_packet_delta_pct", "meld_source_bytes", "arq_source_bytes", "source_byte_delta_pct",
-		"meld_source_psnr", "meld_source_fallback", "meld_ff", "meld_ff_stddev", "best_arq", "arq_ff", "arq_ff_stddev",
-		"delta_ff", "delta_noise", "delta_stable", "delta_pct", "runtime_delta_ms", "meld_runtime_ms", "arq_runtime_ms",
-		"meld_repair_overhead_pct", "relay_byte_delta_pct", "meld_relay_sent_bytes", "arq_relay_sent_bytes",
-		"meld_frame_pct", "arq_frame_pct", "meld_key_pct", "arq_key_pct",
-	})
+		"competitor_source_packets", "source_packet_delta_pct", "meld_source_bytes", "competitor_source_bytes", "source_byte_delta_pct",
+		"meld_source_psnr", "meld_source_fallback", "meld_ff", "meld_ff_stddev", "best_competitor", "competitor_ff", "competitor_ff_stddev",
+		"seeds", "delta_ff", "delta_noise", "delta_stable", "delta_pct", "runtime_delta_ms", "meld_runtime_ms", "competitor_runtime_ms",
+		"meld_repair_overhead_pct", "relay_byte_delta_pct", "meld_relay_sent_bytes", "competitor_relay_sent_bytes",
+		"meld_frame_pct", "competitor_frame_pct", "meld_key_pct", "competitor_key_pct",
+	}); err != nil {
+		return err
+	}
 	for _, r := range rows {
-		w.Write([]string{
+		if err := w.Write([]string{
 			r.SourceID,
 			r.SourceClip,
+			r.SourceCodec,
 			r.Case,
 			fmt.Sprintf("%.6f", r.Loss),
 			fmt.Sprintf("%.3f", r.Burst),
@@ -1176,6 +1486,7 @@ func writeMacroGapRows(path string, rows []macroGapRow) error {
 			r.BestARQ,
 			fmt.Sprintf("%.3f", r.ARQFF),
 			fmt.Sprintf("%.3f", r.ARQFFSD),
+			strconv.Itoa(r.Seeds),
 			fmt.Sprintf("%.3f", r.DeltaFF),
 			fmt.Sprintf("%.3f", r.DeltaNoise),
 			strconv.FormatBool(macroGapStable(r)),
@@ -1191,9 +1502,11 @@ func writeMacroGapRows(path string, rows []macroGapRow) error {
 			fmt.Sprintf("%.6f", r.ARQFrame),
 			fmt.Sprintf("%.6f", r.MeldKey),
 			fmt.Sprintf("%.6f", r.ARQKey),
-		})
+		}); err != nil {
+			return err
+		}
 	}
-	return w.Error()
+	return nil
 }
 
 func writeMacroFrontierMarkdown(path string, rows []macroGapRow, opts macroFrontierOptions) error {
@@ -1204,12 +1517,11 @@ func writeMacroFrontierMarkdown(path string, rows []macroGapRow, opts macroFront
 	}
 	fmt.Fprintf(&b, "Grid: losses `%v`, bursts `%v`, RTTs `%v`, multipliers `%v`, reps `%d`.\n\n",
 		opts.Losses, opts.Bursts, opts.RTTs, opts.Mults, opts.Reps)
-	if opts.JitterMs > 0 {
-		fmt.Fprintf(&b, "Forward jitter/reorder injection: `%d ms` maximum per datagram.\n\n", opts.JitterMs)
-	}
+	fmt.Fprintf(&b, "Forward jitter/reorder planes: `%v ms`; shard `%d/%d` covers `%d` of `%d` cells.\n\n",
+		macroJitterPlanes(opts), opts.ShardIndex, opts.ShardCount, macroShardCells(opts), macroTotalCells(opts))
 	fmt.Fprintf(&b, "Charts: [delta bars](charts/delta-bars.svg), [frontier heatmap](charts/frontier-heatmap.svg), [arm frames](charts/arm-frames.svg), [cost/gain](charts/cost-gain.svg).\n\n")
 	fmt.Fprintf(&b, "Theory-opportunity cells are cells where a full ARQ retransmission is latency-tight (`budget < 1.5x RTT`) or burst duration exceeds post-RTT slack.\n\n")
-	fmt.Fprintf(&b, "Gap rows compare the deployable Meld profile against the best ARQ-style arm. If `meld-auto` is present in the arm list, it is used instead of choosing the best experimental Meld variant.\n\n")
+	fmt.Fprintf(&b, "Gap rows compare the deployable Meld profile against the best successful SRT or RIST arm in the same cell. If `meld-auto` is present in the arm list, it is used instead of choosing the best experimental Meld variant.\n\n")
 	fmt.Fprintf(&b, "Runtime is wall-clock time for the arm run. External-process CPU/RSS fields are captured for SRT/RIST subprocesses when the OS exposes rusage; Meld runs in-process, so its per-arm CPU/RSS needs a dedicated isolated runner before publication claims about CPU cost.\n\n")
 	if opts.AutoEncoderCadence {
 		fmt.Fprintf(&b, "Encoder cadence actuator model is enabled: `meld-auto[irN]` means the Meld arm used an encoder-controlled x264 intra-refresh source with bounded recovery interval N. ARQ arms used the baseline source. Source packet and byte deltas compare the Meld source variant with the ARQ baseline source.\n\n")
@@ -1319,7 +1631,7 @@ func writeGapMarkdownBlock(b *strings.Builder, title string, rows []macroGapRow,
 		fmt.Fprintf(b, "None.\n\n")
 		return
 	}
-	fmt.Fprintf(b, "| case | best Meld | best ARQ | Meld ff | ARQ ff | delta ff | noise ff | stable | repair overhead | wire byte delta | runtime delta | frame delta | key delta | source byte delta | source PSNR | source fallback |\n")
+	fmt.Fprintf(b, "| case | Meld | best competitor | Meld ff | competitor ff | delta ff | noise ff | stable | repair overhead | wire byte delta | runtime delta | frame delta | key delta | source byte delta | source PSNR | source fallback |\n")
 	fmt.Fprintf(b, "| --- | --- | --- | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |\n")
 	for _, r := range rows {
 		fmt.Fprintf(b, "| `%s` | `%s` | `%s` | %.1f | %.1f | %+.1f | %.1f | %t | %s | %s | %+.0f ms | %+.1f%% | %+.1f%% | %s | %s | `%s` |\n",

@@ -22,7 +22,7 @@ func drawSlot(rng *rand.Rand, pNone, pTwo float64) int {
 	}
 }
 
-// TestJointTailHoldsWhereIIDFails is the multipath money test: as two equally-lossy
+// TestJointTailHoldsWhereIIDFails verifies that as two equally-lossy
 // paths become correlated (both go bad together), the i.i.d.-union sizer — which
 // assumes independence — silently under-provisions and misses its decode-failure
 // target, while the correlation-aware joint-tail sizer holds it.

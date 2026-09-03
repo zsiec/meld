@@ -29,9 +29,7 @@ func TestSetFrameRefs(t *testing.T) {
 	var refOrderHint [av1NumRefFrames]int
 	// A plausible DPB: a spread of order hints across the eight slots.
 	hints := []int{0, 8, 16, 4, 12, 2, 6, 10}
-	for i, h := range hints {
-		refOrderHint[i] = h
-	}
+	copy(refOrderHint[:], hints)
 	const lastIdx, goldIdx, orderHint, bits = 1, 3, 14, 7
 	refIdx := setFrameRefs(lastIdx, goldIdx, orderHint, bits, refOrderHint)
 

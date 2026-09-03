@@ -127,7 +127,7 @@ func TestSlidingProtectedFeedbackGetsSparseRepair(t *testing.T) {
 	}
 	drainSlidingSymbols(t, s)
 
-	s.FeedFeedback(clock.Timestamp(100_000), wire.Feedback{
+	s.FeedFeedback(clock.Timestamp(20_000), wire.Feedback{
 		Flow:           cfg.Flow,
 		DecodedLowEdge: 2,
 		HighestSeen:    20,
@@ -164,7 +164,7 @@ func TestSlidingProtectedSparseRepairGetsDelayedRetry(t *testing.T) {
 	}
 	drainSlidingSymbols(t, s)
 
-	s.FeedFeedback(clock.Timestamp(100_000), wire.Feedback{
+	s.FeedFeedback(clock.Timestamp(20_000), wire.Feedback{
 		Flow:           cfg.Flow,
 		DecodedLowEdge: 2,
 		HighestSeen:    20,
@@ -205,17 +205,18 @@ func TestSlidingProtectedSparseRepairGetsDelayedRetry(t *testing.T) {
 func TestSlidingReceiverSparseRepairRecoversProtectedGap(t *testing.T) {
 	cfg := Config{Flow: 1, SymbolSize: testSym, Sliding: true, CodingWindow: 8, BufferMicros: 60_000}
 	r := NewSlidingReceiver(cfg)
-	enc := code.NewEncoder(testSym)
+	enc := code.NewEncoder(codedSymbolSize(testSym))
 	src := make([][]byte, 6)
+	deadline := clock.Timestamp(cfg.BufferMicros)
 	for i := range src {
 		src[i] = makeChunkN(uint32(i))
-		enc.Add(src[i])
+		enc.Add(makeCodedSource(src[i], testSym, deadline))
 	}
 	now := clock.Timestamp(0)
 	feedSystematic := func(id uint32) {
 		r.FeedSymbol(now, wire.EncodeSymbol(nil, wire.Symbol{
 			Flow: cfg.Flow, Kind: wire.Systematic, WindowBase: id, SrcIndex: id, N: 1,
-			Deadline: int64(now.Add(cfg.BufferMicros)), Payload: src[id],
+			Deadline: int64(deadline), HasSourceLength: true, SourceLength: uint32(len(src[id])), Payload: src[id],
 		}))
 	}
 	for _, id := range []uint32{0, 2, 4, 5} {
@@ -510,9 +511,9 @@ func TestPendingSingletonKeepsPayloadAfterGenerationRetire(t *testing.T) {
 		s.WriteUnit(clock.Timestamp(i+2), makeChunkN(uint32(100+i)), uepCenterTier)
 	}
 
-	enc := code.NewEncoderAt(cfg.SymbolSize, 0)
-	enc.Add(src)
-	_, _, want := enc.Repair(0)
+	enc := code.NewEncoderAt(codedSymbolSize(cfg.SymbolSize), 0)
+	enc.Add(makeCodedSource(src, cfg.SymbolSize, clock.Timestamp(cfg.BufferMicros)))
+	_, _, want := enc.Repair(code.BlockRepairKey(0))
 	defer enc.Recycle(want)
 
 	for {
@@ -525,7 +526,8 @@ func TestPendingSingletonKeepsPayloadAfterGenerationRetire(t *testing.T) {
 			t.Fatalf("DecodeSymbol: %v", err)
 		}
 		if sym.Kind == wire.Repair && sym.WindowBase == 0 && sym.N == 1 {
-			if !bytes.Equal(sym.Payload, want) {
+			got, ok := expandRepairPayload(sym, cfg.SymbolSize)
+			if !ok || !bytes.Equal(got, want) {
 				t.Fatal("pending singleton repair payload changed after its generation retired")
 			}
 			return

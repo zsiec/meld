@@ -3,7 +3,7 @@ package flow
 import "testing"
 
 // TestRepairForJointTailNPath exercises the N-path joint-tail sizer on the per-slot
-// erasure-count histogram. The headline N5 property generalizes to N>2: at the SAME
+// erasure-count histogram. The correlation property generalizes to N>2: at the same
 // per-path marginal loss, a correlated channel (more mass at the all-paths-erased tail)
 // forces MORE repair than the independent channel — the lift an independence-assuming
 // sizer misses.

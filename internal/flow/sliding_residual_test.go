@@ -2,13 +2,9 @@ package flow
 
 import "testing"
 
-// TestSlidingResidual20pctIID is the deterministic repro of the sliding-coder
-// recovery floor found over the live session: at 20% i.i.d. loss with a GENEROUS
-// budget (4–6×RTT), the band (sliding) receiver plateaued ~98.5% delivery and
-// MORE budget did not help — while the generation coder reached ~100% on the same
-// channel. This drives the sans-I/O core directly (no sockets, no real clock) so
-// the residual is reproducible and debuggable, and — crucially — uses the
-// no-premature-drop oracle to split the residual into:
+// TestSlidingResidual20pctIID pins conservative startup protection at 20% iid
+// loss with a generous 4–6×RTT budget. It drives the sans-I/O core directly and
+// uses the no-premature-drop oracle to split any residual into:
 //
 //   - premature   : the symbol ARRIVED and the ideal in-time decoder could recover
 //     it, but the real receiver dropped it  → a receiver/decoder BUG.
@@ -16,7 +12,7 @@ import "testing"
 //     → the SENDER under-provisioned repair (a sizing issue, not a
 //     receiver bug).
 //
-// Which bucket the floor lands in tells us where to fix it.
+// The split distinguishes decoder loss from insufficient emitted rank.
 func TestSlidingResidual20pctIID(t *testing.T) {
 	t.Parallel()
 	if testing.Short() {
@@ -33,6 +29,7 @@ func TestSlidingResidual20pctIID(t *testing.T) {
 			cfg := base
 			cfg.BufferMicros = budgetMs * 1000
 			var deliv, prem, gen int
+			var prematureIDs []uint32
 			for s := 0; s < seeds; s++ {
 				p := oracleParams{cfg: cfg, owdMicros: owd, srcMicros: src, n: n, sliding: sliding}
 				delivered, tape, writeAt, late := oracleRun(t, p, uniformDrop(uint64(0x5000+s), 0.20))
@@ -40,6 +37,12 @@ func TestSlidingResidual20pctIID(t *testing.T) {
 				deliv += res.delivered
 				prem += res.premature
 				gen += res.genuineLoss
+				if len(prematureIDs) < 12 {
+					prematureIDs = append(prematureIDs, res.prematureIDs...)
+					if len(prematureIDs) > 12 {
+						prematureIDs = prematureIDs[:12]
+					}
+				}
 			}
 			total := n * seeds
 			coder := "generation"
@@ -59,15 +62,12 @@ func TestSlidingResidual20pctIID(t *testing.T) {
 				}
 				continue
 			}
-			// FIXED by the sliding cold-start (SlidingSender.codeRate sizes the proactive
-			// rate for coldStartP assumed loss until the loss estimate primes ~1×RTT in).
-			// Both the warmup genuineLoss (sender under-provision before feedback can
-			// arrive) and the premature drops it caused are gone — strict 0 now, so this
-			// guards the fix: any regression trips. Before the fix this was ≈ 71 premature
-			// / 163 genuineLoss over 8000 at 97.075% delivered.
+			// The sliding sender sizes its initial proactive rate for coldStartP until
+			// feedback is credible, covering the flight that reactive repair cannot yet
+			// observe.
 			if deliv != total || prem != 0 || gen != 0 {
-				t.Errorf("sliding residual regressed at %.1f×RTT: delivered=%d/%d premature=%d genuineLoss=%d (want %d/%d, 0, 0)",
-					float64(budgetMs)/100.0, deliv, total, prem, gen, total, total)
+				t.Errorf("sliding residual regressed at %.1f×RTT: delivered=%d/%d premature=%d genuineLoss=%d ids=%v (want %d/%d, 0, 0)",
+					float64(budgetMs)/100.0, deliv, total, prem, gen, prematureIDs, total, total)
 			}
 		}
 	}

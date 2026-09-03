@@ -21,13 +21,15 @@ func TestAV1ShaperRealStream(t *testing.T) {
 	if len(sh) == 0 {
 		t.Fatal("shaped no units from a real AV1 stream")
 	}
-	var seqs, keys, pics, hidden, showExist, multiRef int
+	var seqs, delimiters, keys, pics, hidden, showExist, multiRef int
 	var units []Unit
 	for _, s := range sh {
 		units = append(units, s.Unit)
 		switch {
-		case s.Unit.Class == ClassParamSet:
+		case len(s.Payload) > 0 && (s.Payload[0]>>3)&0xf == av1SeqHeader:
 			seqs++
+		case len(s.Payload) > 0 && (s.Payload[0]>>3)&0xf == av1TemporalDelim:
+			delimiters++
 		case s.Unit.RAP:
 			keys++
 		}
@@ -43,10 +45,13 @@ func TestAV1ShaperRealStream(t *testing.T) {
 			multiRef++ // an inter frame resolved to several reference slots
 		}
 	}
-	t.Logf("real AV1: %d units — %d seq headers, %d keyframes, %d displayed, %d hidden refs, %d show_existing, %d multi-ref",
-		len(sh), seqs, keys, pics, hidden, showExist, multiRef)
+	t.Logf("real AV1: %d units — %d seq headers, %d temporal delimiters, %d keyframes, %d displayed, %d hidden refs, %d show_existing, %d multi-ref",
+		len(sh), seqs, delimiters, keys, pics, hidden, showExist, multiRef)
 	if seqs < 1 {
 		t.Fatalf("expected a sequence header, got %d", seqs)
+	}
+	if delimiters < 1 {
+		t.Fatal("expected temporal delimiters required by low-overhead OBU framing")
 	}
 	if keys != 2 {
 		t.Fatalf("expected 2 KEY frames, got %d", keys)

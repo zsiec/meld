@@ -7,9 +7,8 @@ import "testing"
 // top-ups inside the budget, so proactive may lean on it) and ZERO where a single honest
 // reactive cycle (reactiveCycleMicros: rtt + rtt/4 margin + the loss-onset report floor)
 // does not fit the budget — the frontier regime, where proactive must carry the full
-// Gilbert-Elliott margin itself. The former 2×rtt+cadence model priced reactive out of
-// budgets up to ~4×RTT (the generous-budget cost gap vs ARQ); the honest cycle credits
-// exactly what loss-onset feedback + one transit can deliver.
+// Gilbert-Elliott margin itself. The cycle credits exactly what loss-onset feedback and
+// one transit can deliver.
 func TestReactiveRoundsConservative(t *testing.T) {
 	s := NewSender(Config{Flow: 1, SymbolSize: 256, GenSize: 32, BufferMicros: 200_000})
 	s.rttMicros = 20_000 // 20 ms RTT: cycle 30 ms ⇒ several rounds in 200 ms

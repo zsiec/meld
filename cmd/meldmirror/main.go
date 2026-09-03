@@ -149,7 +149,7 @@ func runMirror(ctx context.Context, o *options) error {
 	if err != nil {
 		return fmt.Errorf("receiver: %w", err)
 	}
-	defer rx.Close()
+	defer func() { _ = rx.Close() }()
 
 	target := rx.LocalAddr()
 	var proxy *lossyProxy
@@ -158,7 +158,7 @@ func runMirror(ctx context.Context, o *options) error {
 		if err != nil {
 			return fmt.Errorf("loss relay: %w", err)
 		}
-		defer proxy.Close()
+		defer func() { _ = proxy.Close() }()
 		target = proxy.addr()
 	}
 
@@ -166,13 +166,13 @@ func runMirror(ctx context.Context, o *options) error {
 	if err != nil {
 		return fmt.Errorf("sender: %w", err)
 	}
-	defer tx.Close()
+	defer func() { _ = tx.Close() }()
 
 	sink, closeSink, sinkCmd, err := openSink(ctx, o)
 	if err != nil {
 		return err
 	}
-	defer closeSink()
+	defer func() { _ = closeSink() }()
 
 	cap := captureCommand(ctx, o)
 	stdout, err := cap.StdoutPipe()
@@ -193,14 +193,19 @@ func runMirror(ctx context.Context, o *options) error {
 	}
 
 	var wg sync.WaitGroup
+	pumpErr := make(chan error, 2)
 	wg.Add(2)
-	go func() { defer wg.Done(); pumpFromReceiver(rx, sink, cfg.SymbolSize) }()
+	go func() { defer wg.Done(); pumpErr <- pumpFromReceiver(rx, sink, cfg.SymbolSize) }()
 	go func() {
 		defer wg.Done()
-		pumpToSender(tx, stdout, cfg.MaxChunk())
+		pumpErr <- pumpToSender(tx, stdout, cfg.MaxChunk())
 	}()
 
-	<-ctx.Done()
+	var runErr error
+	select {
+	case <-ctx.Done():
+	case runErr = <-pumpErr:
+	}
 
 	// Teardown: stop the encoder so its stdout reaches EOF and the ingest pump drains,
 	// then flush the sender's tail. Give the receiver a brief grace to deliver the
@@ -209,17 +214,17 @@ func runMirror(ctx context.Context, o *options) error {
 	_ = cap.Process.Kill()
 	_ = cap.Wait()
 	tx.Flush()
-	tx.Close()
+	_ = tx.Close()
 	time.Sleep(o.buffer + 300*time.Millisecond)
-	rx.Close()
-	closeSink()
+	_ = rx.Close()
+	_ = closeSink()
 	if sinkCmd != nil {
 		_ = sinkCmd.Wait()
 	}
 	wg.Wait()
 
 	printStats(o, tx, rx, proxy)
-	return nil
+	return runErr
 }
 
 // runSend captures and streams to a remote receiver (the camera host).
@@ -232,7 +237,7 @@ func runSend(ctx context.Context, o *options) error {
 	if err != nil {
 		return fmt.Errorf("sender: %w", err)
 	}
-	defer tx.Close()
+	defer func() { _ = tx.Close() }()
 
 	cap := captureCommand(ctx, o)
 	stdout, err := cap.StdoutPipe()
@@ -244,20 +249,25 @@ func runSend(ctx context.Context, o *options) error {
 	}
 	fmt.Fprintf(os.Stderr, "meldmirror: %s -> Meld -> %s\n", sourceLabel(o), o.connect)
 
-	done := make(chan struct{})
-	go func() { defer close(done); pumpToSender(tx, stdout, cfg.MaxChunk()) }()
+	done := make(chan error, 1)
+	go func() { done <- pumpToSender(tx, stdout, cfg.MaxChunk()) }()
 
+	var runErr error
+	finished := false
 	select {
 	case <-ctx.Done():
-	case <-done:
+	case runErr = <-done:
+		finished = true
 	}
 	_ = cap.Process.Kill()
 	_ = cap.Wait()
 	tx.Flush()
-	tx.Close()
-	<-done
+	_ = tx.Close()
+	if !finished {
+		runErr = <-done
+	}
 	printStats(o, tx, nil, nil)
-	return nil
+	return runErr
 }
 
 // runRecv binds a receiver and displays the recovered stream (the display host).
@@ -267,28 +277,36 @@ func runRecv(ctx context.Context, o *options) error {
 	if err != nil {
 		return fmt.Errorf("receiver: %w", err)
 	}
-	defer rx.Close()
+	defer func() { _ = rx.Close() }()
 
 	sink, closeSink, sinkCmd, err := openSink(ctx, o)
 	if err != nil {
 		return err
 	}
-	defer closeSink()
+	defer func() { _ = closeSink() }()
 
 	fmt.Fprintf(os.Stderr, "meldmirror: listening on %s -> Meld -> %s\n", rx.LocalAddr(), sinkLabel(o))
 
-	done := make(chan struct{})
-	go func() { defer close(done); pumpFromReceiver(rx, sink, cfg.SymbolSize) }()
+	done := make(chan error, 1)
+	go func() { done <- pumpFromReceiver(rx, sink, cfg.SymbolSize) }()
 
-	<-ctx.Done()
-	rx.Close()
-	closeSink()
+	var runErr error
+	finished := false
+	select {
+	case <-ctx.Done():
+	case runErr = <-done:
+		finished = true
+	}
+	_ = rx.Close()
+	_ = closeSink()
 	if sinkCmd != nil {
 		_ = sinkCmd.Wait()
 	}
-	<-done
+	if !finished {
+		runErr = <-done
+	}
 	printStats(o, nil, rx, nil)
-	return nil
+	return runErr
 }
 
 // openSink returns the destination for recovered chunks: ffplay's stdin (output=="play")
@@ -308,7 +326,8 @@ func openSink(ctx context.Context, o *options) (io.Writer, func() error, *exec.C
 			return nil, nil, nil, fmt.Errorf("start ffplay: %w", err)
 		}
 		var once sync.Once
-		closeFn := func() error { once.Do(func() { stdin.Close() }); return nil }
+		var closeErr error
+		closeFn := func() error { once.Do(func() { closeErr = stdin.Close() }); return closeErr }
 		return stdin, closeFn, cmd, nil
 	}
 
@@ -317,7 +336,8 @@ func openSink(ctx context.Context, o *options) (io.Writer, func() error, *exec.C
 		return nil, nil, nil, fmt.Errorf("create output: %w", err)
 	}
 	var once sync.Once
-	closeFn := func() error { once.Do(func() { f.Close() }); return nil }
+	var closeErr error
+	closeFn := func() error { once.Do(func() { closeErr = f.Close() }); return closeErr }
 	return f, closeFn, nil, nil
 }
 

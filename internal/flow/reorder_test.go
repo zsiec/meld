@@ -15,9 +15,11 @@ func TestReorderHoldoffFrameBurst(t *testing.T) {
 		n      = 1024
 	)
 	mk := func(auto bool) Config {
-		return Config{Flow: 1, SymbolSize: 1316, GenSize: 16, Redundancy: 0.15, TargetFailure: 1e-3,
+		return Config{
+			Flow: 1, SymbolSize: 1316, GenSize: 16, Redundancy: 0.15, TargetFailure: 1e-3,
 			BufferMicros: budget, AutoGenSize: true, ProactiveDecay: true, RepairWithinBudget: true,
-			AutoReorderHoldoff: auto}
+			AutoReorderHoldoff: auto,
+		}
 	}
 	run := func(auto bool, seed int64) (proactive, delivered int) {
 		res := simLink{cfg: mk(auto), owdMicros: owd, srcMicros: 526, n: n, burst: 8, // 8-chunk access units
@@ -106,12 +108,16 @@ func TestAutoReorderHoldoffInvariants(t *testing.T) {
 		budget = 400_000
 		n      = 800
 	)
-	cfg := Config{Flow: 1, SymbolSize: 256, GenSize: 16, Redundancy: 0.15, TargetFailure: 1e-3,
+	cfg := Config{
+		Flow: 1, SymbolSize: 256, GenSize: 16, Redundancy: 0.15, TargetFailure: 1e-3,
 		BufferMicros: budget, AutoGenSize: true, ProactiveDecay: true, RepairWithinBudget: true,
-		AutoReorderHoldoff: true}
+		AutoReorderHoldoff: true,
+	}
 	for seed := int64(1); seed <= 4; seed++ {
-		res := simLink{cfg: cfg, owdMicros: owd, srcMicros: 526, n: n, drop: geDrop(seed, 0.02, 2),
-			jitterMicros: 60_000, timingJitterMicros: 60_000, timingSeed: seed*131 + 1}.run()
+		res := simLink{
+			cfg: cfg, owdMicros: owd, srcMicros: 526, n: n, drop: geDrop(seed, 0.02, 2),
+			jitterMicros: 60_000, timingJitterMicros: 60_000, timingSeed: seed*131 + 1,
+		}.run()
 		assertDeliveryInvariants(t, res)
 		if frac := float64(res.delivered) / float64(n); frac < 0.99 {
 			t.Fatalf("seed %d: delivered %.1f%% (< 99%%) — auto reorder window broke completeness", seed, 100*frac)
@@ -130,14 +136,18 @@ func TestAutoReorderHoldoffSelfDisables(t *testing.T) {
 		n      = 1000
 	)
 	mk := func(auto bool) Config {
-		return Config{Flow: 1, SymbolSize: 1316, GenSize: 16, Redundancy: 0.15, TargetFailure: 1e-3,
+		return Config{
+			Flow: 1, SymbolSize: 1316, GenSize: 16, Redundancy: 0.15, TargetFailure: 1e-3,
 			BufferMicros: budget, AutoGenSize: true, ProactiveDecay: true, RepairWithinBudget: true,
-			AutoReorderHoldoff: auto}
+			AutoReorderHoldoff: auto,
+		}
 	}
 	run := func(auto bool, seed int64) (proactive, delivered int) {
 		// No timing jitter ⇒ no reorder; 5% loss ⇒ real gaps. The window must not engage.
-		res := simLink{cfg: mk(auto), owdMicros: owd, srcMicros: 526, n: n, drop: geDrop(seed, 0.05, 2),
-			paceBytesPerSec: 12_500_000}.run()
+		res := simLink{
+			cfg: mk(auto), owdMicros: owd, srcMicros: 526, n: n, drop: geDrop(seed, 0.05, 2),
+			paceBytesPerSec: 12_500_000,
+		}.run()
 		return int(res.sstats.Repair), res.delivered
 	}
 	var offPro, onPro, offDel, onDel int
@@ -171,13 +181,17 @@ func TestReorderHoldoffInvariants(t *testing.T) {
 		n      = 800
 	)
 	mk := func(holdoff int64) Config {
-		return Config{Flow: 1, SymbolSize: 256, GenSize: 16, Redundancy: 0.15, TargetFailure: 1e-3,
+		return Config{
+			Flow: 1, SymbolSize: 256, GenSize: 16, Redundancy: 0.15, TargetFailure: 1e-3,
 			BufferMicros: budget, AutoGenSize: true, ProactiveDecay: true, RepairWithinBudget: true,
-			ReorderHoldoffMicros: holdoff}
+			ReorderHoldoffMicros: holdoff,
+		}
 	}
 	for seed := int64(1); seed <= 4; seed++ {
-		res := simLink{cfg: mk(80_000), owdMicros: owd, srcMicros: 526, n: n,
-			drop: geDrop(seed, 0.02, 2), jitterMicros: 60_000, timingJitterMicros: 60_000, timingSeed: seed*131 + 1}.run()
+		res := simLink{
+			cfg: mk(80_000), owdMicros: owd, srcMicros: 526, n: n,
+			drop: geDrop(seed, 0.02, 2), jitterMicros: 60_000, timingJitterMicros: 60_000, timingSeed: seed*131 + 1,
+		}.run()
 		assertDeliveryInvariants(t, res)
 		if frac := float64(res.delivered) / float64(n); frac < 0.99 {
 			t.Fatalf("seed %d: delivered %.1f%% (< 99%%) — reorder window broke completeness", seed, 100*frac)
@@ -197,13 +211,17 @@ func TestReorderHoldoffCutsOverSend(t *testing.T) {
 		n      = 1000
 	)
 	mk := func(holdoff int64) Config {
-		return Config{Flow: 1, SymbolSize: 1316, GenSize: 16, Redundancy: 0.15, TargetFailure: 1e-3,
+		return Config{
+			Flow: 1, SymbolSize: 1316, GenSize: 16, Redundancy: 0.15, TargetFailure: 1e-3,
 			BufferMicros: budget, AutoGenSize: true, ProactiveDecay: true, RepairWithinBudget: true,
-			ReorderHoldoffMicros: holdoff}
+			ReorderHoldoffMicros: holdoff,
+		}
 	}
-	run := func(holdoff int64, seed int64) (proactive, delivered int) {
-		res := simLink{cfg: mk(holdoff), owdMicros: owd, srcMicros: 526, n: n, drop: geDrop(seed, 0.01, 2),
-			paceBytesPerSec: 12_500_000, timingJitterMicros: 80_000, timingSeed: seed*7919 + 1}.run()
+	run := func(holdoff, seed int64) (proactive, delivered int) {
+		res := simLink{
+			cfg: mk(holdoff), owdMicros: owd, srcMicros: 526, n: n, drop: geDrop(seed, 0.01, 2),
+			paceBytesPerSec: 12_500_000, timingJitterMicros: 80_000, timingSeed: seed*7919 + 1,
+		}.run()
 		return int(res.sstats.Repair), res.delivered
 	}
 	var offPro, onPro, offDel, onDel int

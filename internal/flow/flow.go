@@ -4,19 +4,14 @@
 // effects leave as drained datagram/delivery queues. The host (internal/session)
 // owns the clock, the timer cadence, and the wire.
 //
-// # Coding model (first cut: generation-based RLNC)
+// # Coding model
 //
-// The source stream is partitioned into fixed-size generations of GenSize source
-// symbols. Within a generation the Sender emits each source symbol as a
-// SYSTEMATIC coded symbol immediately, then, when the generation closes (fills,
-// or is flushed at end of stream), emits repairCount REPAIR symbols — random
-// linear combinations over the whole generation (internal/code). The Receiver
-// recovers any generation that loses at most its repair count, delivers source
-// symbols in strict order, and evicts a generation whose deadline passes
-// (delivering the in-order prefix it has, skipping the rest). This is a
-// systematic block code with RLNC repair; a truly sliding / streaming window
-// (lower tail latency, coding across boundaries) is a later refinement behind the
-// same wire and the same four invariants.
+// The default single-path flow uses a bounded sliding RLNC window. A generation
+// coder remains available for multipath and controlled comparisons. Both emit
+// source symbols systematically, add deterministic GF(2^8) repair equations,
+// deliver recovered sources in order, and retire work at explicit deadlines.
+// They share the same wire types, feedback model, loss observations, media
+// descriptors, and safety bounds.
 package flow
 
 import (
@@ -155,7 +150,7 @@ type Config struct {
 	// MaxGenSymbols caps a symbol's declared window N (RFC 8681 ls_max_size): the
 	// receiver refuses any symbol with N greater than this, bounding decoder
 	// allocation against a forged wide window (the raw uint16 N would otherwise size a
-	// decoder up to 65535 symbols). 0 selects the default. (N1 resource safety.)
+	// decoder up to 65535 symbols). 0 selects the default.
 	MaxGenSymbols int
 	// MaxRetainedGens caps both the number of live generation decoders and the
 	// look-ahead horizon (in generations) of an admissible window, bounding the
@@ -165,10 +160,10 @@ type Config struct {
 	// MaxBitrate caps the sender's aggregate emitted rate in bits/sec via a token
 	// bucket: media (systematic) is never dropped, but REPAIR is throttled to keep the
 	// total under this ceiling — bounding a forged-feedback reactive-amplification /
-	// reflection storm (N1). It is also the ceiling the congestion controller reduces
+	// reflection storm. It is also the ceiling the congestion controller reduces
 	// below. 0 selects the default (100 Mbps).
 	MaxBitrate int64
-	// CongestionControl enables the delay-based (Copa-style) controller (N3): it sizes
+	// CongestionControl enables the delay-based (Copa-style) controller: it sizes
 	// the send-rate budget from the standing-queue delay and drives the token bucket,
 	// so repair is the first thing sacrificed under congestion (media is preserved) and
 	// the budget is surfaced for the host to pace the media source. Off ⇒ the bucket
@@ -197,14 +192,14 @@ type Config struct {
 	// ProbeMTU enables host-side per-path DPLPMTUD (RFC 8899): the sender probes the path
 	// MTU with padded, Don't-Fragment datagrams and detects black holes (a path that
 	// silently drops oversized datagrams — invisible to FEC and the loss-agnostic CC). A
-	// host concern (the core ignores this field). Phase 1: discovers and reports the PLPMTU
-	// per path; it does NOT yet resize symbols. Off by default (experimental).
+	// host concern (the core ignores this field). It discovers and reports the PLPMTU
+	// per path; it does not resize symbols. Off by default.
 	ProbeMTU bool
 	// MaxProbeMTU is the largest UDP-payload size DPLPMTUD probes for (the interface MTU /
 	// deployment ceiling). 0 selects a safe default. Ignored unless ProbeMTU.
 	MaxProbeMTU int
 	// Paths is the number of network paths a generation is spread across (coding-native
-	// multipath, N5). 0 or 1 ⇒ single path (the default; unchanged sizing and PathID 0).
+	// multipath). 0 or 1 ⇒ single path (the default; unchanged sizing and PathID 0).
 	// ≥ 2 enables the correlation-aware joint-tail sizer (repairForJointTailN) and the path
 	// scheduler — systematic symbols round-robin across the paths, repair is metered toward
 	// the better-delivering paths, and the receiver decodes from the union, so lossy paths
@@ -216,7 +211,7 @@ type Config struct {
 	// cross-checks arrived symbols' PathID and disables co-loss reporting on a mismatch
 	// (the union decoder still delivers; only the correlation refinement is lost).
 	Paths int
-	// EvictBrokenFrames turns on media-aware early eviction (WP6): when a frame the
+	// EvictBrokenFrames turns on media-aware early eviction: when a frame the
 	// receiver tracks is known UNDECODABLE — one of its own source ids was lost, or a
 	// reference's whole sub-tree is dead — its remaining ids are dropped IMMEDIATELY
 	// rather than waiting out each one's deadline, so the next independently-decodable
@@ -272,37 +267,19 @@ type Config struct {
 	// separate outage telemetry; the honest congestion counters (WireLost,
 	// CongestionLoss) are NEVER censored. (2) The generation sender skips reactive
 	// repair that provably cannot arrive in time (now + OWD past the window deadline).
-	// Receiver- and sender-side policy; the two ends may differ. ON by default
-	// (DefaultConfig) — validated tie-or-better across the flow sweep and the
-	// glassbench grid at both packet-rate scales, and strictly better in outage
-	// regimes at high rate: composure through the outage prevents the poisoned-
-	// estimator repair flood from evicting healthy post-outage media (+36.5 ffprobe
-	// frames at 14% fewer wire bytes and 3.5x lower seed variance in the burst400
-	// gate; docs/decisions). Set false for the outage-blind estimators.
+	// Receiver- and sender-side policy; the two ends may differ. Enabled by
+	// DefaultConfig. Set false for outage-blind estimation.
 	OutageAware bool
 	// SlidingReactiveShift (EXPERIMENTAL, off by default) enables the sliding
 	// profile's reactive-offload ports: the confirmed-clean floor decay, the
 	// rounds-gated burst/variance margin discount, and the budget-conditional
-	// TargetFailure relief. The 2026-07 permutation sweep measured the bundle's
-	// means positive (generous lossy +2.4 pp at 0.84x overhead) but with per-seed
-	// breaches beyond the cell noise floor in deep-burst cells, traced to the
-	// sliding RTT estimate inflating under self-induced queueing (which clips the
-	// band and saturates the sizer — and self-disables the relief exactly in the
-	// storms it targets). Off until the RTT estimator is hardened; the generation
-	// profile's ProactiveDecay is unaffected.
+	// TargetFailure relief. The generation profile's ProactiveDecay is unaffected.
 	SlidingReactiveShift bool
 
 	// HeadroomAwareSizing (EXPERIMENTAL, off by default) integrates a measured
-	// affordable-rate ceiling into the sliding proactive sizer (updateHeadroom):
-	// the GE set-point is capped at what the wire demonstrably serves, breaking
-	// the breaker/set-point limit cycle the arc-9 isolation named. Sim-validated
-	// on explicit-capacity links (the worst holdoff cell 1391→5677-5762 of 6000
-	// delivered; nine sweep cells +9 to +70 pp at lower overhead; zero cells
-	// worse). OFF by default because the loopback glass bench REGRESSED two
-	// bursty guard cells (~-6 pp delivery for -170 to -200 pp overhead) — its
-	// wire has no true capacity, so transient scheduling delay reads as
-	// saturation there; a real path (which has real capacity) is the only honest
-	// arbiter, and this flag awaits that soak.
+	// affordable-rate ceiling into the sliding proactive sizer. It is off by
+	// default because transient scheduling delay can resemble saturation on paths
+	// without a stable capacity ceiling.
 	HeadroomAwareSizing bool
 }
 
@@ -375,7 +352,7 @@ func (c Config) singletonRepairGap() uint32 {
 
 // DefaultConfig returns a reasonable starting configuration for a 1316-byte
 // media chunk (the bench/RTP payload size). The main profile is the band-form
-// sliding coder; set Sliding=false to use the legacy generation coder.
+// sliding coder; set Sliding=false to use the bounded generation coder.
 func DefaultConfig() Config {
 	return Config{
 		SymbolSize:             1316,
@@ -387,24 +364,51 @@ func DefaultConfig() Config {
 		Pace:                   true,    // host pacer on: smooth to the budget, backpressure the source
 		ProtectedRepairPhasing: true,    // on by default: burst-aware emission timing for protected reference repair
 		ProactiveDecay:         true,    // on by default: burst-guarded variance-margin offload (cuts overhead, self-reverts on bursts)
-		AutoGenSize:            true,    // on by default: zero-config self-measuring generation width (Pareto win over fixed GenSize across a real-timing sweep; no-op where it can't help, fixes the fixed-width burst/high-RTT delivery holes)
+		AutoGenSize:            true,    // self-measuring generation width
 		// on by default: cap proactive repair to the rate budget so a tight budget sheds protection
-		// gracefully instead of the host pacer delaying media (fixes the budget<2xRTT delivery
-		// collapse — bench: 4% → ~99%); inert where the budget is ample (byte-identical), never hurts.
+		// gracefully instead of allowing the host pacer to delay media.
 		RepairWithinBudget: true,
 		// FrameAtomic is intentionally opt-in: the default media path keeps deliverable bytes
 		// flowing and uses WriteFrame metadata for protection/telemetry rather than destructive
 		// all-or-nothing gating.
 		FrameAtomic: false,
 		// on by default: size the loss-estimate reorder window from measured reorder. Self-disabling
-		// where there is no reorder (a cref no-regression sweep across loss 1/3/8% holds delivery and
-		// cuts proactive overhead severalfold under real-timing reorder); single-path only for now.
+		// where there is no reorder; single-path only for now.
 		AutoReorderHoldoff: true,
 		// on by default: two-regime channel control — provision for the recoverable regime,
-		// compose through outages (inert without outages; strictly better with them: the
-		// glassbench burst400 gate shows better delivery at lower cost and far lower variance).
+		// compose through outages.
 		OutageAware: true,
 	}
+}
+
+const sourceWireWindowSize = 64
+
+// sourceWireWindow tracks the mean encoded systematic size over recent source
+// progress. Systematic datagrams are variable-length on the wire, so using only
+// the latest chunk would make the repair ceiling jump at every access-unit tail.
+// A bounded exact window reacts to a sustained bitrate/shape change without
+// allowing one short chunk to manufacture recovery headroom.
+type sourceWireWindow struct {
+	samples [sourceWireWindowSize]int64
+	sum     int64
+	count   int
+	pos     int
+}
+
+func (w *sourceWireWindow) observe(n int) int64 {
+	if n < 0 {
+		n = 0
+	}
+	v := int64(n)
+	if w.count < len(w.samples) {
+		w.count++
+	} else {
+		w.sum -= w.samples[w.pos]
+	}
+	w.samples[w.pos] = v
+	w.sum += v
+	w.pos = (w.pos + 1) % len(w.samples)
+	return w.sum / int64(w.count)
 }
 
 // repairFloor returns the floor repair count for a generation of n source symbols
@@ -427,7 +431,7 @@ func (c Config) targetFailure() float64 {
 
 // uepCenterTier is the protection tier (wire.Symbol.Priority) that maps to the
 // configured TargetFailure; tiers above it tighten the target, below it loosen it
-// (WP6 unequal protection). It is the media shaper's base/reference tier
+// for unequal protection. It is the media shaper's base/reference tier
 // (internal/shape.ClassBase) by convention — the core stays codec-blind, acting only
 // on the generic priority byte.
 const uepCenterTier = 2
@@ -461,14 +465,6 @@ func targetFailureForTier(tier int, base float64) float64 {
 	return d
 }
 
-// targetFailureForPriority returns the per-generation decode-failure target for a discrete
-// protection tier — the generic priority byte the shaper assigns. It is the unsigned entry point
-// to targetFailureForTier and is the whole unequal-protection policy at tier granularity; the core
-// never sees the codec.
-func targetFailureForPriority(pri uint8, base float64) float64 {
-	return targetFailureForTier(int(pri), base)
-}
-
 // effectiveProtectionTier folds temporal depth into a generation's protection tier. By the GOP
 // reference structure, a frame deeper in the temporal hierarchy is decoded FROM by fewer downstream
 // frames — its descendant fan-out shrinks with depth — so the deeper a PURE top-layer generation
@@ -490,10 +486,9 @@ func effectiveProtectionTier(pri, minTID uint8) int {
 
 // feedbackIntervalMicros is how often the receiver emits a cumulative feedback
 // report while a flow is active — the idle POLLING floor. Loss onset does not
-// wait for it: a new wire-loss run marks feedback due immediately (rate-limited
-// by eventFeedbackMinMicros), the gap-triggered-NACK reflex ARQ transports have
-// always had. Feedback stays cumulative and idempotent, so the extra report is
-// pure latency win, never extra state.
+// wait for it: a new wire-loss run marks feedback due immediately, rate-limited
+// by eventFeedbackMinMicros. Feedback stays cumulative and idempotent, so the
+// extra report reduces detection latency without adding state.
 const (
 	feedbackIntervalMicros = 20_000 // 20 ms
 	// eventFeedbackMinMicros is the floor between loss-onset-triggered reports. Half
@@ -508,13 +503,12 @@ const (
 
 // reactiveCycleMicros is one honest reactive cycle at the current RTT estimate:
 // the round trip (deficit out with the loss-onset event report, repair back) plus
-// an rtt/4 estimate margin plus the event-report floor. It replaces the former
-// 2×rtt + polling-cadence model, which over-doubled: the RTT estimator's samples
-// already include feedback transit (they tend to OVER-count the wire RTT), and
-// loss-onset reporting removed the polling cadence from the loop. The margin keeps
-// the model conservative without pricing reactive repair out of budgets (1.25-2)×RTT
-// — where ARQ demonstrably recovers, and where the old model claimed zero rounds
-// and carried full proactive margins as pure overhead.
+// an rtt/4 estimate margin plus the event-report floor. The RTT estimator's samples
+// already include feedback transit, and loss-onset reporting removes the polling
+// cadence from the loop. The margin keeps the model conservative without pricing
+// reactive repair out of budgets
+// (1.25-2)×RTT, where a request-and-response exchange can fit and full proactive
+// margins would be unnecessary overhead.
 func reactiveCycleMicros(rttMicros int64) int64 {
 	return rttMicros + rttMicros/4 + eventFeedbackMinMicros
 }
@@ -529,7 +523,7 @@ func reactiveRoundsFrom(budgetMicros, rttMicros int64) int {
 	return int(budgetMicros / cycle)
 }
 
-// extrasReplaceable is the capability predicate for the dedicated per-chunk
+// extrasReplaceable is the eligibility predicate for the dedicated per-chunk
 // singleton and anchor-closure extras, shared by both sender profiles: the extras
 // are double coverage ONLY where the reactive tier can repair a full
 // observed-burst-length reference hole inside the deadline budget — one honest
@@ -538,12 +532,16 @@ func reactiveRoundsFrom(budgetMicros, rttMicros int64) int {
 // in for the burst-length tail, matching the outage threshold's kappa. Where it
 // holds the extras are shed; where it fails they are the only protection that can
 // land, and stay on. The burst term is load-bearing: gating extras on the bare
-// cycle regressed low-rate burst48 at a 1.5×RTT budget by ~8 ffprobe frames (extras
-// off, retro too late for the early holes), while iid regimes (burst ≈ 1 symbol)
-// still shed the extras and their cost. coldBurstSyms is each profile's cold-start
+// cycle would release the coverage before a long burst can be observed, while iid
+// regimes (burst ≈ 1 symbol) can shed the extras and their cost. coldBurstSyms is
+// each profile's cold-start
 // stand-in (generation: GenSize; sliding: the effective band) — conservative:
 // extras stay on until the channel says bursts are short.
 func extrasReplaceable(bufferMicros, rttMicros, interMicros, coldBurstSyms int64, fbCount, burstQ8 int) bool {
+	return extrasReplaceableAtCycle(bufferMicros, reactiveCycleMicros(rttMicros), interMicros, coldBurstSyms, fbCount, burstQ8)
+}
+
+func extrasReplaceableAtCycle(bufferMicros, cycleMicros, interMicros, coldBurstSyms int64, fbCount, burstQ8 int) bool {
 	if bufferMicros <= 0 {
 		return false
 	}
@@ -554,10 +552,10 @@ func extrasReplaceable(bufferMicros, rttMicros, interMicros, coldBurstSyms int64
 	if fbCount >= coldStartFeedbacks && burstQ8 > 0 {
 		burstSyms = int64(burstQ8) >> 8
 	}
-	return reactiveCycleMicros(rttMicros)+2*burstSyms*interMicros <= bufferMicros
+	return cycleMicros+2*burstSyms*interMicros <= bufferMicros
 }
 
-// Reactive-repair (WP3) pacing constants. The sender retains closed generations
+// Reactive-repair pacing constants. The sender retains closed generations
 // and, on a feedback rank deficit, sends extra repair for the blocking
 // generation — debounced by an estimated RTT so a batch can arrive and update the
 // deficit before the next is sent (HARQ incremental redundancy).
@@ -567,7 +565,7 @@ const (
 	maxReactiveIntervalMicros = 500_000 // ceiling on it
 )
 
-// Redundancy controller (PLAN §3.5). The proactive code rate is sized FEED-FORWARD
+// The proactive code rate is sized feed-forward
 // to the target per-generation decode-failure probability (Config.TargetFailure)
 // from the receiver's reported channel erasure rate (wire.Feedback.LossRate),
 // covering the mean loss AND the binomial variance — the term a mean-tracking AIMD
@@ -581,6 +579,10 @@ const (
 	// maxRepairFactor caps the proactive code rate at this multiple of the
 	// generation size, bounding overhead under an extreme or mis-estimated loss.
 	maxRepairFactor = 3
+	// maxBlockSymbols bounds one systematic Cauchy block to 255 total source
+	// plus parity rows. The source and parity evaluation-point sets then remain
+	// disjoint in GF(256), giving the bounded block its MDS guarantee.
+	maxBlockSymbols = 255
 	// lossWindowMin is the smallest source-id span the receiver averages channel
 	// loss over before reporting; a wider span lowers estimator variance.
 	lossWindowMin = 64
@@ -604,16 +606,16 @@ const (
 	// the reactive tier (not the floor) covers the onset. Conservative (> 1) so feedback or
 	// reactive-repair loss during the onset still leaves a retry within budget.
 	reactiveFloorSafe = 2
-	// defaultMaxGenSymbols / defaultMaxRetainedGens are the resource-safety floors
-	// (N1): a forged symbol cannot allocate a decoder wider than the former or push
-	// the live-decoder count / look-ahead horizon past the latter.
+	// defaultMaxGenSymbols / defaultMaxRetainedGens are the resource-safety limits:
+	// a forged symbol cannot allocate a wider decoder or push the live-decoder count
+	// or look-ahead horizon beyond them.
 	defaultMaxGenSymbols   = 256
 	defaultMaxRetainedGens = 512
-	// defaultMaxBitrate is the sender's aggregate rate ceiling (100 Mbps, matching the
-	// libRIST recovery_maxbitrate default ethos): generous enough that legit media +
-	// repair pass untouched, low enough to clip a reactive-amplification storm.
+	// defaultMaxBitrate is the sender's aggregate rate ceiling (100 Mbps): generous
+	// enough that legitimate media and repair pass untouched, but finite enough to
+	// clip a reactive-amplification storm.
 	defaultMaxBitrate = 100_000_000
-	// symHeaderBytes is the on-wire symbol header length (wire format v1) — used only
+	// symHeaderBytes is the on-wire symbol base header length (wire format v1) — used only
 	// to size the congestion controller's per-packet MSS, not for encoding.
 	symHeaderBytes = 30
 	// lossHoldDecay slows the decay of the conservative max-hold loss estimate
@@ -647,11 +649,7 @@ const (
 	// of consecutive stamp gaps: an access unit's chunks are written in one burst with
 	// ONE stamp, so consecutive gaps are zeros (skipped) interleaved with whole-frame
 	// jumps, and a gap-EWMA converges to the per-BATCH interval — up to chunks-per-frame
-	// times the true per-id spacing. Every never-received id's extrapolated deadline
-	// then lands that factor too deep in the past, and a long loss run is mass-evicted
-	// long before its true deadlines (the "premature-drop residual": measured as the
-	// 2x-early eviction that defeated retrospective repair in the batched-write sim,
-	// and the 0.44 clean-link-with-jitter decodable rate in the LTR experiment).
+	// times the true per-id spacing, placing extrapolated deadlines too early.
 	intervalFitSpanIDs = 64
 	// outageCensorKappa and outageCensorHorizonFloor set the outage-classification
 	// threshold (Config.OutageAware): a loss run longer than
@@ -659,13 +657,8 @@ const (
 	// horizon is the observed remaining-usefulness span (arrival slack over the
 	// inter-symbol interval); kappa=2 keeps every plausibly-recoverable run (edges
 	// included) inside the estimators. The floor guards the HORIZON estimate against
-	// noise, deliberately NOT the threshold against small horizons: at low packet
-	// rates the true horizon is genuinely a few symbols (e.g. ~3 at 57 pkt/s under a
-	// 100 ms budget), and an absolute threshold floor of 16 was measured to miss
-	// real outages entirely there — the sender's own repair overhead dilutes a
-	// 48-datagram burst to ~12 consecutive SOURCE losses, each representing ~200 ms
-	// of dead channel against 50 ms of slack (the glassbench burst48 calibration
-	// run; see docs/decisions).
+	// noise, deliberately not the threshold against small horizons: at low packet
+	// rates the true recovery horizon can be only a few symbols.
 	outageCensorKappa        = 2
 	outageCensorHorizonFloor = 4
 )
@@ -878,7 +871,7 @@ func geTailGreater(n int, pGB, pBG, piB int64, r int) int64 {
 // clock, integer math so it is bit-reproducible). It refills at bytesPerSec and
 // admits a take only while tokens remain; a non-droppable take (media) always
 // proceeds and may drive tokens negative, so only the droppable surplus (repair) is
-// clipped. The N1 aggregate-emit ceiling against reactive amplification.
+// clipped. This is the aggregate-emit ceiling against reactive amplification.
 type tokenBucket struct {
 	bytesPerSec int64
 	tokens      int64
@@ -897,6 +890,19 @@ func newTokenBucket(bitsPerSec int64) tokenBucket {
 		burst = 1 << 16
 	}
 	return tokenBucket{bytesPerSec: bps, tokens: burst, burst: burst}
+}
+
+// limitStartupCredit reduces an initially full bucket to a short earned-capacity
+// bootstrap. The reservoir can still grow to its normal burst as time advances.
+func (tb *tokenBucket) limitStartupCredit(micros int64) {
+	initial := tb.bytesPerSec * micros / 1_000_000
+	if initial < 1<<12 {
+		initial = 1 << 12
+	}
+	if initial > tb.burst {
+		initial = tb.burst
+	}
+	tb.tokens = initial
 }
 
 // setRate updates the bucket's fill rate (bytes/sec) — how the congestion controller
@@ -948,8 +954,8 @@ func (tb *tokenBucket) allow(now clock.Timestamp, n int, droppable bool) bool {
 }
 
 // allowRepair is the priority-aware repair admission: repair AT OR ABOVE the baseline
-// tier (uepCenterTier) is admitted whenever any tokens remain (the unchanged N1
-// behavior — never pre-throttled, so it does not mask the congestion signal). Repair
+// tier (uepCenterTier) is admitted whenever any tokens remain. It is never
+// pre-throttled, so it does not mask the congestion signal. Repair
 // BELOW the baseline must clear a CUSHION that grows as the tier falls, so under budget
 // pressure the bucket sheds DISPOSABLE repair first, then enhancement — the
 // unequal-protection drop order (docs/media-awareness.md §4) — preserving the
@@ -959,15 +965,30 @@ func (tb *tokenBucket) allowRepair(now clock.Timestamp, n int, pri uint8) bool {
 		return true
 	}
 	tb.refill(now)
-	var cushion int64
-	if int(pri) < uepCenterTier {
-		cushion = tb.burst * int64(uepCenterTier-int(pri)) / int64(uepCenterTier+1)
-	}
-	if tb.tokens-int64(n) < cushion {
+	if !tb.repairAvailable(n, pri) {
 		return false
 	}
 	tb.tokens -= int64(n)
 	return true
+}
+
+// canRepairReserved is canRepair with an additional byte reserve that must remain
+// after admission. Optional recovery lanes use it to avoid consuming the next
+// source-triggered base equation's capacity.
+func (tb *tokenBucket) canRepairReserved(now clock.Timestamp, n int, pri uint8, reserve int) bool {
+	if tb.bytesPerSec <= 0 {
+		return true
+	}
+	tb.refill(now)
+	return tb.repairAvailable(n+reserve, pri)
+}
+
+func (tb *tokenBucket) repairAvailable(n int, pri uint8) bool {
+	var cushion int64
+	if int(pri) < uepCenterTier {
+		cushion = tb.burst * int64(uepCenterTier-int(pri)) / int64(uepCenterTier+1)
+	}
+	return tb.tokens-int64(n) >= cushion
 }
 
 // p65535ToPPM converts a wire loss field (parts per 65535) to parts per million —
@@ -1045,13 +1066,11 @@ func (c Config) fillCappedWidth(w int) int {
 // only where the budget can still absorb a burst's residual — proactively, or by one
 // reactive round. Below a reactive round (budget < RTT, the all-proactive regime) it stays
 // at GenSize, since a deadline-evicted wide generation loses more symbols at once with no
-// reactive recovery (measured: ~2% delivery loss at width 64, budget < RTT). The ramp is
-// gradual so an optimistic RTT hint degrades the width gracefully rather than off a cliff.
+// reactive recovery. The ramp is gradual so an optimistic RTT hint degrades gracefully.
 //
 // A NominalBitrateBps hint additionally caps the width by GENERATION FILL TIME (fillCappedWidth):
 // a wide generation only pays off when it fills fast, so at a high bitrate it widens fully and at a
-// low bitrate it stays near GenSize — the overhead win where it is free, a no-op where it would cost
-// latency (the cref bench shows p50 regressing 4-5× from a slow fill at 5 Mbps).
+// low bitrate it stays near GenSize, avoiding excess fill latency.
 func (c Config) genWidth() int {
 	base := c.GenSize
 	if base < 1 {

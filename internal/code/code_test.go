@@ -230,6 +230,74 @@ func TestDeficit(t *testing.T) {
 	}
 }
 
+func TestEncoderAddWithSuffixBounds(t *testing.T) {
+	enc := NewEncoder(8)
+	id := enc.AddWithSuffix([]byte{1, 2}, 5, []byte{3, 4, 5, 6})
+	got, ok := enc.Source(id)
+	if !ok || !bytes.Equal(got, []byte{1, 2, 0, 0, 0, 3, 4, 5}) {
+		t.Fatalf("bounded suffix = %v, ok=%v", got, ok)
+	}
+	enc.AddWithSuffix(nil, -10, []byte{1, 2}) // a fully clipped suffix must not panic
+}
+
+func TestBoundedCauchyRowsAreMDS(t *testing.T) {
+	const (
+		n       = 4
+		repairs = 4
+		symSize = 8
+	)
+	type row struct {
+		systematic bool
+		index      int
+		payload    []byte
+	}
+	enc := NewEncoder(symSize)
+	want := make([][]byte, n)
+	rows := make([]row, 0, n+repairs)
+	for i := 0; i < n; i++ {
+		want[i] = bytes.Repeat([]byte{byte(i + 1)}, symSize)
+		id := enc.Add(want[i])
+		payload, _ := enc.Source(id)
+		rows = append(rows, row{systematic: true, index: i, payload: append([]byte(nil), payload...)})
+	}
+	for key := 0; key < repairs; key++ {
+		_, _, payload := enc.Repair(BlockRepairKey(uint16(key)))
+		rows = append(rows, row{index: key, payload: append([]byte(nil), payload...)})
+	}
+
+	var chosen [n]int
+	var check func(depth, start int)
+	check = func(depth, start int) {
+		if depth < n {
+			for i := start; i <= len(rows)-(n-depth); i++ {
+				chosen[depth] = i
+				check(depth+1, i+1)
+			}
+			return
+		}
+		dec := NewDecoder(symSize, 0, n)
+		got := make(map[uint32][]byte, n)
+		for _, i := range chosen {
+			r := rows[i]
+			var recovered []Recovered
+			if r.systematic {
+				recovered = dec.AddSystematic(uint32(r.index), r.payload)
+			} else {
+				recovered = dec.AddRepair(0, n, BlockRepairKey(uint16(r.index)), r.payload)
+			}
+			for _, x := range recovered {
+				got[x.ID] = append([]byte(nil), x.Data...)
+			}
+		}
+		for id, payload := range want {
+			if !bytes.Equal(got[uint32(id)], payload) {
+				t.Fatalf("rows %v did not recover id %d: got %v want %v", chosen, id, got[uint32(id)], payload)
+			}
+		}
+	}
+	check(0, 0)
+}
+
 // TestEncoderSlide checks window eviction and Source lookup.
 func TestEncoderSlide(t *testing.T) {
 	rng := rand.New(rand.NewSource(9))

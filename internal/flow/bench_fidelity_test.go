@@ -22,13 +22,17 @@ func TestReactiveBreakdown(t *testing.T) {
 		burst     = 2.0
 		mult      = 4.0
 	)
-	cfg := Config{Flow: 1, SymbolSize: 1316, GenSize: 16, Redundancy: 0.15, TargetFailure: 1e-3,
-		BufferMicros: int64(mult * 100_000), AutoGenSize: true, ProactiveDecay: true, RepairWithinBudget: true}
+	cfg := Config{
+		Flow: 1, SymbolSize: 1316, GenSize: 16, Redundancy: 0.15, TargetFailure: 1e-3,
+		BufferMicros: int64(mult * 100_000), AutoGenSize: true, ProactiveDecay: true, RepairWithinBudget: true,
+	}
 	for _, jit := range []int64{0, 80_000} {
 		var src, pro, react, thr, pest, bq8 float64
 		for s := int64(1); s <= seeds; s++ {
-			sl := simLink{cfg: cfg, owdMicros: owd, srcMicros: srcMicros, n: n, drop: geDrop(s, loss, burst),
-				paceBytesPerSec: 12_500_000, timingJitterMicros: jit}
+			sl := simLink{
+				cfg: cfg, owdMicros: owd, srcMicros: srcMicros, n: n, drop: geDrop(s, loss, burst),
+				paceBytesPerSec: 12_500_000, timingJitterMicros: jit,
+			}
 			if jit > 0 {
 				sl.timingSeed = s*7919 + 1
 			}
@@ -62,14 +66,18 @@ func TestAutoReorderHoldoffScreen(t *testing.T) {
 		pace      = 12_500_000
 	)
 	mk := func(fixed int64, auto bool, mult float64) Config {
-		return Config{Flow: 1, SymbolSize: 1316, GenSize: 16, Redundancy: 0.15, TargetFailure: 1e-3,
+		return Config{
+			Flow: 1, SymbolSize: 1316, GenSize: 16, Redundancy: 0.15, TargetFailure: 1e-3,
 			BufferMicros: int64(mult * 100_000), AutoGenSize: true, ProactiveDecay: true, RepairWithinBudget: true,
-			ReorderHoldoffMicros: fixed, AutoReorderHoldoff: auto}
+			ReorderHoldoffMicros: fixed, AutoReorderHoldoff: auto,
+		}
 	}
 	agg := func(fixed int64, auto bool, mult, loss float64, jit int64) (deliv, ovh float64) {
 		for s := int64(1); s <= seeds; s++ {
-			sl := simLink{cfg: mk(fixed, auto, mult), owdMicros: owd, srcMicros: srcMicros, n: n,
-				drop: geDrop(s, loss, 2), paceBytesPerSec: pace, timingJitterMicros: jit}
+			sl := simLink{
+				cfg: mk(fixed, auto, mult), owdMicros: owd, srcMicros: srcMicros, n: n,
+				drop: geDrop(s, loss, 2), paceBytesPerSec: pace, timingJitterMicros: jit,
+			}
 			if jit > 0 {
 				sl.timingSeed = s*7919 + 1
 			}
@@ -77,7 +85,7 @@ func TestAutoReorderHoldoffScreen(t *testing.T) {
 			deliv += 100 * float64(res.delivered) / float64(n) / seeds
 			ovh += 100 * res.overhead() / seeds
 		}
-		return
+		return deliv, ovh
 	}
 	t.Logf("AutoReorderHoldoff screen, 4×RTT, %d seeds | arm: deliv%% / ovhd%%", seeds)
 	t.Logf("REORDER regime (1%% loss, 80ms jitter) — auto must cut overhead like fixed:")
@@ -100,12 +108,10 @@ func TestAutoReorderHoldoffScreen(t *testing.T) {
 	}
 }
 
-// TestReorderHoldoffScreen is the pre-registered screen for the loss-estimate reorder window. The
-// breakdown showed the real-timing over-send is PROACTIVE — the receiver reports a fictitious ~50%
-// loss + high burstiness under reorder, inflating the set-point ~10×. Pre-registered bar: cut overhead
-// at 1% loss toward the ~17% the jitter-free sim proves sufficient, WITHOUT dropping delivery below its
-// A/A floor or raising p99 beyond it. Screen only; the verdict waits for cref. Several holdoff values
-// are swept to find the smallest that captures the win (less onset-responsiveness cost).
+// TestReorderHoldoffScreen evaluates the loss-estimate reorder window. Real-timing
+// oversend is proactive: reorder can look like high loss and burstiness to the
+// receiver, inflating the repair set point. Several holdoff values are swept to
+// find the smallest that reduces this overhead without harming delivery or p99.
 func TestReorderHoldoffScreen(t *testing.T) {
 	if os.Getenv("AUTORED_SWEEP") == "" {
 		t.Skip("set AUTORED_SWEEP=1 to run the reorder-holdoff screen")
@@ -121,15 +127,19 @@ func TestReorderHoldoffScreen(t *testing.T) {
 		jit       = 80_000
 	)
 	cfg := func(holdoff int64, mult float64) Config {
-		return Config{Flow: 1, SymbolSize: 1316, GenSize: 16, Redundancy: 0.15, TargetFailure: 1e-3,
+		return Config{
+			Flow: 1, SymbolSize: 1316, GenSize: 16, Redundancy: 0.15, TargetFailure: 1e-3,
 			BufferMicros: int64(mult * 100_000), AutoGenSize: true, ProactiveDecay: true,
-			RepairWithinBudget: true, ReorderHoldoffMicros: holdoff}
+			RepairWithinBudget: true, ReorderHoldoffMicros: holdoff,
+		}
 	}
 	agg := func(holdoff int64, mult float64) (dmean, dlo, dhi, p99, ovh float64) {
 		var ds []float64
 		for s := int64(1); s <= seeds; s++ {
-			sl := simLink{cfg: cfg(holdoff, mult), owdMicros: owd, srcMicros: srcMicros, n: n,
-				drop: geDrop(s, loss, burst), paceBytesPerSec: pace, timingJitterMicros: jit, timingSeed: s*7919 + 1}
+			sl := simLink{
+				cfg: cfg(holdoff, mult), owdMicros: owd, srcMicros: srcMicros, n: n,
+				drop: geDrop(s, loss, burst), paceBytesPerSec: pace, timingJitterMicros: jit, timingSeed: s*7919 + 1,
+			}
 			res := sl.run()
 			d := 100 * float64(res.delivered) / float64(n)
 			ds = append(ds, d)
@@ -169,12 +179,16 @@ func TestBenchMapDefault(t *testing.T) {
 		burst     = 2.0
 	)
 	cfg := func(mult float64) Config {
-		return Config{Flow: 1, SymbolSize: 1316, GenSize: 16, Redundancy: 0.15, TargetFailure: 1e-3,
-			BufferMicros: int64(mult * 100_000), AutoGenSize: true, ProactiveDecay: true, RepairWithinBudget: true}
+		return Config{
+			Flow: 1, SymbolSize: 1316, GenSize: 16, Redundancy: 0.15, TargetFailure: 1e-3,
+			BufferMicros: int64(mult * 100_000), AutoGenSize: true, ProactiveDecay: true, RepairWithinBudget: true,
+		}
 	}
-	run := func(mult, paceBps float64, jit int64, seed int64) (deliv, p99, ovh float64) {
-		sl := simLink{cfg: cfg(mult), owdMicros: owd, srcMicros: srcMicros, n: n,
-			drop: geDrop(seed, loss, burst), paceBytesPerSec: int64(paceBps), timingJitterMicros: jit}
+	run := func(mult, paceBps float64, jit, seed int64) (deliv, p99, ovh float64) {
+		sl := simLink{
+			cfg: cfg(mult), owdMicros: owd, srcMicros: srcMicros, n: n,
+			drop: geDrop(seed, loss, burst), paceBytesPerSec: int64(paceBps), timingJitterMicros: jit,
+		}
 		if jit > 0 {
 			sl.timingSeed = seed*7919 + 1
 		}

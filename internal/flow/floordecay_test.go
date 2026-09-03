@@ -1,7 +1,7 @@
 package flow
 
-// Tests for the DEFAULT-ON sliding confirmed-clean floor decay (PREREG Amendment
-// 7): the strict composite keying of cleanRun (any loss signal resets it), the
+// Tests for the default-on sliding confirmed-clean floor decay: settled-loss
+// keying of cleanRun, the
 // structural eligibility gate (rounds >= reactiveFloorSafe), the clean-link
 // overhead collapse it exists for, and the onset-burst-after-confirmed-clean
 // recovery that makes it safe (the floor re-arms on first evidence and the
@@ -14,11 +14,13 @@ import (
 	"github.com/zsiec/meld/internal/wire"
 )
 
-// TestCleanRunCompositeKeying pins the strict composite: every one of the four
-// loss signals independently resets cleanRun; only an all-quiet report counts.
-func TestCleanRunCompositeKeying(t *testing.T) {
-	cfg := Config{Flow: 1, SymbolSize: testSym, Sliding: true, CodingWindow: 16,
-		Redundancy: 0.15, BufferMicros: 200_000}
+// TestCleanRunUsesSettledLoss pins the sender's clean-evidence input and its
+// saturation behavior.
+func TestCleanRunUsesSettledLoss(t *testing.T) {
+	cfg := Config{
+		Flow: 1, SymbolSize: testSym, Sliding: true, CodingWindow: 16,
+		Redundancy: 0.15, BufferMicros: 200_000,
+	}
 	s := NewSlidingSender(cfg)
 	now := clock.Timestamp(0)
 	for i := 0; i < 8; i++ {
@@ -34,31 +36,19 @@ func TestCleanRunCompositeKeying(t *testing.T) {
 		drainSlidingSymbols(t, s)
 	}
 	quiet := wire.Feedback{Flow: 1, HighestSeen: 8, DecodedLowEdge: 8}
-	dirty := []struct {
-		name string
-		fb   wire.Feedback
-	}{
-		{"LossRate", wire.Feedback{Flow: 1, HighestSeen: 8, DecodedLowEdge: 8, LossRate: 1}},
-		{"CongestionLoss", wire.Feedback{Flow: 1, HighestSeen: 8, DecodedLowEdge: 8, CongestionLoss: 1}},
-		{"Deficit", wire.Feedback{Flow: 1, HighestSeen: 8, DecodedLowEdge: 8, Deficit: 1}},
-		{"Missing", wire.Feedback{Flow: 1, HighestSeen: 8, DecodedLowEdge: 8, Missing: 1}},
-	}
-	for _, d := range dirty {
-		for i := 0; i < 3; i++ {
-			now = now.Add(20_000)
-			offer()
-			s.FeedFeedback(now, quiet)
-		}
-		if s.cleanRun != 3 {
-			t.Fatalf("%s: cleanRun after 3 quiet reports = %d, want 3", d.name, s.cleanRun)
-		}
+	for i := 0; i < 3; i++ {
 		now = now.Add(20_000)
 		offer()
-		s.FeedFeedback(now, d.fb)
-		if s.cleanRun != 0 {
-			t.Fatalf("%s: dirty report did not reset cleanRun (= %d)", d.name, s.cleanRun)
-		}
-		drainSlidingSymbols(t, s) // a Deficit report may emit reactive symbols; keep the queue clean
+		s.FeedFeedback(now, quiet)
+	}
+	if s.cleanRun != 3 {
+		t.Fatalf("cleanRun after 3 quiet reports = %d, want 3", s.cleanRun)
+	}
+	now = now.Add(20_000)
+	offer()
+	s.FeedFeedback(now, wire.Feedback{Flow: 1, HighestSeen: 8, DecodedLowEdge: 8, SettledLost: 1})
+	if s.cleanRun != 0 {
+		t.Fatalf("settled loss did not reset cleanRun (= %d)", s.cleanRun)
 	}
 	// The counter saturates at the confirm threshold and stays there while quiet.
 	for i := 0; i < cleanFloorConfirm+8; i++ {
@@ -75,8 +65,10 @@ func TestCleanRunCompositeKeying(t *testing.T) {
 // decays the floor only where the budget affords reactiveFloorSafe honest
 // reactive rounds, independent of any opt-in flag.
 func TestFloorDecayEligibilityGate(t *testing.T) {
-	cfg := Config{Flow: 1, SymbolSize: testSym, Sliding: true, CodingWindow: 16,
-		Redundancy: 0.15, BufferMicros: 200_000}
+	cfg := Config{
+		Flow: 1, SymbolSize: testSym, Sliding: true, CodingWindow: 16,
+		Redundancy: 0.15, BufferMicros: 200_000,
+	}
 	s := NewSlidingSender(cfg)
 	s.cleanRun = cleanFloorConfirm
 	if s.floorDecayed(reactiveFloorSafe - 1) {
@@ -98,8 +90,10 @@ func floorDecaySim(cfg Config, n int, drop func(wire.Symbol) bool) simResult {
 	if drop == nil {
 		drop = func(wire.Symbol) bool { return false }
 	}
-	return simLink{cfg: cfg, owdMicros: 30_000, srcMicros: 500, n: n,
-		sliding: true, drop: drop}.run()
+	return simLink{
+		cfg: cfg, owdMicros: 30_000, srcMicros: 500, n: n,
+		sliding: true, drop: drop,
+	}.run()
 }
 
 // TestFloorDecayCollapsesCleanOverhead is the sim form of the arc's win: on a
@@ -109,8 +103,10 @@ func floorDecaySim(cfg Config, n int, drop func(wire.Symbol) bool) simResult {
 func TestFloorDecayCollapsesCleanOverhead(t *testing.T) {
 	t.Parallel()
 	const n = 8_000 // 4 s at the 500 us cadence: ~1.3 s to confirm, ~2.7 s decayed
-	cfg := Config{Flow: 1, SymbolSize: testSym, Sliding: true, CodingWindow: 32,
-		Redundancy: 0.15, BufferMicros: 200_000}
+	cfg := Config{
+		Flow: 1, SymbolSize: testSym, Sliding: true, CodingWindow: 32,
+		Redundancy: 0.15, BufferMicros: 200_000,
+	}
 	res := floorDecaySim(cfg, n, nil)
 	assertCoreInvariants(t, res, n, "clean decay")
 	if res.delivered != n {
@@ -145,15 +141,19 @@ func TestFloorDecayOnsetBurstRecovered(t *testing.T) {
 		burstFrom = 7_200 // ~3.6 s in: long after cleanRun confirms at ~1.3 s
 		burstTo   = 7_264 // 64 consecutive source ids (~32 ms outage)
 	)
-	cfg := Config{Flow: 1, SymbolSize: testSym, Sliding: true, CodingWindow: 32,
-		Redundancy: 0.15, BufferMicros: 200_000}
+	cfg := Config{
+		Flow: 1, SymbolSize: testSym, Sliding: true, CodingWindow: 32,
+		Redundancy: 0.15, BufferMicros: 200_000,
+	}
 	drop := func(sym wire.Symbol) bool {
 		return sym.Kind == wire.Systematic && sym.SrcIndex >= burstFrom && sym.SrcIndex < burstTo
 	}
 	s := NewSlidingSender(cfg)
 	r := NewSlidingReceiver(cfg)
-	res := simLink{cfg: cfg, owdMicros: 30_000, srcMicros: 500, n: n,
-		sliding: true, drop: drop}.runCores(s, r)
+	res := simLink{
+		cfg: cfg, owdMicros: 30_000, srcMicros: 500, n: n,
+		sliding: true, drop: drop,
+	}.runCores(s, r)
 	assertCoreInvariants(t, res, n, "onset burst after confirmed clean")
 	if res.delivered != n {
 		t.Fatalf("onset burst not recovered: delivered %d/%d", res.delivered, n)
@@ -180,11 +180,12 @@ func TestFloorDecayOnsetBurstRecovered(t *testing.T) {
 
 // TestCleanRunSettledEvidence pins the settled-evidence keying (arc 8): when the
 // peer reports the settled tail, SettledLost==0 counts clean even while the
-// raw-order signals read dirty (reorder ghosts), SettledLost>0 resets, and a
-// peer without the tail falls back to the strict raw composite.
+// raw-order signals read dirty (reorder ghosts), while SettledLost>0 resets it.
 func TestCleanRunSettledEvidence(t *testing.T) {
-	cfg := Config{Flow: 1, SymbolSize: testSym, Sliding: true, CodingWindow: 16,
-		Redundancy: 0.15, BufferMicros: 200_000}
+	cfg := Config{
+		Flow: 1, SymbolSize: testSym, Sliding: true, CodingWindow: 16,
+		Redundancy: 0.15, BufferMicros: 200_000,
+	}
 	s := NewSlidingSender(cfg)
 	now := clock.Timestamp(0)
 	for i := 0; i < 8; i++ {
@@ -200,9 +201,11 @@ func TestCleanRunSettledEvidence(t *testing.T) {
 		next++
 		drainSlidingSymbols(t, s)
 	}
-	ghost := wire.Feedback{Flow: 1, HighestSeen: 8, DecodedLowEdge: 8,
+	ghost := wire.Feedback{
+		Flow: 1, HighestSeen: 8, DecodedLowEdge: 8,
 		LossRate: 300, CongestionLoss: 2, Deficit: 1, Missing: 0b10,
-		HasSettled: true, SettledLost: 0}
+		SettledLost: 0,
+	}
 	for i := 0; i < 5; i++ {
 		now = now.Add(20_000)
 		offer()
@@ -215,23 +218,12 @@ func TestCleanRunSettledEvidence(t *testing.T) {
 	// Settled loss resets regardless of quiet raw signals.
 	now = now.Add(20_000)
 	offer()
-	s.FeedFeedback(now, wire.Feedback{Flow: 1, HighestSeen: 8, DecodedLowEdge: 8,
-		HasSettled: true, SettledLost: 3})
+	s.FeedFeedback(now, wire.Feedback{
+		Flow: 1, HighestSeen: 8, DecodedLowEdge: 8,
+		SettledLost: 3,
+	})
 	if s.cleanRun != 0 {
 		t.Fatalf("settled loss did not reset cleanRun (= %d)", s.cleanRun)
-	}
-	// Old peer (no tail): the raw composite governs — a dirty signal resets.
-	now = now.Add(20_000)
-	offer()
-	s.FeedFeedback(now, wire.Feedback{Flow: 1, HighestSeen: 8, DecodedLowEdge: 8})
-	if s.cleanRun != 1 {
-		t.Fatalf("legacy quiet report = %d, want 1", s.cleanRun)
-	}
-	now = now.Add(20_000)
-	offer()
-	s.FeedFeedback(now, wire.Feedback{Flow: 1, HighestSeen: 8, DecodedLowEdge: 8, CongestionLoss: 1})
-	if s.cleanRun != 0 {
-		t.Fatalf("legacy dirty report did not reset cleanRun (= %d)", s.cleanRun)
 	}
 }
 
@@ -239,14 +231,18 @@ func TestCleanRunSettledEvidence(t *testing.T) {
 // counts settled loss once the adaptive window has learned the spread, while a
 // real gap counts after the holdoff.
 func TestSettledWalkAdjudicatesReorder(t *testing.T) {
-	cfg := Config{Flow: 1, SymbolSize: testSym, Sliding: true, CodingWindow: 16,
-		Redundancy: 0.15, BufferMicros: 200_000}
+	cfg := Config{
+		Flow: 1, SymbolSize: testSym, Sliding: true, CodingWindow: 16,
+		Redundancy: 0.15, BufferMicros: 200_000,
+	}
 	r := NewSlidingReceiver(cfg)
 	now := clock.Timestamp(0)
 	feed := func(id uint32) {
-		r.FeedSymbol(now, wire.EncodeSymbol(nil, wire.Symbol{Flow: 1, Kind: wire.Systematic,
+		r.FeedSymbol(now, wire.EncodeSymbol(nil, wire.Symbol{
+			Flow: 1, Kind: wire.Systematic,
 			SrcIndex: id, Deadline: int64(now.Add(cfg.BufferMicros)),
-			Payload: makeChunkN(id)}))
+			Payload: makeChunkN(id),
+		}))
 	}
 	// Adjacent swaps at 1ms spacing: pure reorder, zero loss. The fixed holdoff
 	// (budget/8, >= 10ms) far exceeds the swap spread, so nothing ever settles lost.
@@ -277,7 +273,7 @@ func TestSettledWalkAdjudicatesReorder(t *testing.T) {
 	}
 }
 
-// TestFloorDecayArmsUnderReorder is the arc-8 win in sim form: on a CLEAN link
+// TestFloorDecayArmsUnderReorder verifies that, on a clean link
 // with deterministic reorder (the regime where the raw composite reads dirty on
 // nearly every report and today's decay never arms), the settled evidence arms
 // the decay and the overhead collapses below the floor — at full delivery. The
@@ -285,21 +281,25 @@ func TestSettledWalkAdjudicatesReorder(t *testing.T) {
 func TestFloorDecayArmsUnderReorder(t *testing.T) {
 	t.Parallel()
 	const n = 8_000
-	cfg := Config{Flow: 1, SymbolSize: testSym, Sliding: true, CodingWindow: 32,
-		Redundancy: 0.15, BufferMicros: 200_000}
+	cfg := Config{
+		Flow: 1, SymbolSize: testSym, Sliding: true, CodingWindow: 32,
+		Redundancy: 0.15, BufferMicros: 200_000,
+	}
 	s := NewSlidingSender(cfg)
 	rr := NewSlidingReceiver(cfg)
-	sl := simLink{cfg: cfg, owdMicros: 30_000, srcMicros: 500, n: n, sliding: true,
+	sl := simLink{
+		cfg: cfg, owdMicros: 30_000, srcMicros: 500, n: n, sliding: true,
 		jitterMicros: 3_000, // deterministic per-datagram delay: deep reorder, zero loss
-		drop:         func(wire.Symbol) bool { return false }}
+		drop:         func(wire.Symbol) bool { return false },
+	}
 	var lastTap clock.Timestamp
 	sl.fbTap = func(now clock.Timestamp, fb wire.Feedback) {
 		if now.Sub(lastTap) < 200_000 {
 			return
 		}
 		lastTap = now
-		t.Logf("tap t=%.2f settled=%d hasSettled=%v lr=%d cl=%d def=%d cleanRun=%d rate=%.3f",
-			float64(now)/1e6, fb.SettledLost, fb.HasSettled, fb.LossRate, fb.CongestionLoss,
+		t.Logf("tap t=%.2f settled=%d lr=%d cl=%d def=%d cleanRun=%d rate=%.3f",
+			float64(now)/1e6, fb.SettledLost, fb.LossRate, fb.CongestionLoss,
 			fb.Deficit, s.cleanRun, s.codeRate())
 	}
 	res := sl.runCores(s, rr)
@@ -321,8 +321,10 @@ func TestFloorDecayArmsUnderReorder(t *testing.T) {
 	// Lossy control (same reorder): settled losses are real; the decay must not arm.
 	s2 := NewSlidingSender(cfg)
 	r2 := NewSlidingReceiver(cfg)
-	resL := simLink{cfg: cfg, owdMicros: 30_000, srcMicros: 500, n: n, sliding: true,
-		jitterMicros: 3_000, drop: uniformDrop(0xA5A5A5, 0.02)}.runCores(s2, r2)
+	resL := simLink{
+		cfg: cfg, owdMicros: 30_000, srcMicros: 500, n: n, sliding: true,
+		jitterMicros: 3_000, drop: uniformDrop(0xA5A5A5, 0.02),
+	}.runCores(s2, r2)
 	assertCoreInvariants(t, resL, n, "lossy reordered control")
 	if s2.cleanRun >= cleanFloorConfirm {
 		t.Fatalf("cleanRun = %d on a 2%% loss link, must stay below %d", s2.cleanRun, cleanFloorConfirm)

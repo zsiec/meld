@@ -1,269 +1,178 @@
-# Meld wire format (pinned, v1)
+# Meld wire format (version 1)
 
-The on-wire encoding of the narrow waist (`internal/wire`): the **Symbol** (media-
-bearing) and the **Feedback** report. This document is the authority; the codec
-mirrors it. All multi-byte fields are **big-endian**. The codec never panics on
-malformed input — short, mis-versioned, or corrupt buffers return a sentinel error
-(`ErrShort`, `ErrType`, `ErrVersion`).
+This document defines the on-wire encoding implemented by `internal/wire`. All
+multi-byte integers are big-endian. A decoder returns `ErrShort`, `ErrType`,
+`ErrVersion`, or `ErrInvalid` for malformed input and never panics.
 
-> **Status:** v1, pinned 2026-06-21 (roadmap N0). Meld is pre-deployment; v0 (the
-> unversioned 27-byte prototype headers) was never shipped and has no compatibility
-> obligation. v1 is the first explicitly-versioned format.
+Version 1 is the sole research format. The repository does not encode or decode
+any preceding layout.
 
-## Versioning — the forcing function
+## Datagram lead byte
 
-Every datagram's **leading byte** packs the format version and the message type:
+Every datagram begins with:
 
-```
-byte0 = (Version << 4) | type      // Version = 1 (high nibble), type (low nibble)
+```text
+byte0 = (1 << 4) | type
 ```
 
-| type nibble | message |
+| type | message |
 |---|---|
-| `0x1` | Systematic symbol (one source symbol, verbatim) |
-| `0x2` | Repair symbol (random linear combination over a window) |
-| `0x3` | Feedback report (receiver → sender) |
-| `0x4` | Clock probe (receiver → sender): `T0` (9 bytes) — N4 offset handshake |
-| `0x5` | Clock echo (sender → receiver): `T0,T1,T2` (25 bytes) — the probe reply |
-| `0x6` | Handshake message 1 (initiator → responder) — encryption (below) |
-| `0x7` | Handshake message 2 (responder → initiator) |
-| `0x8` | Cookie reply (responder → initiator) — mac2 anti-amplification, under load |
-| `0x9` | MTU probe (sender → receiver): padded DPLPMTUD probe |
-| `0xA` | MTU probe acknowledgement (receiver → sender) |
-| `0xB` | Sparse repair symbol (repair over explicit source ids) |
+| `0x1` | systematic symbol |
+| `0x2` | contiguous repair symbol |
+| `0x3` | feedback report |
+| `0x4` | clock probe |
+| `0x5` | clock echo |
+| `0x6` | handshake message 1 |
+| `0x7` | handshake message 2 |
+| `0x8` | handshake cookie reply |
+| `0x9` | MTU probe |
+| `0xA` | MTU probe acknowledgement |
+| `0xB` | sparse repair symbol |
+| `0xC` | exact unit repair |
 
-A decoder checks the version nibble **first**: a datagram whose version it does not
-understand returns `ErrVersion` rather than misparsing — so a field added in a later
-revision can never decode as silent garbage in an older peer. `ErrVersion` is
-reported before `ErrType` (a mis-versioned datagram is named as such, not as an
-unknown type).
+The version nibble is validated before the type nibble. Any version other than
+1 is rejected with `ErrVersion`.
 
-### Extension policy (how N1/N2/N4 add fields without colliding)
+## Symbol messages
 
-- **Additive optional field** → append to the **tail** under the *same* version,
-  gated by a Symbol `Flags` bit (symbols) or a length check (feedback). An older
-  decoder reads the base layout it knows and ignores the rest. **No version bump.**
-- **Incompatible base-layout change** (moving/resizing an existing field) → **bump
-  the version nibble.** Old peers cleanly reject with `ErrVersion`.
+Systematic, contiguous repair, sparse repair, and unit repair share this
+30-byte base header:
 
-The near-term roadmap fields have all landed this way:
+| offset | size | field | meaning |
+|---:|---:|---|---|
+| 0 | 1 | `ver\|type` | version 1 and symbol type |
+| 1 | 4 | `Flow` | flow identifier |
+| 5 | 2 | `Epoch` | flow/key generation |
+| 7 | 1 | `PathID` | host-selected path; zero on a single path |
+| 8 | 4 | `WindowBase` | low edge of the coding set |
+| 12 | 4 | `SrcIndex` | source id or repair sequence |
+| 16 | 2 | `N` | coding width or sparse-id count |
+| 18 | 2 | `RepairKey` | coefficient key |
+| 20 | 1 | `Priority` | protection tier |
+| 21 | 8 | `Deadline` | decode-by time in sender-clock microseconds |
+| 29 | 1 | `Flags` | bit 0 send time, bit 1 frame descriptor, bit 2 source length |
 
-| field | message | how |
-|---|---|---|
-| `CongestionLoss` (pre-recovery wire loss, N1) | Feedback | tail append, length-gated |
-| `Burstiness` (loss-run / GE estimate, N2) | Feedback | tail append, length-gated |
-| `EcnCE` (CE-marked fraction, N3 / L4S) | Feedback | base field, now populated |
-| per-path loss + erasure-count histogram (N5, **N paths**) | Feedback | variable tail section (below) |
-| media damage counters (N6) | Feedback | tail append after the per-path section |
-| frame dependency (`FrameRefs`, WP6) | Symbol | `flagDesc` tail extension (below) |
-| `NewestDecodableLTR` + `BrokenAnchors` (LTR resync) | Feedback | tail append after the media counters |
-| LTR-candidate flag (`descFlags` bit 4, LTR resync) | Symbol | new bit in the existing `flagDesc` extension |
+Flagged extensions follow in a fixed order:
 
-`PathID` (N5) is the one exception that is **not** a tail extension: a path id is a
-structural property of every symbol (single path is just path 0), not an optional
-measurement, so it lands as a **base header field**. Meld is pre-deployment with no
-compatibility obligation (see Status), so the v1 base layout absorbed it directly
-rather than spending a `Flags` bit and an extension on a field every multipath symbol
-carries; the version nibble stays 1.
+1. If bit 0 is set, `SendTimestamp` is an 8-byte signed timestamp.
+2. If bit 1 is set, a frame descriptor contains `FrameStart` (4), `FrameLen`
+   (2), descriptor flags (1), reference count (1), then that many 4-byte source
+   ids. The reference count is bounded to 15 when decoded by the flow.
+3. If bit 2 is set, `SourceLength` is a 4-byte unsigned integer.
 
-The cross-host clock offset (N4) is carried by the dedicated probe/echo messages
-above (cheap, periodic — not on every symbol), so the per-symbol `SendTimestamp`
-(now implemented as the `flagSendTS` header extension above) is only a *refinement*
-(finer one-way-delay-variation tracking, the QUIC-TS trick), not required for the
-offset itself.
+A sparse repair then carries `N` 4-byte source ids before its payload. `N` must
+be in `[1,64]`.
 
-## Symbol header (30-byte base, then optional extension, then payload)
+### Source representation
 
-| off | size | field | meaning |
-|----:|----:|---|---|
-| 0 | 1 | `ver\|type` | version nibble + `0x1`/`0x2`/`0xB` |
-| 1 | 4 | `Flow` | flow id |
-| 5 | 2 | `Epoch` | flow generation; bumps on flow reset / key update (reserved; 0) |
-| 7 | 1 | `PathID` | host-stamped path the symbol was sent on (0 = single path / path 0; N5) |
-| 8 | 4 | `WindowBase` | low edge of the coding window |
-| 12 | 4 | `SrcIndex` | Systematic: source id · Repair: repair counter |
-| 16 | 2 | `N` | Repair: window width covered |
-| 18 | 2 | `RepairKey` | Repair: GF(2⁸) coefficient PRNG seed |
-| 20 | 1 | `Priority` | descriptor: protection tier (0 = most disposable) |
-| 21 | 8 | `Deadline` | descriptor: decode-by, clock microseconds (i64) |
-| 29 | 1 | `Flags` | bit 0 `flagSendTS` ⇒ send-timestamp ext; bit 1 `flagDesc` ⇒ frame-descriptor ext |
-| +8 | 8 | `SendTimestamp` | ext, present iff `flagSendTS` — sender clock µs at emission (N4) |
-| ext | 8 + 4·`nRefs` | frame descriptor | ext, present iff `flagDesc` — head `FrameStart`(4) `FrameLen`(2) `descFlags`(1) `nRefs`(1), then `nRefs`×`RefStart`(4); WP6 |
-| ext | 4·`N` | sparse source ids | present iff type is `0xB`: `N`×`SparseID`(4), before payload |
-| … | — | `Payload` | coded bytes, sized to the validated path MTU |
+A systematic symbol normally sets `SourceLength` and carries exactly that many
+source bytes. A full-width systematic payload may omit the field when its length
+is exactly the configured `SymbolSize`. A unit repair always names one retained
+source (`WindowBase=SrcIndex`, `N=1`) and carries its exact bytes. Receivers reject
+ambiguous or over-wide source representations.
 
-The two extensions follow the 30-byte base in a **fixed order** (send timestamp, then frame
-descriptor), each gated by its Flags bit, so the decoder walks them by flag. The **frame
-descriptor** (WP6) is stamped on SYSTEMATIC symbols only and lets the receiver compute loss
-propagation parse-free: `FrameStart` is the access unit's first source id (its identity, and
-with `FrameLen` its exact id range `[FrameStart, FrameStart+FrameLen)`); `descFlags` bit 0 =
-RAP (keyframe), bit 1 = discardable, bit 2 = non-picture metadata/parameter material, bit 3 =
-recovery-refresh, bit 4 = long-term-reference candidate (the encoder retains this frame; the
-receiver reports the newest decodable one in `NewestDecodableLTR` as the resync anchor);
-`nRefs` (≤ 15) is the number of dependency frames, each a `RefStart` (a referenced frame's first source id). The references are **exact and
-variable-length** — a B-picture carries its two bracketing anchors, a P-picture one — so the
-receiver tracks the dependency tree the shaper resolved (POC bracketing / AV1's reference
-buffer). Coding rebuilds payloads, not headers, so a recovered symbol carries no descriptor —
-the receiver infers frames it did not directly receive (`internal/flow` FrameStats).
+The flow's algebraic source width is `SymbolSize + 12`. The private 12-byte
+suffix holds the source length as a uint32 and its exact deadline as an int64.
+The receiver reconstructs this suffix before admitting a systematic or unit
+value to the decoder. Consequently a recovered source retains its own length and
+deadline.
 
-A **Systematic** symbol carries one source symbol verbatim (`N`/`RepairKey` unused);
-a **Repair** symbol carries a random linear combination, where `WindowBase`+`N`
-delimit the spanned window and `RepairKey` regenerates the coefficients
-(`internal/code.GenCoeffs`). A **SparseRepair** symbol carries a random linear
-combination over explicit source ids listed after the optional header extensions;
-`N` is the number of ids and is capped at 64 by the decoder. `PathID` is set by the multipath scheduler
-(`internal/flow.pathScheduler`); the host transmits the symbol on that path and the
-receiver attributes its arrival/loss to that path for the co-loss estimate.
+### Repair representation
 
-## Feedback report (53-byte base + length-gated tails)
+A contiguous repair covers:
 
-Cumulative and idempotent — *state, not events* — so a lost report costs nothing;
-the next carries the same truth, advanced. The encoder always writes the fullest
-form; the decoder reads each tail group only when the buffer is long enough, so an
-earlier-prefix peer ignores fields it does not know (no version bump).
-
-| off | size | field | meaning |
-|----:|----:|---|---|
-| 0 | 1 | `ver\|type` | version nibble + `0x3` |
-| 1 | 4 | `Flow` | flow id |
-| 5 | 2 | `Epoch` | flow generation (mirrors Symbol.Epoch; reserved; 0) |
-| 7 | 4 | `DecodedLowEdge` | everything below this source id is recovered + delivered |
-| 11 | 4 | `HighestSeen` | highest source id observed (gap = work outstanding) |
-| 15 | 2 | `Deficit` | extra independent symbols the live window needs (== `Deficits[0]`) |
-| 17 | 2 | `EcnCE` | CE-marked fraction of received symbols this interval, parts per 65535 (N3 / L4S) |
-| 19 | 2 | `LossRate` | smoothed channel erasure estimate, parts per 65535 |
-| 21 | 32 | `Deficits[32]` | rank deficit of the 32 generations from the cursor (saturating u8) |
-| 53 | 2 | `CongestionLoss` | pre-recovery wire-loss count since last report (N1; tail, length-gated) |
-| 55 | 2 | `Burstiness` | smoothed mean loss-run length, Q8 (256 = i.i.d.; N2; tail) |
-| 57 | 1 | `nPaths` | multipath: paths reported (0 = single path); N5 variable tail |
-| +0 | 2·`nPaths` | `PathLoss[nPaths]` | per-path marginal erasure rates, parts per 65535 (weights the scheduler) |
-| +… | 2·(`nPaths`+1) | `SlotDist[nPaths+1]` | per-slot erasure-COUNT histogram: fraction of aligned N-path slots with exactly *j* of *N* paths erased, parts per 65535 (drives the joint-tail sizer) |
-| next | 16 | media stats | cumulative `Frames`, `DecodableFrames`, `Keyframes`, `DecodableKeyframes` as u32 counters (N6; zero when absent/no descriptors) |
-| next | 6 | LTR resync | `NewestDecodableLTR`(4): FrameStart+1 of the newest decodable LTR-candidate frame (0 = none) · `BrokenAnchors`(2): wrapping count of referenced pictures resolved undecodable at/after it (tail, length-gated) |
-| next | 1 | `DeadPaths` | bitmap of paths in receiver-detected OUTAGE (per-path lost-slot run beyond the recovery horizon while others deliver). The sender fails systematic placement to the live paths and probes dead ones with droppable repair; any arrival on a dead path clears its bit. 0 on single-path flows (tail, length-gated) |
-| next | 8 | `Missing` | NACK bitmap for the stuck neighborhood: bit k = source id `DecodedLowEdge`+k is covered-but-unproducible at the receiver, masked to ids below its decode frontier (an unsent or in-flight id never reads missing). The sender may answer set bits with unit repairs (`WindowBase=id, N=1, RepairKey=0` — the singleton shape), which close at the decoder instantly. 0 = nothing missing or peer predates the field (tail, length-gated) |
-| next | 2 | `SettledLost` | source ids the receiver's SETTLED walk confirmed lost since the last report: an id counts only after arrivals above it plus a fixed reorder holdoff (budget/8, clamped 10–30 ms; `ReorderHoldoffMicros` overrides) prove it absent, so a reordered-late arrival never counts. Reorder-tolerant clean/dirty evidence for the sender's confirmed-clean proactive decay; feeds nothing else (sizing keeps the raw-order walks). Saturates at 65535. Presence is length-gated: a peer predating the field yields no settled evidence, not a clean claim (tail) |
-
-The per-path section is **variable** and bound-gated (`nPaths ≤ 8`): a forged count can neither
-over-read nor over-allocate. `SlotDist` is the exact sufficient statistic the correlation-aware
-joint-tail sizer (`internal/flow.repairForJointTailN`) convolves — union-decode failure depends
-only on the total erasure count, so the count histogram embeds the cross-path correlation an
-i.i.d.-union sizer misses, without enumerating which paths failed.
-
-The media-stats tail lets the sender's single `meld-auto` loop tell ordinary wire loss from
-decode-damaging dependency loss. Combined with `Burstiness`, it drives the advisory encoder
-recovery-cadence request (`EncoderControl.RecoveryCadenceFrames`) without introducing separate
-deployable profiles. A sender that cannot influence the encoder simply ignores that actuator and
-keeps the same transport loop.
-
-The LTR-resync tail closes the loop for the second encoder actuator (`EncoderControl.Resync`):
-`BrokenAnchors` deltas tell the sender the reference chain broke (distinct from the media
-counters, whose deltas also count broken disposable leaves that no resync can help), and
-`NewestDecodableLTR` names the safe anchor to resync against. Stragglers behind the safe anchor
-are known-dead history and are never counted, so a completed resync stops re-triggering.
-
-## The generic media descriptor
-
-Every symbol carries the minimal slice the core's sizing acts on — `Priority` (unequal
-protection) and `Deadline` (per-symbol eviction) — and systematic symbols additionally carry
-the `flagDesc` frame descriptor above (`FrameStart`, `FrameLen`, `FrameRefs[]`, RAP /
-discardable), so the receiver reconstructs the dependency tree and computes decodable-frame
-loss propagation parse-free. The media shaper (`internal/shape`) fills it from the bitstream;
-see `docs/media-awareness.md`.
-
-## Encryption (handshake + ciphertext) — opt-in
-
-When a flow is encrypted (`meld.Config.Passphrase`), three handshake messages establish
-keys before any media, and every Symbol's `Payload` becomes AEAD ciphertext. The design,
-rationale, and citations are in [`docs/encryption.md`](encryption.md); this section pins the
-bytes. The deterministic sans-I/O core never sees a key — encryption lives in the host
-(`internal/session`), so these messages and the payload transform sit entirely on the host
-side of the waist.
-
-### Handshake messages
-
-All three are framed `byte0 = (Version<<4) | type` followed by an opaque crypto payload
-(`internal/crypto`); the lengths are fixed by the X25519 + ML-KEM-768 sizes.
-
-| type | name | payload bytes | layout |
-|---|---|---:|---|
-| `0x6` | message 1 (init → resp) | 1248 | `X25519_pub`(32) ‖ `MLKEM768_encap_key`(1184) ‖ `mac1`(16) ‖ `mac2`(16) |
-| `0x7` | message 2 (resp → init) | 1152 | `X25519_pub`(32) ‖ `MLKEM768_ciphertext`(1088) ‖ `confirm`(16) ‖ `mac1`(16) |
-| `0x8` | cookie reply (resp → init) | 56 | `nonce`(24) ‖ XChaCha20-Poly1305(`cookie`(16) ‖ `tag`(16)) under a PSK-derived key |
-
-Message 1 carries no freshness counter. A restarted sender re-handshakes **commit-after-confirm**:
-the responder stages a new handshake as a PENDING session (matched to the live one by the
-initiator's ephemeral keys — identical keys ⇒ a retransmit, resend the cached message 2 to the
-established peer; different keys ⇒ a new handshake) and keeps the live session running until an
-inbound symbol AUTHENTICATES under the pending keys, only then promoting it and resetting the
-receive core. A replayed or forged message 1 can never produce such a symbol, so it can never
-displace a live session — replacing the need for a wire freshness/anti-replay field. `mac1` is
-HMAC-SHA256 (truncated to 16) keyed by the Argon2id-derived PSK over `pubs` — the always-on
-gate that rejects a non-PSK flood before any asymmetric work. `mac2`
-is the WireGuard-style cookie (HMAC keyed by the cookie the responder issues in `0x8`),
-zero unless the responder is under load; it proves return-routability of the source
-address. `confirm` is HMAC under a master-derived key over the handshake transcript,
-authenticating the responder. The two ephemeral shared secrets (X25519 ECDH + ML-KEM-768
-decapsulation) are HKDF-chained into the master secret — a hybrid that survives the break
-of either primitive (PQNoise / PQ-WireGuard lineage).
-
-### Encrypted Symbol payload
-
-The Symbol **header is unchanged and cleartext** (a relay still reads `WindowBase`, `N`,
-`RepairKey`, `PathID` to route and recode), but its `Payload` is the AEAD output:
-
-```
-Payload = ChaCha20-Poly1305(K_epoch, nonce, media_chunk, AAD)   // len = len(media_chunk) + 16
+```text
+[WindowBase, WindowBase + N)
 ```
 
-- **Encrypt-then-code:** the host seals each SOURCE symbol *before* the coder; repair
-  symbols are GF(2⁸) linear combinations of the sealed bytes, so a recoding relay
-  recombines ciphertext with **no key**, and the 16-byte tag (carried as coded payload)
-  gives end-to-end integrity through the code.
-- **Nonce** = `Epoch`(2) ‖ `SrcIndex`(4), zero-padded to 96 bits — **derived, never on the
-  wire** (the receiver knows the delivered source id and the epoch). Refuse-to-reuse: the
-  sender rekeys before `SrcIndex` wraps.
-- **`Epoch` is the key-update counter** (the reserved Symbol/Feedback field, now used):
-  `Epoch = SrcIndex / EpochSize`, and the directional traffic secret ratchets forward each
-  epoch (intra-session forward secrecy). Both ends derive the epoch from the source id with
-  no extra wire field.
-- **AAD** = `Flow`(4) ‖ `Epoch`(2) ‖ `SrcIndex`(4) — the routing identity both ends know
-  for any delivered symbol (including a recovered one, which carries no header); binding
-  `Epoch` is the lightweight key-commitment that closes the partitioning-oracle gap.
+A sparse repair covers the explicit source ids carried in the packet. For either
+kind, `RepairKey` regenerates the coefficient vector over GF(2⁸).
 
-Encrypted media chunks are therefore at most `SymbolSize − 16` bytes. The frame-descriptor
-(`flagDesc`) and `SendTimestamp` extensions are unaffected (cleartext header extensions).
+The full repair payload is `SymbolSize + 12` bytes. When its application region
+ends in at least five zero bytes, the sender uses the compact representation:
+`SourceLength` is the transmitted application-prefix width and the payload is
+that prefix followed by the coded 12-byte metadata suffix. The receiver restores
+the omitted zero interval before GF arithmetic. Compaction is used only when the
+four-byte length field produces a net saving, and control accounting continues
+to charge the full equation width.
 
-### Encrypted control plane
+Generation repair and fixed 16-source repair epochs use the Cauchy-MDS key
+namespace (`RepairKey & 0xC000 == 0xC000`). Other keys select deterministic
+seeded RLNC coefficients. A repair epoch uses ordinary type `0x2` packets: each
+systematic announces the same 16-source `WindowBase`/`N` pair and the epoch rows
+are decoded in separate bounded block state before recovered values are injected
+into ordered sliding recovery.
 
-On an encrypted flow the control datagrams — Feedback (`0x3`), Clock probe (`0x4`), Clock
-echo (`0x5`) — are authenticated so a forged or replayed one cannot retire recovery state or
-skew the deadline frame. Each carries an 8-byte sequence and a 16-byte tag as a **trailer**,
-leaving the leading type byte at offset 0 so a relay/host still dispatches on it:
+## Feedback report
 
-```
-datagram ‖ Seq(8) ‖ HMAC-SHA256(K_dir, datagram ‖ Seq)[:16]
-```
+Feedback type `0x3` is cumulative recovery state. Version 1 requires the complete
+layout; a truncated report returns `ErrShort` and trailing bytes return
+`ErrInvalid`.
 
-Each direction uses its OWN key — `K_i2r = HKDF-Expand(master, "control-i2r")` for
-initiator→responder, `K_r2i` for the reverse — so one direction's datagram can never verify
-in the other (no cross-direction reflection); one side's send key equals the other's receive
-key. The receiver of a control datagram verifies the tag and runs `Seq` through a 64-entry
-sliding replay window (RFC 6479), dropping replays and stale sequences. Control datagrams are
-dropped (and never emitted) until the handshake has established the keys, so the
-pre-establishment window is not an unauthenticated hole. Cleartext flows carry no trailer.
+| offset | size | field | meaning |
+|---:|---:|---|---|
+| 0 | 1 | `ver\|type` | version 1 and `0x3` |
+| 1 | 4 | `Flow` | flow identifier |
+| 5 | 2 | `Epoch` | flow/key generation |
+| 7 | 4 | `DecodedLowEdge` | all lower source ids are resolved |
+| 11 | 4 | `HighestSeen` | highest observed source-id edge |
+| 15 | 2 | `Deficit` | independent values needed at the cursor |
+| 17 | 2 | `EcnCE` | CE-marked fraction, parts per 65535 |
+| 19 | 2 | `LossRate` | smoothed pre-recovery erasure rate |
+| 21 | 32 | `Deficits[32]` | generation deficits or sliding closure continuation |
+| 53 | 2 | `CongestionLoss` | pre-recovery loss count for the interval |
+| 55 | 2 | `Burstiness` | mean loss-run length in Q8; 256 is iid |
+| 57 | 1 | `nPaths` | number of reported paths; zero for single path |
+| next | `2*nPaths` | `PathLoss` | per-path loss fractions |
+| next | `2*(nPaths+1)` | `SlotDist` | aligned-slot erasure-count histogram |
+| next | 16 | media counters | frames, decodable frames, keyframes, decodable keyframes |
+| next | 6 | LTR state | newest decodable LTR and broken-anchor count |
+| next | 1 | `DeadPaths` | receiver-classified path-outage bitmap |
+| next | 8 | `Missing` | rank-closing free-column bitmap from `DecodedLowEdge` |
+| next | 2 | `SettledLost` | reorder-settled losses in the interval |
+| next | 2 | `OutageRun` | largest classified outage run in source symbols |
 
-## Coefficient encoding (resolved for v1)
+`nPaths` is bounded to 8. If it is nonzero, both `PathLoss[nPaths]` and
+`SlotDist[nPaths+1]` are required. A single-path report is 93 bytes; an N-path
+report is `95 + 4*N` bytes.
 
-v1 uses **seeded coefficients**: `RepairKey` is the PRNG seed both ends expand into
-the GF(2⁸) coefficient vector over `[WindowBase, WindowBase+N)` — compact (no
-on-wire vector), the RFC 8681 RLC lineage. A `density` byte (fraction of the window
-mixed) is reserved for sparse codes.
+In generation mode, `Deficits[i]` is the saturating rank deficit for generation
+`i` from the delivery cursor. In sliding mode, `Missing` covers offsets 0--63
+from `DecodedLowEdge` and `Deficits` carries the continuation. Its default form is
+four big-endian 64-bit words covering offsets 64--319. Run form begins with
+`ff 43 <count> 00`, sets bit `0x80` in byte 31, and stores one to six
+`(start uint16, length uint16)` big-endian pairs beginning at byte 4. Runs are
+ordered, non-overlapping, begin at offset 64 or later, and end by the 2,048-source
+sliding-window limit. `Deficit` remains the hard cap on exact answers.
 
-Two alternatives are deliberately **not** v1, and adopting either is a version bump:
+The combined closure representation names only free columns in the receiver's
+reduced system, below decode coverage. Each exact answer removes one independent
+degree of freedom; unresolved pivot columns are omitted because an arbitrary set
+of them need not close rank. Unsent or merely in-flight ids are never named.
+`SettledLost` is the
+reorder-tolerant clean/dirty signal. `OutageRun` preserves fade duration separately
+from the recoverable-run distribution used for repair-rate sizing.
 
-- **Explicit coefficient vectors** — *forced* the moment recoding at relays is in
-  scope, because a recoded symbol's coefficients are no longer derivable from a single
-  seed. Reserve for it.
-- **Deterministic Vandermonde** (`α^((src·key) mod 2^m)`, RFC 9407 Tetrys) — the
-  price of wire-interop with Tetrys. Adopt only if interop is wanted.
+## Other control messages
+
+- Clock probe (`0x4`) is 9 bytes: lead byte and `T0` as int64.
+- Clock echo (`0x5`) is 25 bytes: lead byte and `T0`, `T1`, `T2` as int64.
+- MTU probe (`0x9`) is a 4-byte nonce followed by zero padding to the candidate
+  datagram size.
+- MTU acknowledgement (`0xA`) is 7 bytes: lead byte, nonce, and observed size as
+  uint16.
+- Handshake types `0x6`, `0x7`, and `0x8` contain opaque payloads owned by the
+  session crypto layer.
+
+On encrypted flows, source bytes are sealed before coding. Symbol headers remain
+cleartext, while the exact ciphertext length is protected by the same source
+metadata. Feedback, clock, and other protected control packets receive the
+sequence/tag trailer defined in [Encryption](encryption.md).
+
+## Media descriptor
+
+The base header always carries `Priority` and `Deadline`. Systematic symbols may
+also carry the frame descriptor extension. Its flags identify RAP,
+recovery-refresh, discardable, non-picture, and long-term-reference units;
+`FrameStart`, `FrameLen`, and the reference source ids let the receiver compute
+dependency damage without parsing the media payload.

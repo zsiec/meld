@@ -120,7 +120,7 @@ func streamingMinOverhead(er []bool, T, nMax int, target float64) (ovh float64, 
 			break // residual is monotone non-increasing in B, so the first hit is the cheapest for this N
 		}
 	}
-	return
+	return ovh, bestB, bestN
 }
 
 // schedState is what a repair-scheduling policy sees after each source emit. cursor
@@ -202,6 +202,13 @@ func onGapPolicy(rhoBase, rhoGap float64) repairPolicy {
 // so the data plane is idealized and the experiment isolates schedule quality vs RTT).
 // Returns residual loss and realized overhead (repairs sent / source sent).
 func bandSim(t *testing.T, er []bool, nSrc, T, b, symSize, cursorDelay int, policy repairPolicy) (residual, overhead float64) {
+	return bandSimKeyed(t, er, nSrc, T, b, symSize, cursorDelay, policy, nil)
+}
+
+// bandSimKeyed is bandSim with an optional repair-key transform. It lets code-family
+// gates compare coefficient constructions under the exact same source, erasure, and
+// scheduling trace. A nil transform is the shipping seeded-RLNC construction.
+func bandSimKeyed(t *testing.T, er []bool, nSrc, T, b, symSize, cursorDelay int, policy repairPolicy, keyFor func(uint16) uint16) (residual, overhead float64) {
 	t.Helper()
 	enc := NewEncoderAt(symSize, 0)
 	dec := NewBandDecoder(symSize, b, 3*T+b+64)
@@ -258,9 +265,13 @@ func bandSim(t *testing.T, er []bool, nSrc, T, b, symSize, cursorDelay int, poli
 		// frontier so the proactive repair covers exactly the still-in-flight region
 		// [cursor, src). The BandDecoder rejects repairs whose base is below its cursor.
 		enc.SlideTo(dec.Cursor())
-		base, n, payload := enc.RepairWindow(key, b)
+		wireKey := key
+		if keyFor != nil {
+			wireKey = keyFor(key)
+		}
+		base, n, payload := enc.RepairWindow(wireKey, b)
 		if n > 0 && !er[slot] {
-			dec.AddRepair(base, n, key, payload)
+			dec.AddRepair(base, n, wireKey, payload)
 		}
 		key++
 		repairs++
@@ -306,7 +317,7 @@ func bandResidual(t *testing.T, er []bool, nSrc, T, b int, repairRate float64, s
 
 // bandMinOverhead grid-searches the proactive repair rate for the lowest realized
 // overhead whose band residual holds the target.
-func bandMinOverhead(t *testing.T, er []bool, nSrc, T, b, symSize int, target float64) (ovh float64, rate float64) {
+func bandMinOverhead(t *testing.T, er []bool, nSrc, T, b, symSize int, target float64) (ovh, rate float64) {
 	t.Helper()
 	ovh = math.Inf(1)
 	// Residual is monotone non-increasing in the repair rate, so the first (ascending)
@@ -320,7 +331,7 @@ func bandMinOverhead(t *testing.T, er []bool, nSrc, T, b, symSize int, target fl
 			return o, r
 		}
 	}
-	return
+	return ovh, rate
 }
 
 // streamingResidualBudget returns the ideal streaming code's lowest residual whose
@@ -345,7 +356,7 @@ func streamingResidualBudget(er []bool, T, nMax int, budget float64) (res float6
 			res, B, N = r, bMax, n
 		}
 	}
-	return
+	return res, B, N
 }
 
 // TestStreamingVsBandGE is the head-to-head on the channel Meld actually faces. For a
@@ -460,7 +471,8 @@ var schedRates = []float64{
 // lowest realized overhead whose residual holds target (first hit; residual is
 // monotone non-increasing in intensity).
 func searchMinOverhead(t *testing.T, er []bool, nSrc, T, b, symSize, cursorDelay int,
-	makePolicy func(float64) repairPolicy, target float64) (ovh, res float64) {
+	makePolicy func(float64) repairPolicy, target float64,
+) (ovh, res float64) {
 	t.Helper()
 	for _, rho := range schedRates {
 		r, o := bandSim(t, er, nSrc, T, b, symSize, cursorDelay, makePolicy(rho))
@@ -568,5 +580,159 @@ func TestRepairSchedulingGE(t *testing.T) {
 		n := float64(seeds)
 		t.Logf(" %8.0f | %6.1f%% | %7.1f%% | %7.1f%% | %9.1f%% | %7.1f%% | %7.1f%%",
 			mb, 100*uni/n, 100*clu/n, 100*g0/n, 100*g1/n, 100*g2/n, 100*g3/n)
+	}
+}
+
+// TestSlidingMDSCoefficientSwapNotPareto compares the shipping seeded RLNC
+// coefficients with bounded Cauchy rows while leaving the moving window, repair
+// rate, deadline, and erasure trace unchanged. Cauchy rows are MDS only when they
+// share one fixed column set; moving each row with the sliding window forfeits that
+// guarantee. The envelope pins the empirical consequence: the naive coefficient
+// swap has no material winning cell and has at least one material regression.
+func TestSlidingMDSCoefficientSwapNotPareto(t *testing.T) {
+	if testing.Short() {
+		t.Skip("coefficient envelope is slow; run without -short")
+	}
+	const (
+		symSize = 8
+		pMean   = 0.10
+		seeds   = 4
+		nSrc    = 8_000
+	)
+	var maxMDSGain, maxMDSLoss float64
+	for _, T := range []int{24, 48, 96} {
+		for _, meanBurst := range []float64{1, 2, 6, 24, 48} {
+			for _, rate := range []float64{0.15, 0.30, 0.50} {
+				var rlncResidual, mdsResidual float64
+				for seed := 0; seed < seeds; seed++ {
+					rng := rand.New(rand.NewSource(int64(seed)*1009 + int64(meanBurst)*31 + int64(T)*7))
+					er := geTrace(rng, nSrc*3+4*T+64, pMean, meanBurst)
+					rlnc, _ := bandSimKeyed(t, er, nSrc, T, T, symSize, 0, uniformPolicy(rate), nil)
+					mds, _ := bandSimKeyed(t, er, nSrc, T, T, symSize, 0, uniformPolicy(rate), func(k uint16) uint16 {
+						// All tested spans are <=96, so rows [0,127] stay inside the
+						// exact Cauchy namespace (row+span < 255).
+						return BlockRepairKey(k % 128)
+					})
+					rlncResidual += rlnc
+					mdsResidual += mds
+				}
+				rlncMean := rlncResidual / seeds
+				mdsMean := mdsResidual / seeds
+				delta := mdsMean - rlncMean
+				if -delta > maxMDSGain {
+					maxMDSGain = -delta
+				}
+				if delta > maxMDSLoss {
+					maxMDSLoss = delta
+				}
+				t.Logf("T=%d burst=%g rate=%.2f: RLNC=%.5f Cauchy-moving=%.5f delta=%+.5f",
+					T, meanBurst, rate, rlncMean, mdsMean, delta)
+			}
+		}
+	}
+	if maxMDSGain > 5e-4 {
+		t.Fatalf("moving Cauchy rows gained materially in one cell: %.6f", maxMDSGain)
+	}
+	if maxMDSLoss < 1e-3 {
+		t.Fatalf("expected pinned moving-window regression, largest was %.6f", maxMDSLoss)
+	}
+}
+
+// blockMDSResidual scores an ideal systematic Cauchy-MDS block at the same
+// source+repair channel-slot cost as bandSim. Sources occupy k consecutive slots,
+// parity follows immediately, and fractional credit realizes the requested
+// long-term repair rate without rounding every block upward. A block recovers all of
+// its missing sources iff at least that many parity rows survive. The caller must
+// choose k so the last parity slot is no later than the first source's deadline.
+func blockMDSResidual(er []bool, nSrc, T, k int, repairRate float64) (residual, overhead float64) {
+	if nSrc <= 0 || k <= 0 {
+		return 0, 0
+	}
+	var slot, source, repairs, lost int
+	credit := 0.0
+	for source < nSrc && slot < len(er) {
+		width := k
+		if remaining := nSrc - source; width > remaining {
+			width = remaining
+		}
+		missing := 0
+		for i := 0; i < width && slot < len(er); i++ {
+			if er[slot] {
+				missing++
+			}
+			source++
+			slot++
+		}
+		credit += repairRate * float64(width)
+		parity := int(credit)
+		credit -= float64(parity)
+		if width+parity-1 > T {
+			lost += missing // the block cannot close by its first source deadline
+			for i := 0; i < parity && slot < len(er); i++ {
+				repairs++
+				slot++
+			}
+			continue
+		}
+		survivingParity := 0
+		for i := 0; i < parity && slot < len(er); i++ {
+			if !er[slot] {
+				survivingParity++
+			}
+			repairs++
+			slot++
+		}
+		if survivingParity < missing {
+			lost += missing
+		}
+	}
+	if source == 0 {
+		return 0, 0
+	}
+	return float64(lost) / float64(source), float64(repairs) / float64(source)
+}
+
+// TestFixedMDSBlockOracleVsSliding gives a real fixed-block construction its
+// strongest fair case before any production selector is considered. For each cell
+// it searches every deadline-admissible block width and compares that oracle width
+// with the shipping sliding RLNC at the same requested repair rate and erasure trace.
+func TestFixedMDSBlockOracleVsSliding(t *testing.T) {
+	if testing.Short() {
+		t.Skip("fixed-block envelope is slow; run without -short")
+	}
+	const (
+		pMean = 0.10
+		seeds = 8
+		nSrc  = 16_000
+	)
+	for _, T := range []int{24, 48, 96} {
+		for _, meanBurst := range []float64{1, 2, 6, 24, 48} {
+			for _, rate := range []float64{0.15, 0.30, 0.50} {
+				var slidingMean float64
+				blockMeans := make(map[int]float64)
+				for seed := 0; seed < seeds; seed++ {
+					rng := rand.New(rand.NewSource(int64(seed)*1009 + int64(meanBurst)*31 + int64(T)*7))
+					er := geTrace(rng, nSrc*3+4*T+64, pMean, meanBurst)
+					sliding, _ := bandSim(t, er, nSrc, T, T, 8, 0, uniformPolicy(rate))
+					slidingMean += sliding
+					for k := 2; k <= T; k++ {
+						if k+int(math.Ceil(rate*float64(k)))-1 > T {
+							continue
+						}
+						block, _ := blockMDSResidual(er, nSrc, T, k, rate)
+						blockMeans[k] += block
+					}
+				}
+				bestBlock, bestK := 1.0, 0
+				for k, total := range blockMeans {
+					if mean := total / seeds; mean < bestBlock {
+						bestBlock, bestK = mean, k
+					}
+				}
+				slidingMean /= seeds
+				t.Logf("T=%d burst=%g rate=%.2f: sliding=%.5f block-oracle=%.5f delta=%+.5f best-k=%d",
+					T, meanBurst, rate, slidingMean, bestBlock, bestBlock-slidingMean, bestK)
+			}
+		}
 	}
 }

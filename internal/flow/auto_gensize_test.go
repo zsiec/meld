@@ -42,8 +42,10 @@ func TestAutoGenSize(t *testing.T) {
 		burst  = 4.0
 	)
 	mk := func(auto bool) Config {
-		return Config{Flow: 1, SymbolSize: 256, GenSize: 16, Redundancy: 0.15, TargetFailure: 1e-3,
-			BufferMicros: budget, AutoGenSize: auto}
+		return Config{
+			Flow: 1, SymbolSize: 256, GenSize: 16, Redundancy: 0.15, TargetFailure: 1e-3,
+			BufferMicros: budget, AutoGenSize: auto,
+		}
 	}
 	run := func(c Config) simResult {
 		// 200 µs/sym ⇒ ~10 Mbps: fast enough that the fill gate admits the full width.
@@ -74,8 +76,10 @@ func TestAutoGenSize(t *testing.T) {
 // ACROSS the transition is the correctness proof; delivery stays complete throughout.
 func TestAutoGenSizeRateChange(t *testing.T) {
 	const n = 1600
-	cfg := Config{Flow: 1, SymbolSize: 256, GenSize: 16, Redundancy: 0.15, TargetFailure: 1e-3,
-		BufferMicros: 300_000, AutoGenSize: true}
+	cfg := Config{
+		Flow: 1, SymbolSize: 256, GenSize: 16, Redundancy: 0.15, TargetFailure: 1e-3,
+		BufferMicros: 300_000, AutoGenSize: true,
+	}
 	res := simLink{
 		cfg:          cfg,
 		owdMicros:    20_000, // 40 ms RTT

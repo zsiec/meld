@@ -11,9 +11,20 @@ import (
 
 // simChunk builds a source chunk of size bytes carrying id in its first four bytes, so a
 // delivered payload's identity is self-describing (the receiver also reports the id).
+// The remaining application bytes are deterministic and nonzero. This matters now that
+// compact repair legitimately omits an equation's zero tail: an all-zero synthetic body
+// would make every nominally full-width source look like a four-byte media packet and
+// remove the serialization pressure that paced-link tests are intended to exercise.
 func simChunk(size int, id uint32) []byte {
 	b := make([]byte, size)
 	binary.BigEndian.PutUint32(b, id)
+	x := id + 0x9e3779b9
+	for i := 4; i < len(b); i++ {
+		x ^= x << 13
+		x ^= x >> 17
+		x ^= x << 5
+		b[i] = byte(x) | 1
+	}
 	return b
 }
 
@@ -31,6 +42,7 @@ type simLink struct {
 	rateChangeAt int                    // write index at which the cadence switches to srcMicros2
 	stepMicros   int64                  // clock granularity (0 ⇒ 1 ms)
 	n            int                    // number of source chunks to send
+	sourceSize   func(id uint32) int    // optional application size; nil uses SymbolSize
 	drop         func(wire.Symbol) bool // wire loss; closed over a per-symbol coin by the caller
 	sliding      bool                   // use the band-form sliding coder instead of the generation coder
 	jitterMicros int64                  // max extra per-datagram delay (deterministic per symbol) — induces reorder
@@ -60,6 +72,7 @@ type simLink struct {
 type simResult struct {
 	n               int // source chunks offered (== simLink.n)
 	delivered       int
+	deliveredBytes  uint64 // application payload bytes delivered (quality/capacity accounting)
 	deliveredIDs    []uint32
 	stats           ReceiverStats
 	sstats          SenderStats
@@ -67,11 +80,14 @@ type simResult struct {
 	peakRetained    int // max len(sender.retained) — the sender resource-bound witness
 	deliveredInTime int // deliveries within each chunk's own deadline — the ARBITERED count, the honest live metric (delivered includes late ones)
 	lateDeliv       bool
+	lateID          uint32
+	lateByMicros    int64
 	corrupt         bool    // a delivered payload did not match its source id (false recovery)
 	latencyMicros   []int64 // per-delivered-symbol latency (now - write time), for p50/p99
 	finalPEst       float64 // the sender's loss estimate at end of run (feedback-driven; for diagnostics)
 	finalBurstQ8    int     // the sender's burstiness estimate at end of run (Q8; 256 == i.i.d.)
 	finalCliff      bool    // whether the sender detected an unsatisfiable one-way-delay budget
+	wireBytes       uint64  // forward datagram bytes emitted before impairment
 }
 
 // pctlMicros returns the p-th percentile (0..1) of the latency samples in microseconds, or 0 if empty.
@@ -88,16 +104,10 @@ func pctlMicros(xs []int64, p float64) int64 {
 // overhead returns the realized repair overhead (repair that actually went out, net of
 // throttle) as a fraction of the source symbols emitted.
 func (res simResult) overhead() float64 {
-	sent := res.sstats.Repair
-	if res.sstats.Throttled < sent {
-		sent -= res.sstats.Throttled
-	} else {
-		sent = 0
-	}
 	if res.sstats.Source == 0 {
 		return 0
 	}
-	return float64(sent) / float64(res.sstats.Source)
+	return float64(res.sstats.Repair) / float64(res.sstats.Source)
 }
 
 type inflight struct {
@@ -158,6 +168,7 @@ func (sl simLink) runCores(s coreSenderT, r coreReceiverT) simResult {
 			if err != nil {
 				continue
 			}
+			res.wireBytes += uint64(len(d))
 			dropped := sl.drop(sym)
 			if sl.tap != nil {
 				sl.tap(sym, dropped)
@@ -202,6 +213,7 @@ func (sl simLink) runCores(s coreSenderT, r coreReceiverT) simResult {
 			}
 			res.deliveredIDs = append(res.deliveredIDs, id)
 			res.delivered++
+			res.deliveredBytes += uint64(len(d))
 			if len(d) >= 4 && binary.BigEndian.Uint32(d) != id {
 				res.corrupt = true // delivered the wrong bytes for this id — a false recovery
 			}
@@ -209,6 +221,10 @@ func (sl simLink) runCores(s coreSenderT, r coreReceiverT) simResult {
 				// delivery latency = now - write time; write time = dl - BufferMicros.
 				res.latencyMicros = append(res.latencyMicros, int64(now.Sub(dl))+sl.cfg.BufferMicros)
 				if now.After(dl) {
+					if !res.lateDeliv {
+						res.lateID = id
+						res.lateByMicros = now.Sub(dl)
+					}
 					res.lateDeliv = true // delivered past its deadline
 				} else {
 					res.deliveredInTime++
@@ -227,7 +243,17 @@ func (sl simLink) runCores(s coreSenderT, r coreReceiverT) simResult {
 			for k := 0; k < b && written < sl.n; k++ {
 				id := uint32(written)
 				srcDL[id] = now.Add(sl.cfg.BufferMicros)
-				s.Write(now, simChunk(sl.cfg.SymbolSize, id))
+				size := sl.cfg.SymbolSize
+				if sl.sourceSize != nil {
+					size = sl.sourceSize(id)
+					if size < 4 {
+						size = 4
+					}
+					if size > sl.cfg.SymbolSize {
+						size = sl.cfg.SymbolSize
+					}
+				}
+				s.Write(now, simChunk(size, id))
 				written++
 			}
 			cadence := sl.srcMicros

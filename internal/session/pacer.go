@@ -8,6 +8,7 @@ import (
 
 	"github.com/zsiec/meld/internal/clock"
 	"github.com/zsiec/meld/internal/flow"
+	"github.com/zsiec/meld/internal/wire"
 )
 
 // Pacer defaults (host-owned; the core's flow.Config carries the optional overrides).
@@ -41,7 +42,7 @@ func paceQueueLimitMicros(cfg flow.Config) int64 {
 // between the flow core's drained datagrams and the socket, and does ONE job the core
 // cannot: shape WHEN already-decided datagrams hit the wire, and apply backpressure to
 // the media source. It is NOT a congestion controller — its release rate is slaved
-// read-only to the core's flow.Sender.RateBudgetBitsPerSec() (the Copa/N3 budget, or the
+// read-only to the core's flow.Sender.RateBudgetBitsPerSec() (the delay-control budget, or the
 // static ceiling when CC is off). Adding a second, independently-controlled rate here is
 // the "two loops fighting over one rate" anti-pattern (docs/substrate.md); the pacer only
 // reshapes timing within the budget the core already set.
@@ -52,8 +53,7 @@ func paceQueueLimitMicros(cfg flow.Config) int64 {
 // at the Write() boundary, can (by blocking the writer). The core's bucket still sheds
 // REPAIR by protection tier; the pacer is purely additive over what the core admitted.
 //
-// Design rules, each validated by the host-pacer probe (see PACER_FINDINGS in the
-// experiment branch):
+// Design rules, covered by the host-pacer tests:
 //   - release at the BUDGET, never the encoder average (pacing at the average stretches a
 //     keyframe across its avg-rate airtime, well past the deadline);
 //   - the smoothing burst-credit (a few ms) and the queue-time limit (≈ the deadline) are
@@ -61,25 +61,31 @@ func paceQueueLimitMicros(cfg flow.Config) int64 {
 //     in a quiet gap and dump it on the next keyframe, re-creating the microburst;
 //   - the queue-time limit is the DEADLINE minus expected downstream latency, not a
 //     WebRTC-style multi-second bound (a datagram draining after its deadline is dead);
-//   - never drop media: the queue is FIFO and drains in order; overload is handled by
-//     backpressure at Write(), not by dropping queued datagrams.
+//   - never drop media: source and repair are FIFO within class, source drains first,
+//     and overload is handled by backpressure at Write(), not by dropping queued media.
 
 // minBurstBytes floors the smoothing reservoir so a single MTU-sized datagram always fits
 // even at a tiny budget (mirrors the core token bucket's burst floor).
 const minBurstBytes = 1 << 12
 
-// pacerState is the PURE, clockless decision core: a leaky bucket over a FIFO of opaque
-// datagrams. Time enters only as explicit clock.Timestamp arguments — it never reads a
-// clock, so it is unit-testable deterministically. The goroutine wrapper (hostPacer)
-// stamps it with the host clock.
+// pacerState is the PURE, clockless decision core: a leaky bucket over a
+// source-priority queue of opaque datagrams. FIFO order is preserved within the
+// source and recovery classes, but fresh source is inserted ahead of queued repair.
+// Time enters only as explicit clock.Timestamp arguments — it never reads a clock,
+// so it is unit-testable deterministically. The goroutine wrapper (hostPacer) stamps
+// it with the host clock.
 type pacerState struct {
 	rateBytesPerSec int64 // slaved to the core budget; >0 always (host floors it)
 	burstBytes      int64 // token reservoir cap = rate × burstMicros, floored
-	tokens          int64 // available credit; may go briefly negative (one over-budget datagram, paid down)
+	tokens          int64 // aggregate source+repair credit
+	sourceTokens    int64 // independent source credit: repair debt cannot stall fresh media
 	last            clock.Timestamp
 	primed          bool
 	queue           [][]byte
 	queuedBytes     int64
+	sourceCount     int   // source datagrams occupy queue[:sourceCount]
+	exactCount      int   // exact repairs occupy queue[sourceCount:sourceCount+exactCount]
+	sourceBytes     int64 // source bytes ahead of the next source admission
 }
 
 // setRate re-slaves the bucket to a new budget (bytes/sec) and recomputes the burst
@@ -98,12 +104,40 @@ func (p *pacerState) setRate(bytesPerSec, burstMicros int64) {
 	if p.tokens > burst {
 		p.tokens = burst
 	}
+	if p.sourceTokens > burst {
+		p.sourceTokens = burst
+	}
 }
 
 // enqueue appends one datagram to the FIFO. The pacer copies nothing — callers hand it
 // buffers they no longer mutate (the core allocates a fresh datagram per emit).
 func (p *pacerState) enqueue(d []byte) {
 	p.queue = append(p.queue, d)
+	p.queuedBytes += int64(len(d))
+}
+
+// enqueueExact inserts an exact repair behind all source but ahead of fungible
+// recovery. FIFO is preserved inside the exact class. It spends the same shared
+// tokens as every other repair; this changes deadline order, not rate.
+func (p *pacerState) enqueueExact(d []byte) {
+	at := p.sourceCount + p.exactCount
+	p.queue = append(p.queue, nil)
+	copy(p.queue[at+1:], p.queue[at:])
+	p.queue[at] = d
+	p.exactCount++
+	p.queuedBytes += int64(len(d))
+}
+
+// enqueueSource inserts fresh source after older source but before all recovery
+// traffic. This is the host half of the source-first capacity contract: a repair
+// burst can consume spare wire tokens, but cannot create a standing queue in front
+// of media that arrives later.
+func (p *pacerState) enqueueSource(d []byte) {
+	p.queue = append(p.queue, nil)
+	copy(p.queue[p.sourceCount+1:], p.queue[p.sourceCount:])
+	p.queue[p.sourceCount] = d
+	p.sourceCount++
+	p.sourceBytes += int64(len(d))
 	p.queuedBytes += int64(len(d))
 }
 
@@ -114,9 +148,14 @@ func (p *pacerState) refill(now clock.Timestamp) {
 		return
 	}
 	if dt := now.Sub(p.last); dt > 0 {
-		p.tokens += p.rateBytesPerSec * dt / 1_000_000
+		credit := p.rateBytesPerSec * dt / 1_000_000
+		p.tokens += credit
 		if p.tokens > p.burstBytes {
 			p.tokens = p.burstBytes
+		}
+		p.sourceTokens += credit
+		if p.sourceTokens > p.burstBytes {
+			p.sourceTokens = p.burstBytes
 		}
 		p.last = now
 	}
@@ -129,10 +168,21 @@ func (p *pacerState) refill(now clock.Timestamp) {
 func (p *pacerState) due(now clock.Timestamp) [][]byte {
 	p.refill(now)
 	var out [][]byte
-	for len(p.queue) > 0 && p.tokens > 0 {
+	for len(p.queue) > 0 {
+		isSource := p.sourceCount > 0
+		if (isSource && p.sourceTokens <= 0) || (!isSource && p.tokens <= 0) {
+			break
+		}
 		d := p.queue[0]
 		copy(p.queue[0:], p.queue[1:])
 		p.queue = p.queue[:len(p.queue)-1]
+		if p.sourceCount > 0 {
+			p.sourceCount--
+			p.sourceBytes -= int64(len(d))
+			p.sourceTokens -= int64(len(d))
+		} else if p.exactCount > 0 {
+			p.exactCount--
+		}
 		p.queuedBytes -= int64(len(d))
 		p.tokens -= int64(len(d))
 		out = append(out, d)
@@ -147,6 +197,9 @@ func (p *pacerState) drainAll() [][]byte {
 	copy(out, p.queue)
 	p.queue = nil
 	p.queuedBytes = 0
+	p.sourceCount = 0
+	p.exactCount = 0
+	p.sourceBytes = 0
 	return out
 }
 
@@ -158,23 +211,20 @@ func (p *pacerState) untilNextMicros() int64 {
 	if len(p.queue) == 0 {
 		return -1
 	}
-	if p.tokens > 0 {
+	credit := p.tokens
+	if p.sourceCount > 0 {
+		credit = p.sourceTokens
+	}
+	if credit > 0 {
 		return 0
 	}
 	// credit must reach > 0; deficit is -tokens, plus one to cross zero.
-	need := -p.tokens + 1
+	need := -credit + 1
 	us := need * 1_000_000 / p.rateBytesPerSec
 	if us < minPaceSleepMicros {
 		us = minPaceSleepMicros
 	}
 	return us
-}
-
-// queueDrainMicros is the time to drain the current backlog at the budget rate — the
-// standing queue delay the pacer is about to impose. Write() compares it to the queue-time
-// limit to decide backpressure. Conservative (ignores any positive credit).
-func (p *pacerState) queueDrainMicros() int64 {
-	return p.drainMicrosForBytes(p.queuedBytes)
 }
 
 func (p *pacerState) drainMicrosForBytes(bytes int64) int64 {
@@ -184,8 +234,23 @@ func (p *pacerState) drainMicrosForBytes(bytes int64) int64 {
 	return bytes * 1_000_000 / p.rateBytesPerSec
 }
 
-func (p *pacerState) queueDrainMicrosAfter(d []byte) int64 {
-	return p.drainMicrosForBytes(p.queuedBytes + int64(len(d)))
+// sourceDrainMicrosAfter is the delay a newly admitted source datagram can see.
+// Queued repair is excluded because enqueueSource places the new source ahead of it.
+func (p *pacerState) sourceDrainMicrosAfter(d []byte) int64 {
+	return p.drainMicrosForBytes(p.sourceBytes + int64(len(d)))
+}
+
+func isSystematicDatagram(d []byte) bool {
+	t, err := wire.PeekType(d)
+	if err != nil {
+		return true // fail source-safe: an opaque host datagram must not be starved
+	}
+	return wire.IsSystematic(t)
+}
+
+func isExactRepairDatagram(d []byte) bool {
+	t, err := wire.PeekType(d)
+	return err == nil && wire.IsUnitRepair(t)
 }
 
 // minPaceSleepMicros floors the pacer's wake-up interval so it never busy-spins on a
@@ -227,7 +292,8 @@ func newHostPacer(clk clock.Clock, initialBudgetBytesPerSec, burstMicros, limitM
 	}
 	hp.cond = sync.NewCond(&hp.mu)
 	hp.st.setRate(initialBudgetBytesPerSec, burstMicros)
-	hp.st.tokens = hp.st.burstBytes // start full: an initial burst (≤ burst window) goes promptly
+	hp.st.tokens = hp.st.burstBytes       // start full: an initial burst (≤ burst window) goes promptly
+	hp.st.sourceTokens = hp.st.burstBytes // source has its own non-repairable reservation
 	go hp.loop()
 	return hp
 }
@@ -242,7 +308,13 @@ func (hp *hostPacer) offer(datagrams [][]byte) {
 	}
 	hp.mu.Lock()
 	for _, d := range datagrams {
-		hp.st.enqueue(d)
+		if isSystematicDatagram(d) {
+			hp.st.enqueueSource(d)
+		} else if isExactRepairDatagram(d) {
+			hp.st.enqueueExact(d)
+		} else {
+			hp.st.enqueue(d)
+		}
 	}
 	hp.mu.Unlock()
 	hp.wake()
@@ -259,16 +331,30 @@ func (hp *hostPacer) setRate(bytesPerSec int64) {
 
 // put enqueues datagrams for paced transmission, applying backpressure: if the standing
 // queue would exceed the queue-time limit it blocks the caller until the backlog drains
-// enough to admit the next datagram (or the pacer closes). This is the source budget
-// contract — the only place media can be slowed, since the core never refuses it.
+// enough to admit the next SOURCE datagram (or the pacer closes). Recovery is
+// already bounded by the core and is admitted without blocking the application;
+// later source is inserted ahead of it. This is the source budget contract — the
+// only place media can be slowed, since the core never refuses it.
 // Returns the first async substrate write error, if any.
 func (hp *hostPacer) put(datagrams [][]byte) error {
+	return hp.putClassified(datagrams, false)
+}
+
+// putFlow is the protocol-aware source path. Unlike the generic put helper used
+// by pacer tests and non-flow callers, it classifies encoded symbols so recovery
+// cannot block or queue ahead of source.
+func (hp *hostPacer) putFlow(datagrams [][]byte) error {
+	return hp.putClassified(datagrams, true)
+}
+
+func (hp *hostPacer) putClassified(datagrams [][]byte, classify bool) error {
 	if len(datagrams) == 0 {
 		return hp.err()
 	}
 	hp.mu.Lock()
 	for _, d := range datagrams {
-		for len(hp.st.queue) > 0 && hp.st.queueDrainMicrosAfter(d) > hp.limitMicros {
+		isSource := !classify || isSystematicDatagram(d)
+		for isSource && hp.st.sourceCount > 0 && hp.st.sourceDrainMicrosAfter(d) > hp.limitMicros {
 			select {
 			case <-hp.done:
 				hp.mu.Unlock()
@@ -277,7 +363,13 @@ func (hp *hostPacer) put(datagrams [][]byte) error {
 			}
 			hp.cond.Wait()
 		}
-		hp.st.enqueue(d)
+		if isSource {
+			hp.st.enqueueSource(d)
+		} else if isExactRepairDatagram(d) {
+			hp.st.enqueueExact(d)
+		} else {
+			hp.st.enqueue(d)
+		}
 	}
 	hp.mu.Unlock()
 	hp.wake()

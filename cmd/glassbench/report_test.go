@@ -24,9 +24,9 @@ func TestFailureAttributionReportsErasedRepairForDependencyIsland(t *testing.T) 
 			{Unit: shape.Unit{ID: 2, Class: shape.ClassBase, Picture: true, RefersTo: []uint32{1}, Size: 1}},
 		},
 		unitChunks: map[uint32][]uint32{
-			0: []uint32{0},
-			1: []uint32{1},
-			2: []uint32{2},
+			0: {0},
+			1: {1},
+			2: {2},
 		},
 		chunkSize: 1,
 	}

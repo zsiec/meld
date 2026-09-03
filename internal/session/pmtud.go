@@ -12,9 +12,8 @@ import "github.com/zsiec/meld/internal/clock"
 // Like the pacer, the DECISION LOGIC is a pure, clockless state machine taking explicit
 // `now` — no socket, no timer, no goroutine — so it is unit-testable deterministically.
 // The host (Sender) wraps it: it sends padded probe datagrams with Don't-Fragment set,
-// feeds back ack/timeout events, and surfaces the discovered PLPMTU. Phase 1 discovers and
-// reports the PLPMTU per path (and the path-set minimum); it does NOT yet resize symbols
-// (that is the wire/coder contract change of a later phase).
+// feeds back ack/timeout events, and surfaces the discovered PLPMTU per path and for the
+// path set. Discovery does not resize symbols under a live coder.
 
 // pmtudPhase is the RFC 8899 search state (§5.2).
 type pmtudPhase int
@@ -235,7 +234,7 @@ func (p *pmtudState) tick(now clock.Timestamp) (int, bool) {
 
 // pathSetMin returns the minimum PLPMTU across a set of per-path state machines — the size
 // a generation spread across all paths must fit, since any symbol may traverse any path and
-// repair is fungible across the union (N5). Returns 0 for an empty set.
+// repair is fungible across the union. Returns 0 for an empty set.
 func pathSetMin(ps []*pmtudState) int {
 	m := 0
 	for _, p := range ps {

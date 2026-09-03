@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"math"
@@ -40,6 +42,34 @@ func TestSweepSupportsDefaultArms(t *testing.T) {
 		if !sweepSupported(arm) {
 			t.Fatalf("sweepSupported(%q) = false", arm)
 		}
+	}
+}
+
+func TestExtendRetainsMediaDescriptorGraph(t *testing.T) {
+	c := &chunked{
+		chunks: [][]byte{{0, 0, 0, 0, 0xaa}, {0, 0, 0, 1, 0xbb}},
+		shaped: []shape.Shaped{
+			{Unit: shape.Unit{ID: 0, Picture: true}},
+			{Unit: shape.Unit{ID: 1, Picture: true, RefersTo: []uint32{0}}},
+		},
+		units: []shape.Unit{
+			{ID: 0, Picture: true},
+			{ID: 1, Picture: true, RefersTo: []uint32{0}},
+		},
+		unitChunks: map[uint32][]uint32{0: {0}, 1: {1}},
+		chunkSize:  1,
+	}
+
+	got := extend(c, 2)
+	if len(got.chunks) != 4 || binary.BigEndian.Uint32(got.chunks[2][:4]) != 2 {
+		t.Fatalf("extended chunk sequences = %v", got.chunks)
+	}
+	if len(got.shaped) != 4 || got.shaped[2].Unit.ID != 2 || got.shaped[3].Unit.ID != 3 ||
+		len(got.shaped[3].Unit.RefersTo) != 1 || got.shaped[3].Unit.RefersTo[0] != 2 {
+		t.Fatalf("extended descriptors = %+v", got.shaped)
+	}
+	if chunks := got.unitChunks[3]; len(chunks) != 1 || chunks[0] != 3 {
+		t.Fatalf("extended unit chunks = %v", got.unitChunks)
 	}
 }
 
@@ -154,12 +184,87 @@ func TestFFProbeInvalidStreamIsZeroFrames(t *testing.T) {
 	if _, err := exec.LookPath("ffprobe"); err != nil {
 		t.Skip("ffprobe not installed")
 	}
-	n, err := ffprobeFrames([]byte{0, 0, 0, 1, 0xff, 0x00})
+	n, err := (&chunked{format: formatAVC}).ffprobeFrames([]byte{0, 0, 0, 1, 0xff, 0x00})
 	if err != nil {
 		t.Fatalf("ffprobe invalid stream error = %v, want zero-frame result", err)
 	}
 	if n != 0 {
 		t.Fatalf("invalid stream frames = %d, want 0", n)
+	}
+}
+
+func TestChunkClipAutoDetectsCodecAndPreservesFullDecode(t *testing.T) {
+	if _, err := exec.LookPath("ffprobe"); err != nil {
+		t.Skip("ffprobe not installed")
+	}
+	cases := []struct {
+		name   string
+		path   string
+		format elementaryFormat
+		frames int
+	}{
+		{name: "avc", path: "bbb_bframes.h264", format: formatAVC, frames: 144},
+		{name: "hevc", path: "bbb.h265", format: formatHEVC, frames: 48},
+		{name: "av1", path: "bbb.obu", format: formatAV1, frames: 48},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join("..", "..", "internal", "shape", "testdata", tc.path)
+			c, err := chunkClip(path, 1284, shape.AVCOptions{})
+			if err != nil {
+				t.Fatalf("chunkClip: %v", err)
+			}
+			if c.format != tc.format {
+				t.Fatalf("format = %s, want %s", c.format.name(), tc.format.name())
+			}
+			all := allChunkSeqs(c)
+			got, err := c.ffprobeFrames(c.reassembleDelivered(all))
+			if err != nil {
+				t.Fatalf("ffprobe full stream: %v", err)
+			}
+			if got != tc.frames {
+				cmd := exec.Command("ffprobe", "-v", "error", "-f", c.format.ffprobeDemuxer(), "-count_frames", "-select_streams", "v:0", "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", "-")
+				cmd.Stdin = bytes.NewReader(c.reassembleDelivered(all))
+				detail, _ := cmd.CombinedOutput()
+				t.Logf("ffprobe detail: %s", detail)
+				t.Fatalf("decoded frames = %d, want %d", got, tc.frames)
+			}
+			_, modelPics := c.reassembleDecodable(c.deliveredUnits(all))
+			if modelPics != tc.frames {
+				t.Fatalf("model pictures = %d, want %d", modelPics, tc.frames)
+			}
+
+			longer := extend(c, 2)
+			allLonger := allChunkSeqs(longer)
+			got, err = longer.ffprobeFrames(longer.reassembleDelivered(allLonger))
+			if err != nil {
+				t.Fatalf("ffprobe repeated stream: %v", err)
+			}
+			if got != 2*tc.frames {
+				t.Fatalf("repeated decoded frames = %d, want %d", got, 2*tc.frames)
+			}
+		})
+	}
+}
+
+func TestChunkClipRejectsUnknownElementaryStream(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "clip.bin")
+	if err := os.WriteFile(path, []byte{0}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := chunkClip(path, 1284, shape.AVCOptions{}); err == nil {
+		t.Fatal("chunkClip accepted an unknown elementary-stream extension")
+	}
+}
+
+func TestSourceIDIncludesCodecExtension(t *testing.T) {
+	ids := map[string]bool{}
+	for _, path := range []string{"bbb.h264", "bbb.h265", "bbb.obu"} {
+		id := sourceIDForClip(path)
+		if ids[id] {
+			t.Fatalf("source id collision for %s: %q", path, id)
+		}
+		ids[id] = true
 	}
 }
 
@@ -299,14 +404,15 @@ func TestMacroGapRowsSelectsBestArms(t *testing.T) {
 		{Case: "c", Loss: 0.1, Burst: 24, RTT: 100, Mult: 1, Budget: 100, Arm: "meld-sld-uep", FFMean: 90, FramePctMean: 0.8, KeyPctMean: 0.9, Seeds: 1},
 		{Case: "c", Loss: 0.1, Burst: 24, RTT: 100, Mult: 1, Budget: 100, Arm: "libsrt", FFMean: 70, FramePctMean: 0.6, KeyPctMean: 0.7, Seeds: 1},
 		{Case: "c", Loss: 0.1, Burst: 24, RTT: 100, Mult: 1, Budget: 100, Arm: "librist", FFMean: 85, FramePctMean: 0.75, KeyPctMean: 0.8, Seeds: 1},
+		{Case: "c", Loss: 0.1, Burst: 24, RTT: 100, Mult: 1, Budget: 100, Arm: "libsrt-fec", FFMean: 95, FramePctMean: 0.9, KeyPctMean: 1, Seeds: 1},
 	}
 	gaps := macroGapRows(rows, macroFrontierOptions{ChunkSize: 1316, Mbps: 8, TotalPics: 144})
 	if len(gaps) != 1 {
 		t.Fatalf("macroGapRows len = %d, want 1", len(gaps))
 	}
 	g := gaps[0]
-	if g.BestMeld != "meld-sld-uep" || g.BestARQ != "librist" || g.DeltaFF != 5 {
-		t.Fatalf("gap = %+v, want best Meld vs best ARQ delta 5", g)
+	if g.BestMeld != "meld-sld-uep" || g.BestARQ != "libsrt-fec" || g.DeltaFF != -5 {
+		t.Fatalf("gap = %+v, want deployable Meld vs best SRT/RIST competitor delta -5", g)
 	}
 	if !g.TheoryMeld {
 		t.Fatalf("gap TheoryMeld=false, want true")
@@ -369,11 +475,107 @@ func TestMacroGapRowsPropagatesSeedNoise(t *testing.T) {
 	}
 }
 
+func TestMacroGapStableRequiresMultipleSeeds(t *testing.T) {
+	if macroGapStable(macroGapRow{Seeds: 1, DeltaFF: 20}) {
+		t.Fatal("one-seed gap reported stable")
+	}
+	if !macroGapStable(macroGapRow{Seeds: 3, DeltaFF: 20}) {
+		t.Fatal("three identical nonzero gaps did not report stable")
+	}
+}
+
+func TestBenchmarkSeedSchedule(t *testing.T) {
+	t.Parallel()
+
+	want := []int64{7932, 15851, 23770}
+	for rep, expected := range want {
+		if got := benchmarkSeed(rep + 1); got != expected {
+			t.Fatalf("benchmarkSeed(%d) = %d, want %d", rep+1, got, expected)
+		}
+	}
+	if got := benchmarkSeeds(3); !slices.Equal(got, want) {
+		t.Fatalf("benchmarkSeeds(3) = %v, want %v", got, want)
+	}
+	if got := benchmarkSeeds(0); len(got) != 0 {
+		t.Fatalf("benchmarkSeeds(0) = %v, want empty", got)
+	}
+}
+
+func TestMacroTraceCandidateSelectsWorstUserVisibleDamage(t *testing.T) {
+	t.Parallel()
+
+	current := &macroTraceCandidate{trace: &seedTrace{
+		Rep:     1,
+		Score:   seedTraceScore{FFFrames: 143, FramePct: 0.99, KeyPct: 1},
+		Failure: failureAttribution{MissingChunks: 1},
+	}}
+	worseFrames := &macroTraceCandidate{trace: &seedTrace{
+		Rep:     2,
+		Score:   seedTraceScore{FFFrames: 142, FramePct: 1, KeyPct: 1},
+		Failure: failureAttribution{MissingChunks: 1},
+	}}
+	if !worseFrames.worseThan(current) {
+		t.Fatal("lower decoded-frame result was not selected as the worse trace")
+	}
+	worsePacketsOnly := &macroTraceCandidate{trace: &seedTrace{
+		Rep:     3,
+		Score:   current.trace.Score,
+		Failure: failureAttribution{MissingChunks: 2},
+	}}
+	if !worsePacketsOnly.worseThan(current) {
+		t.Fatal("larger missing-chunk count did not break an equal-score tie")
+	}
+	if current.worseThan(worseFrames) {
+		t.Fatal("better decoded-frame result replaced the worse trace")
+	}
+}
+
+func TestMacroTraceCandidateWritesAndLinksFailure(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	trace := &seedTrace{
+		Case:  reportCase{Name: "iid loss5/rtt100"},
+		Arm:   "meld-auto",
+		Rep:   2,
+		Seed:  benchmarkSeed(2),
+		Score: seedTraceScore{FFFrames: 143, FramePct: 0.99, KeyPct: 1},
+		Failure: failureAttribution{
+			Kind:          "missing_source",
+			MissingChunks: 1,
+		},
+	}
+	failures := []failureReportRow{{Case: "unrelated"}, {Case: trace.Case.Name, Rep: trace.Rep, Seed: trace.Seed}}
+	candidate := &macroTraceCandidate{trace: trace, failureIndex: 1}
+	if err := candidate.write(dir, trace.Case.Name, trace.Arm, failures); err != nil {
+		t.Fatalf("write trace: %v", err)
+	}
+	if failures[0].Trace != "" {
+		t.Fatalf("unrelated failure linked to %q", failures[0].Trace)
+	}
+	if failures[1].Trace == "" {
+		t.Fatal("selected failure did not receive a trace link")
+	}
+
+	b, err := os.ReadFile(filepath.Join(dir, failures[1].Trace))
+	if err != nil {
+		t.Fatalf("read trace: %v", err)
+	}
+	var got seedTrace
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("decode trace: %v", err)
+	}
+	if got.Seed != trace.Seed || got.Score.FFFrames != trace.Score.FFFrames || got.Failure.Kind != trace.Failure.Kind {
+		t.Fatalf("trace lost diagnostic fields: seed=%d ff=%d failure=%q",
+			got.Seed, got.Score.FFFrames, got.Failure.Kind)
+	}
+}
+
 func TestMacroDecisionNamesSelectedTargetAndDeficit(t *testing.T) {
 	rows := []macroGapRow{
-		{Case: "weak_win", TheoryMeld: true, BestMeld: "meld", BestARQ: "libsrt", MeldFF: 120, ARQFF: 118, DeltaFF: 2, MeldFrame: 0.9, ARQFrame: 0.8, MeldKey: 1, ARQKey: 0.9},
-		{Case: "big_win", TheoryMeld: true, BestMeld: "meld-sld-uep", BestARQ: "libsrt", MeldFF: 144, ARQFF: 137, DeltaFF: 7, MeldFrame: 1, ARQFrame: 0.85, MeldKey: 1, ARQKey: 0.95},
-		{Case: "big_deficit", TheoryMeld: true, BestMeld: "meld-sld-uep", BestARQ: "libsrt", MeldFF: 122, ARQFF: 141, DeltaFF: -19, MeldFrame: 0.8, ARQFrame: 0.96, MeldKey: 0.88, ARQKey: 1},
+		{Case: "weak_win", TheoryMeld: true, BestMeld: "meld", BestARQ: "libsrt", MeldFF: 120, ARQFF: 118, Seeds: 8, DeltaFF: 2, MeldFrame: 0.9, ARQFrame: 0.8, MeldKey: 1, ARQKey: 0.9},
+		{Case: "big_win", TheoryMeld: true, BestMeld: "meld-sld-uep", BestARQ: "libsrt", MeldFF: 144, ARQFF: 137, Seeds: 8, DeltaFF: 7, MeldFrame: 1, ARQFrame: 0.85, MeldKey: 1, ARQKey: 0.95},
+		{Case: "big_deficit", TheoryMeld: true, BestMeld: "meld-sld-uep", BestARQ: "libsrt", MeldFF: 122, ARQFF: 141, Seeds: 8, DeltaFF: -19, MeldFrame: 0.8, ARQFrame: 0.96, MeldKey: 0.88, ARQKey: 1},
 	}
 	var b strings.Builder
 	writeMacroDecision(&b, rows)
@@ -388,7 +590,7 @@ func TestMacroDecisionNamesSelectedTargetAndDeficit(t *testing.T) {
 
 func TestMacroDecisionFlagsSeedNoisyDeficit(t *testing.T) {
 	rows := []macroGapRow{
-		{Case: "burst24_loss10_rtt100_1x_b100", TheoryMeld: true, BestMeld: "meld-auto", BestARQ: "libsrt", MeldFF: 127, ARQFF: 141, DeltaFF: -14, DeltaNoise: 24},
+		{Case: "burst24_loss10_rtt100_1x_b100", TheoryMeld: true, BestMeld: "meld-auto", BestARQ: "libsrt", MeldFF: 127, ARQFF: 141, Seeds: 8, DeltaFF: -14, DeltaNoise: 24},
 	}
 	var b strings.Builder
 	writeMacroDecision(&b, rows)
@@ -403,7 +605,7 @@ func TestMacroDecisionFlagsSeedNoisyDeficit(t *testing.T) {
 
 func TestMacroDecisionTreatsParityAsNonDeficit(t *testing.T) {
 	rows := []macroGapRow{
-		{Case: "parity", TheoryMeld: true, BestMeld: "meld-auto", BestARQ: "libsrt", MeldFF: 144, ARQFF: 144, DeltaFF: 0},
+		{Case: "parity", TheoryMeld: true, BestMeld: "meld-auto", BestARQ: "libsrt", MeldFF: 144, ARQFF: 144, Seeds: 8, DeltaFF: 0},
 	}
 	var b strings.Builder
 	writeMacroDecision(&b, rows)
@@ -418,13 +620,116 @@ func TestPublishSuiteSmokeIncludesPrimaryArms(t *testing.T) {
 	if !ok {
 		t.Fatal("smoke suite not found")
 	}
-	for _, arm := range []string{"oracle-source", "oracle-ideal", "meld-auto", "libsrt", "librist"} {
+	for _, arm := range primaryPublishArms() {
 		if !slices.Contains(suite.Arms, arm) {
 			t.Fatalf("smoke suite missing arm %q: %v", arm, suite.Arms)
 		}
 	}
 	if len(suite.Losses) == 0 || len(suite.RTTs) == 0 || len(suite.Mults) == 0 {
 		t.Fatalf("smoke suite has empty grid: %+v", suite)
+	}
+}
+
+func TestPublishSuiteCodecGateExercisesAutomaticSelector(t *testing.T) {
+	suite, ok := publishSuiteByName("codec-gate")
+	if !ok {
+		t.Fatal("codec-gate suite not found")
+	}
+	for _, arm := range primaryPublishArms() {
+		if !slices.Contains(suite.Arms, arm) {
+			t.Fatalf("codec-gate missing arm %q: %v", arm, suite.Arms)
+		}
+	}
+	if !slices.Equal(suite.Losses, []float64{0.10}) ||
+		!slices.Equal(suite.Bursts, []float64{0, 24, 48}) ||
+		!slices.Equal(suite.RTTs, []int{100}) ||
+		!slices.Equal(suite.Mults, []float64{0.75, 1, 2}) {
+		t.Fatalf("codec-gate no longer spans the intended selector boundary: %+v", suite)
+	}
+	if suite.SourceRTTCycles < 4 {
+		t.Fatalf("codec-gate source horizon = %d RTT cycles, want at least 4", suite.SourceRTTCycles)
+	}
+}
+
+func TestPublishSuiteFullEnvelopePinsEveryRequestedPlane(t *testing.T) {
+	suite, ok := publishSuiteByName("full-envelope")
+	if !ok {
+		t.Fatal("full-envelope suite not found")
+	}
+	for _, arm := range primaryPublishArms() {
+		if !slices.Contains(suite.Arms, arm) {
+			t.Fatalf("full-envelope missing arm %q: %v", arm, suite.Arms)
+		}
+	}
+	if !slices.Equal(suite.Losses, []float64{0, 0.01, 0.03, 0.05, 0.10}) ||
+		!slices.Equal(suite.Bursts, []float64{0, 8, 24, 48, 96}) ||
+		!slices.Equal(suite.RTTs, []int{20, 50, 100, 200, 400}) ||
+		!slices.Equal(suite.Mults, []float64{0.5, 0.75, 1, 1.25, 1.5, 2, 3}) ||
+		!slices.Equal(suite.Jitters, []int{0, 10}) {
+		t.Fatalf("full-envelope grid changed: %+v", suite)
+	}
+	if suite.MinReps != 3 || !suite.RequireCapacity || !suite.RequireDeadline || suite.SourceRTTCycles < 4 {
+		t.Fatalf("full-envelope proof guards changed: %+v", suite)
+	}
+	opts := macroFrontierOptions{
+		Losses: suite.Losses, Bursts: suite.Bursts, RTTs: suite.RTTs,
+		Mults: suite.Mults, JitterPlanes: suite.Jitters,
+	}
+	if got := macroTotalCells(opts); got != 1_750 {
+		t.Fatalf("full-envelope cells = %d, want 1750", got)
+	}
+}
+
+func TestMacroShardsPartitionEveryCellExactlyOnce(t *testing.T) {
+	opts := macroFrontierOptions{
+		Losses: []float64{0, 0.1}, Bursts: []float64{0, 24}, RTTs: []int{50, 100},
+		Mults: []float64{0.75, 1, 2}, JitterPlanes: []int{0, 10}, ShardCount: 7,
+	}
+	total := macroTotalCells(opts)
+	covered := 0
+	for shard := range opts.ShardCount {
+		opts.ShardIndex = shard
+		covered += macroShardCells(opts)
+	}
+	if covered != total {
+		t.Fatalf("shards cover %d cells, want %d", covered, total)
+	}
+	if macroShardCells(macroFrontierOptions{Losses: []float64{0}, Bursts: []float64{0}, RTTs: []int{1}, Mults: []float64{1}, ShardCount: 2, ShardIndex: 2}) != 0 {
+		t.Fatal("invalid shard unexpectedly covers cells")
+	}
+}
+
+func TestMacroExternalArmRetriesOnlyProcessBackedCompetitors(t *testing.T) {
+	for _, arm := range []string{"libsrt", "libsrt-fec", "librist"} {
+		if !macroExternalArm(arm) {
+			t.Fatalf("external arm %q is not retryable", arm)
+		}
+	}
+	for _, arm := range []string{"oracle-source", "oracle-ideal", "meld-auto"} {
+		if macroExternalArm(arm) {
+			t.Fatalf("in-process arm %q is retryable", arm)
+		}
+	}
+}
+
+func TestPublicationChunkSizeUsesCommonArmCeiling(t *testing.T) {
+	if got := publicationChunkSize(1316); got != 1284 {
+		t.Fatalf("publicationChunkSize(1316) = %d, want 1284", got)
+	}
+	if got := publicationChunkSize(1200); got != 1200 {
+		t.Fatalf("publicationChunkSize(1200) = %d, want requested smaller size", got)
+	}
+}
+
+func TestSourceRepeatsForHorizonNormalizesShortClips(t *testing.T) {
+	if got := sourceRepeatsForHorizon(&chunked{chunks: make([][]byte, 73)}, 1288, []int{50, 100}, 4); got != 5 {
+		t.Fatalf("short clip repeats = %d, want 5", got)
+	}
+	if got := sourceRepeatsForHorizon(&chunked{chunks: make([][]byte, 341)}, 1288, []int{100}, 4); got != 1 {
+		t.Fatalf("long clip repeats = %d, want 1", got)
+	}
+	if got := sourceRepeatsForHorizon(nil, 1288, []int{100}, 4); got != 1 {
+		t.Fatalf("nil clip repeats = %d, want 1", got)
 	}
 }
 
@@ -436,7 +741,7 @@ func TestPublishSuiteFallbackCheckExists(t *testing.T) {
 	if !slices.Contains(suite.Mults, 2) || !slices.Contains(suite.Mults, 3) {
 		t.Fatalf("fallback-check should cover generous buffers: %+v", suite.Mults)
 	}
-	for _, arm := range []string{"meld-auto", "libsrt", "librist"} {
+	for _, arm := range []string{"meld-auto", "libsrt", "libsrt-fec", "librist"} {
 		if !slices.Contains(suite.Arms, arm) {
 			t.Fatalf("fallback-check missing arm %q: %v", arm, suite.Arms)
 		}

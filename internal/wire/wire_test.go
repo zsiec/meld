@@ -19,21 +19,43 @@ func u32eq(a, b []uint32) bool {
 
 func TestSymbolRoundTrip(t *testing.T) {
 	cases := []Symbol{
-		{Flow: 1, Kind: Systematic, WindowBase: 100, SrcIndex: 105, Priority: 4,
-			Deadline: 1 << 40, Payload: []byte("hello systematic")},
-		{Flow: 0xDEADBEEF, Epoch: 0x1234, PathID: 1, Kind: Repair, WindowBase: 1000, SrcIndex: 7, N: 32,
-			RepairKey: 0xBEEF, Priority: 0, Deadline: -1, Payload: bytes.Repeat([]byte{0xAB}, 1316)},
+		{
+			Flow: 1, Kind: Systematic, WindowBase: 100, SrcIndex: 105, Priority: 4,
+			Deadline: 1 << 40, HasSourceLength: true, SourceLength: 7, Payload: []byte("hello systematic"),
+		},
+		{
+			Flow: 0xDEADBEEF, Epoch: 0x1234, PathID: 1, Kind: Repair, WindowBase: 1000, SrcIndex: 7, N: 32,
+			RepairKey: 0xBEEF, Priority: 0, Deadline: -1, Payload: bytes.Repeat([]byte{0xAB}, 1316),
+		},
+		{
+			Flow: 2, Kind: Repair, WindowBase: 9, SrcIndex: 4, N: 8, RepairKey: 17,
+			HasSourceLength: true, SourceLength: 23, Payload: bytes.Repeat([]byte{0xCD}, 35),
+		},
 		{Flow: 0, Kind: Systematic, Payload: nil},
-		{Flow: 7, PathID: 255, Kind: Systematic, SrcIndex: 3, SendTimestamp: 1_700_000_000_000_000,
-			Deadline: 1 << 41, Payload: []byte("with send ts on a path")},
-		{Flow: 9, Kind: Systematic, SrcIndex: 50, Priority: 4, HasFrameDesc: true,
-			FrameStart: 12, FrameLen: 7, FrameRefs: []uint32{8, 20}, FrameRAP: true, FrameRecoveryRefresh: true, Payload: []byte("with frame desc")},
-		{Flow: 9, Kind: Systematic, SrcIndex: 51, HasFrameDesc: true, FrameStart: 13, FrameLen: 1,
-			FrameDiscardable: true, FrameNonPicture: true, SendTimestamp: 42, Payload: []byte("desc + ts")},
-		{Flow: 9, Kind: Systematic, SrcIndex: 52, Priority: 2, HasFrameDesc: true, FrameStart: 14,
-			FrameLen: 3, FrameRefs: []uint32{2}, FrameLTR: true, Payload: []byte("ltr candidate")},
-		{Flow: 10, Kind: SparseRepair, SrcIndex: 99, N: 4, RepairKey: 123, Priority: 3, Deadline: 55,
-			SendTimestamp: 44, SparseIDs: []uint32{12, 21, 24, 33}, Payload: []byte("sparse repair")},
+		{
+			Flow: 7, PathID: 255, Kind: Systematic, SrcIndex: 3, SendTimestamp: 1_700_000_000_000_000,
+			Deadline: 1 << 41, Payload: []byte("with send ts on a path"),
+		},
+		{
+			Flow: 9, Kind: Systematic, SrcIndex: 50, Priority: 4, HasFrameDesc: true,
+			FrameStart: 12, FrameLen: 7, FrameRefs: []uint32{8, 20}, FrameRAP: true, FrameRecoveryRefresh: true, Payload: []byte("with frame desc"),
+		},
+		{
+			Flow: 9, Kind: Systematic, SrcIndex: 51, HasFrameDesc: true, FrameStart: 13, FrameLen: 1,
+			FrameDiscardable: true, FrameNonPicture: true, SendTimestamp: 42, Payload: []byte("desc + ts"),
+		},
+		{
+			Flow: 9, Kind: Systematic, SrcIndex: 52, Priority: 2, HasFrameDesc: true, FrameStart: 14,
+			FrameLen: 3, FrameRefs: []uint32{2}, FrameLTR: true, Payload: []byte("ltr candidate"),
+		},
+		{
+			Flow: 10, Kind: SparseRepair, SrcIndex: 99, N: 4, RepairKey: 123, Priority: 3, Deadline: 55,
+			SendTimestamp: 44, SparseIDs: []uint32{12, 21, 24, 33}, Payload: []byte("sparse repair"),
+		},
+		{
+			Flow: 11, Kind: UnitRepair, WindowBase: 77, SrcIndex: 77, N: 1, Priority: 2,
+			Deadline: 99, SendTimestamp: 66, HasSourceLength: true, SourceLength: 5, Payload: []byte("short"),
+		},
 	}
 	for i, want := range cases {
 		enc := EncodeSymbol(nil, want)
@@ -49,6 +71,7 @@ func TestSymbolRoundTrip(t *testing.T) {
 			got.WindowBase != want.WindowBase || got.SrcIndex != want.SrcIndex || got.N != want.N ||
 			got.RepairKey != want.RepairKey || !u32eq(got.SparseIDs, want.SparseIDs) ||
 			got.Priority != want.Priority || got.Deadline != want.Deadline || got.SendTimestamp != want.SendTimestamp ||
+			got.HasSourceLength != want.HasSourceLength || got.SourceLength != want.SourceLength ||
 			got.HasFrameDesc != want.HasFrameDesc || got.FrameLen != want.FrameLen || got.FrameStart != want.FrameStart ||
 			!u32eq(got.FrameRefs, want.FrameRefs) || got.FrameRAP != want.FrameRAP ||
 			got.FrameRecoveryRefresh != want.FrameRecoveryRefresh ||
@@ -80,7 +103,7 @@ func feedbackEqual(a, b Feedback) bool {
 		a.Keyframes != b.Keyframes || a.DecodableKeyframes != b.DecodableKeyframes ||
 		a.NewestDecodableLTR != b.NewestDecodableLTR || a.BrokenAnchors != b.BrokenAnchors ||
 		a.DeadPaths != b.DeadPaths || a.Missing != b.Missing ||
-		a.SettledLost != b.SettledLost || a.HasSettled != b.HasSettled {
+		a.SettledLost != b.SettledLost || a.OutageRun != b.OutageRun {
 		return false
 	}
 	return u16eq(a.PathLoss, b.PathLoss) && u16eq(a.SlotDist, b.SlotDist)
@@ -99,13 +122,15 @@ func u16eq(a, b []uint16) bool {
 }
 
 func TestFeedbackRoundTrip(t *testing.T) {
-	want := Feedback{Flow: 42, Epoch: 9, DecodedLowEdge: 1000, HighestSeen: 1050, Deficit: 7, EcnCE: 3,
+	want := Feedback{
+		Flow: 42, Epoch: 9, DecodedLowEdge: 1000, HighestSeen: 1050, Deficit: 7, EcnCE: 3,
 		LossRate: 19661, Deficits: [MaxFeedbackGens]uint8{7, 0, 3, 0, 1, 0, 0, 255},
 		CongestionLoss: 1234, Burstiness: 512,
 		PathLoss: []uint16{26214, 6553, 3276}, SlotDist: []uint16{52000, 9000, 3000, 535},
 		Frames: 120, DecodableFrames: 117, Keyframes: 4, DecodableKeyframes: 3,
 		NewestDecodableLTR: 887, BrokenAnchors: 6, DeadPaths: 0b10, Missing: 0xDEAD_BEEF_0000_0101,
-		SettledLost: 321, HasSettled: true}
+		SettledLost: 321, OutageRun: 73,
+	}
 	enc := EncodeFeedback(nil, want)
 	typ, err := PeekType(enc)
 	if err != nil || !IsFeedback(typ) {
@@ -121,50 +146,19 @@ func TestFeedbackRoundTrip(t *testing.T) {
 	if !bytes.Equal(EncodeFeedback(nil, got), enc) {
 		t.Fatal("re-encode not byte-stable")
 	}
-	// Forward-compat: a base-only datagram (tail truncated) decodes cleanly with the
-	// CongestionLoss/Burstiness and per-path fields zero, per the length-gated policy.
-	base, err := DecodeFeedback(enc[:feedbackLen])
-	if err != nil || base.CongestionLoss != 0 || base.Burstiness != 0 || base.Flow != want.Flow ||
-		base.PathLoss != nil || base.SlotDist != nil {
-		t.Fatalf("base-only decode: %+v err=%v", base, err)
-	}
-	// An N1/N2-length datagram (CongestionLoss/Burstiness present, no per-path tail)
-	// decodes those fields but leaves the per-path slices nil.
-	ext, err := DecodeFeedback(enc[:feedbackLenExt])
-	if err != nil || ext.CongestionLoss != want.CongestionLoss || ext.Burstiness != want.Burstiness ||
-		ext.PathLoss != nil || ext.SlotDist != nil || ext.Frames != 0 {
-		t.Fatalf("ext-only decode: %+v err=%v", ext, err)
-	}
 	single := want
 	single.PathLoss, single.SlotDist = nil, nil
 	singleGot, err := DecodeFeedback(EncodeFeedback(nil, single))
 	if err != nil || !feedbackEqual(singleGot, single) {
 		t.Fatalf("single-path media feedback: got %+v err=%v", singleGot, err)
 	}
-	// A datagram truncated before the LTR-resync tail (media stats present) decodes
-	// with the LTR and failover fields zero — an older peer's report reads as "no signal".
-	noLTR, err := DecodeFeedback(enc[:len(enc)-feedbackLTRLen-11])
-	if err != nil || noLTR.Frames != want.Frames || noLTR.NewestDecodableLTR != 0 || noLTR.BrokenAnchors != 0 || noLTR.DeadPaths != 0 {
-		t.Fatalf("ltr-truncated decode: %+v err=%v", noLTR, err)
+	for n := 0; n < len(enc); n++ {
+		if _, err := DecodeFeedback(enc[:n]); err != ErrShort {
+			t.Fatalf("truncated length %d: want ErrShort, got %v", n, err)
+		}
 	}
-	// Truncated after the LTR tail but before DeadPaths: LTR present, failover and
-	// missing-bitmap zero.
-	noDead, err := DecodeFeedback(enc[:len(enc)-11])
-	if err != nil || noDead.NewestDecodableLTR != want.NewestDecodableLTR || noDead.DeadPaths != 0 || noDead.Missing != 0 {
-		t.Fatalf("deadpaths-truncated decode: %+v err=%v", noDead, err)
-	}
-	// Truncated after DeadPaths but before the missing bitmap: bitmap and the
-	// settled tail read zero/absent.
-	noMiss, err := DecodeFeedback(enc[:len(enc)-10])
-	if err != nil || noMiss.DeadPaths != want.DeadPaths || noMiss.Missing != 0 || noMiss.HasSettled {
-		t.Fatalf("missing-truncated decode: %+v err=%v", noMiss, err)
-	}
-	// Truncated after the missing bitmap but before the settled tail (an arc-6-era
-	// peer): Missing decodes, HasSettled stays false — a zero count from an old peer
-	// must never read as positive clean evidence.
-	noSettled, err := DecodeFeedback(enc[:len(enc)-2])
-	if err != nil || noSettled.Missing != want.Missing || noSettled.HasSettled || noSettled.SettledLost != 0 {
-		t.Fatalf("settled-truncated decode: %+v err=%v", noSettled, err)
+	if _, err := DecodeFeedback(append(append([]byte(nil), enc...), 0)); err != ErrInvalid {
+		t.Fatalf("trailing byte: want ErrInvalid, got %v", err)
 	}
 }
 
@@ -197,9 +191,42 @@ func TestSparseRepairRejectsOversizedIDList(t *testing.T) {
 	}
 }
 
+func TestSourceLengthExtensionTruncation(t *testing.T) {
+	enc := EncodeSymbol(nil, Symbol{Kind: Systematic, HasSourceLength: true, SourceLength: 7})
+	for n := symbolHeader; n < symbolHeader+sourceLenLen; n++ {
+		if _, err := DecodeSymbol(enc[:n]); err != ErrShort {
+			t.Fatalf("length %d: want ErrShort, got %v", n, err)
+		}
+	}
+}
+
+func TestSymbolRejectsUnknownFlags(t *testing.T) {
+	enc := EncodeSymbol(nil, Symbol{Kind: Systematic, Payload: []byte("x")})
+	enc[29] = 0x80
+	if _, err := DecodeSymbol(enc); err != ErrInvalid {
+		t.Fatalf("unknown symbol flag: want ErrInvalid, got %v", err)
+	}
+}
+
+func TestFrameDescriptorRejectsUnknownFlagsAndExcessReferences(t *testing.T) {
+	enc := EncodeSymbol(nil, Symbol{Kind: Systematic, HasFrameDesc: true})
+	badFlags := append([]byte(nil), enc...)
+	badFlags[symbolHeader+6] = 0x80
+	if _, err := DecodeSymbol(badFlags); err != ErrInvalid {
+		t.Fatalf("unknown descriptor flag: want ErrInvalid, got %v", err)
+	}
+
+	tooMany := append([]byte(nil), enc...)
+	tooMany[symbolHeader+7] = descMaxRefs + 1
+	tooMany = append(tooMany, make([]byte, 4*(descMaxRefs+1))...)
+	if _, err := DecodeSymbol(tooMany); err != ErrInvalid {
+		t.Fatalf("excess descriptor references: want ErrInvalid, got %v", err)
+	}
+}
+
 // TestVersionMismatch: a datagram stamped with a version this build does not know
 // is rejected with ErrVersion (never decoded as silent garbage) — the guard that
-// lets a later revision add a field without an older peer misparsing it.
+// prevents a different format from being parsed under the version-1 schema.
 func TestVersionMismatch(t *testing.T) {
 	sym := EncodeSymbol(nil, Symbol{Flow: 1, Kind: Systematic, Payload: []byte("x")})
 	fb := EncodeFeedback(nil, Feedback{Flow: 1})

@@ -18,12 +18,14 @@ import (
 )
 
 // Config parameterizes a Sender/Receiver pair. Both ends must agree on Flow,
-// SymbolSize, GenSize, and BufferMicros; Redundancy is the sender's proactive
-// code rate (repair symbols per source symbol).
+// SymbolSize, and BufferMicros; generation-mode deployments must also agree on
+// their generation constraints. DefaultConfig selects the automatic sliding
+// recovery path, so applications do not choose FEC, ARQ, or burst-copy modes.
 type Config struct {
 	// Flow identifies the flow on the wire.
 	Flow uint32
-	// SymbolSize is the fixed media-chunk / coded-symbol size in bytes.
+	// SymbolSize is the maximum application chunk and fixed algebraic width in
+	// bytes. Systematic datagrams carry only the exact bytes written.
 	SymbolSize int
 	// GenSize is the coding generation (window) size in source symbols. With
 	// AdaptiveGenSize off this is the exact, fixed generation width; with it on it is the
@@ -88,9 +90,11 @@ type Config struct {
 	// lost) and the estimators over-count loss, over-sizing proactive repair severalfold. 0 ⇒ off.
 	// Single-path only for now. Receiver-side; the two ends may differ. Overridden by AutoReorderHoldoff.
 	ReorderHoldoffMicros int64
-	// AutoReorderHoldoff sizes the reorder window from the MEASURED reorder spread (zero-config, and
-	// self-disabling where there is no reorder) instead of a fixed ReorderHoldoffMicros. Single-path
-	// only for now. Receiver-side. Off by default.
+	// AutoReorderHoldoff sizes the generation receiver's loss-estimator reorder
+	// window from measured spread instead of a fixed ReorderHoldoffMicros. It is
+	// zero-config, self-disabling without reorder, single-path, receiver-side, and
+	// on in DefaultConfig. The sliding receiver uses its separately validated
+	// settled-loss holdoff.
 	AutoReorderHoldoff bool
 	// Redundancy is the FLOOR proactive code rate (repair per source symbol); the
 	// controller raises the rate above it as the measured loss requires. On a link
@@ -109,32 +113,23 @@ type Config struct {
 	TargetFailure float64
 	// BufferMicros is the playout/deadline budget in microseconds.
 	BufferMicros int64
-	// Sliding selects the band-form sliding-window coder, the default main profile.
-	// It codes continuous, fungible repair over one elastic window and delivers each
-	// symbol the instant it decodes. Set false to use the generation coder fallback.
-	//
-	// Reach for it when the latency budget (BufferMicros) is TIGHT relative to the
-	// RTT — above all when the budget is SMALLER than the round trip: low-latency
-	// contribution over a long-haul lossy link, where an ARQ retransmit and the
-	// generation coder's feedback-driven reactive tier cannot recover in time but
-	// this coder's continuous, RTT-independent proactive repair can. It also costs
-	// less repair overhead (a wider coding window needs a smaller variance margin),
-	// so it suits bandwidth-constrained links.
-	//
-	// Its tradeoff is decode cost and a wider recovery band: at a generous budget
-	// with a low RTT, generation mode can still be a useful control/fallback path.
-	// Decode costs O(CodingWindow²) per symbol.
+	// Sliding selects the band-form sliding-window coder used by DefaultConfig. It
+	// codes continuous, fungible repair over one elastic window and automatically
+	// selects proactive equations, staged exact closure, or burst-spaced copies from
+	// measured conditions. Set false only for a generation-mode or control
+	// deployment; transient path changes do not require changing this field.
+	// Sliding decode costs O(CodingWindow²) per symbol.
 	Sliding bool
 	// CodingWindow is the MAX sliding band width in source symbols — the recovery
 	// span and O(window²) decode-cost cap. The sender adapts the effective span below
 	// it to fit the deadline budget, so this is a ceiling, not a fixed width. 0 ⇒
 	// default. Ignored unless Sliding.
 	CodingWindow int
-	// CongestionControl enables the generation-mode delay-based congestion controller:
+	// CongestionControl enables the delay-based congestion controller:
 	// it derives the send-rate budget from the standing-queue delay (loss-agnostic,
 	// since coding masks loss) and throttles REPAIR to stay within it — protecting media
-	// goodput and surfacing a target rate the source should pace within. Off, or Sliding
-	// mode today, means a static rate ceiling only. Leave off until validated on your paths.
+	// goodput and surfacing a target rate the source should pace within. Off means a
+	// static rate ceiling only. Leave off until validated on your paths.
 	CongestionControl bool
 	// Pace enables the host transmit pacer: the sender smooths coded datagrams onto the
 	// wire at a rate slaved to the congestion/ceiling budget (never a second controller)
@@ -144,8 +139,8 @@ type Config struct {
 	// On by default (DefaultConfig). Turn off to transmit each emit immediately.
 	Pace bool
 	// ProbeMTU enables host-side DPLPMTUD (RFC 8899): the sender probes the path MTU with
-	// padded, Don't-Fragment datagrams and detects size black holes. Phase 1 discovers and
-	// reports the PLPMTU; it does not yet resize SymbolSize automatically. Off by default.
+	// padded, Don't-Fragment datagrams and detects size black holes. It discovers and
+	// reports the PLPMTU; it does not resize SymbolSize automatically. Off by default.
 	ProbeMTU bool
 	// MaxProbeMTU is the largest UDP payload size DPLPMTUD probes for. 0 selects the
 	// host default. Ignored unless ProbeMTU.
@@ -198,27 +193,16 @@ type Config struct {
 	// wire-loss counters are never censored. Payload-agnostic (no media metadata needed).
 	// ON by default (DefaultConfig); set false for the outage-blind estimators.
 	OutageAware bool
-	// SlidingReactiveShift (EXPERIMENTAL, off by default) enables the sliding profile's
-	// remaining reactive-offload levers: the rounds-gated burst/variance
-	// margin discount, budget-conditional TargetFailure relief, and NACK-bitmap unit
-	// answering (the receiver's missing-ids bitmap answered with instant-closing unit
-	// retransmissions of retained sources; measured to collapse hole release latency
-	// 195-680ms → ~33-92ms in exact-stream replay, though the deep-burst glass cell's
-	// arbitered score is governed by direct-chunk shadow fates it only grazes). The
-	// permutation sweep measured positive means but per-seed breaches in deep-burst
-	// cells; off until a regime where release latency is the margin earns it more.
-	// Sender-side.
+	// SlidingReactiveShift enables an aggressive reactive-offload benchmark override.
+	// The default path already performs persistence-gated exact closure and
+	// deadline-qualified burst copies automatically. This flag bypasses some of the
+	// conservative persistence/headroom gates for controlled A/B work and is not a
+	// deployment mode. Sender-side.
 	SlidingReactiveShift bool
-	// HeadroomAwareSizing (EXPERIMENTAL, off by default) caps the sliding profile's
-	// proactive repair set-point at the wire's MEASURED affordable rate, so the sizer
-	// never demands protection the path cannot carry (unaffordable sizing floods the
-	// sender's own queue and collapses delivery — the breaker/set-point limit cycle).
-	// On explicit-capacity links the deterministic bench measures large wins (the
-	// worst saturating cell 23%→95% of chunks delivered in time; nine sweep cells +9
-	// to +70 points at lower overhead; none worse). Off by default: a loopback bench
-	// has no true wire capacity and misreads bursty scheduling delay as saturation
-	// (two bursty cells traded ~6 points of delivery for ~200 points of overhead
-	// there), so the default waits on real-path validation. Sender-side.
+	// HeadroomAwareSizing enables a delay-inferred headroom benchmark override. The
+	// default path always enforces the source-first byte governor derived from
+	// MaxBitrate and measured source cadence; this flag adds a secondary estimator
+	// and is retained only for controlled A/B work. Sender-side.
 	HeadroomAwareSizing bool
 	// Passphrase enables encryption (docs/encryption.md): when non-empty, the Sender and
 	// Receiver run an X25519 + ML-KEM-768 hybrid post-quantum handshake before any media
@@ -338,7 +322,7 @@ func (c Config) toFlow() flow.Config {
 	}
 }
 
-// toFlowPaths is toFlow with the path count set (coding-native multipath, N5): the
+// toFlowPaths is toFlow with the path count set for coding-native multipath: the
 // generation is spread across paths and decoded from the union.
 func (c Config) toFlowPaths(paths int) flow.Config {
 	fc := c.toFlow()
@@ -351,7 +335,7 @@ func (c Config) toFlowPaths(paths int) flow.Config {
 
 // FrameDesc is the per-access-unit media descriptor a shaper hands WriteFrame: the
 // protection tier plus the dependency the receiver needs to compute decodable-frame
-// stats parse-free (WP6). FrameID identifies the access unit (the shaper's unit id);
+// stats without parsing the codec. FrameID identifies the access unit (the shaper's unit id);
 // RefFrameIDs are its dependency access units (a B-frame's two anchors, a P-frame's one);
 // Chunks is its total chunk count (so the receiver knows its id range); RAP marks a
 // keyframe; RecoveryRefresh marks a reference slice inside a signaled intra-refresh
@@ -384,7 +368,7 @@ func (d FrameDesc) toFlow() flow.FrameDesc {
 	}
 }
 
-// FrameStats is the receiver's parse-free media-frame decodability snapshot (WP6): how
+// FrameStats is the receiver's parse-free media-frame decodability snapshot: how
 // many access units / keyframes were decodable (delivered with their dependency closure
 // intact) versus total — a picture-level QoE signal the receiver computes from the wire
 // descriptors without parsing the codec.
@@ -408,10 +392,14 @@ type SenderStats struct {
 	Repair                uint64 // repair symbols sent (total)
 	ReactiveRepair        uint64 // the subset sent in response to a feedback rank deficit
 	Throttled             uint64 // repair symbols dropped by the aggregate rate ceiling
+	DeadlineRepairSkips   uint64 // repair symbols suppressed because they could not arrive before the coded window deadline
 	HeadroomTightens      uint64 // headroom-cap tighten events: sustained wire-saturation evidence capped the proactive set-point (sliding profile)
 	RecoveryCadenceFrames uint16 // encoder max recovery interval request; 0 means relaxed
+	// SourceWireBytesMean is the recent mean encoded systematic datagram size used
+	// by source-first recovery admission.
+	SourceWireBytesMean uint64
 
-	// Per-mechanism attribution of Repair. The five counters below sum to Repair on
+	// Per-mechanism attribution of Repair. The five contribution counters below sum to Repair on
 	// the sliding profile (Config.Sliding); on the generation profile they read zero
 	// and Repair/ReactiveRepair carry the only split.
 
@@ -430,12 +418,50 @@ type SenderStats struct {
 	// RepairDeficit counts deficit-answering reactive window repair (the
 	// retrospective reactive tier). Sliding profile only.
 	RepairDeficit uint64
+	// RepairExact counts missing-driven exact retransmissions selected after coded
+	// repair leaves a reported residual. It is a subset of RepairDeficit, not an
+	// additional contribution to Repair.
+	RepairExact uint64
+	// RepairBurstDuplicate counts deadline-qualified delayed compact repetitions
+	// selected for a measured burst path. It is a subset of RepairProactive.
+	RepairBurstDuplicate uint64
+	// RepairOutageDiversity counts proactive band equations moved across a
+	// receiver-classified outage span. It is a subset of RepairProactive and does
+	// not add to the controller's redundancy rate.
+	RepairOutageDiversity uint64
+	// RepairEpoch counts proactive equations whose ordinary repair credit
+	// was assigned by the automatic allocator to isolated fixed-geometry epochs.
+	// It is a subset of RepairProactive.
+	RepairEpoch uint64
+	// EpochBlocks counts stable 16-source blocks opened by the automatic
+	// fixed/sliding allocator, including blocks that close with no admitted row.
+	EpochBlocks uint64
+	// EpochDemandQ8 is the latest fixed-geometry demand, where 256 is the
+	// strongest request and zero means no current allocation demand.
+	EpochDemandQ8 uint16
+	// EpochCorrelationQ8 is the latest repeated burst-memory confidence.
+	EpochCorrelationQ8 uint16
+	// EpochMemoryQ8 is confirmed burst/outage memory after promotion.
+	EpochMemoryQ8 uint16
+	// EpochShareQ8 is the epoch share selected for the latest block;
+	// the remainder of ordinary proactive credit stayed in sliding RLNC.
+	EpochShareQ8 uint16
+	// RepairCompacted counts dense and sparse equations serialized without their
+	// trailing zero application bytes.
+	RepairCompacted uint64
+	// RepairBytesSaved is the number of wire bytes omitted by compact equation
+	// serialization. Control admission remains charged at full equation width.
+	RepairBytesSaved uint64
 }
 
 // EncoderControl is Meld's advisory source-control output for an attached encoder.
 // It does not create a separate deployable profile: a host may apply the request,
 // and if the encoder cannot comply, Meld continues with the same transport loop.
 type EncoderControl struct {
+	// TargetBitrateBps asks the encoder to cap its source payload so transport
+	// recovery has room inside the current total-rate budget. Zero means no
+	// active reduction request.
+	TargetBitrateBps int64
 	// RecoveryCadenceFrames asks the encoder to bound the distance between recovery
 	// points, in displayed frames. 0 means no active request. Encoders may satisfy
 	// this with keyframes, recovery-point SEI, or intra-refresh.
@@ -451,6 +477,7 @@ type EncoderControl struct {
 
 func encoderControlFromFlow(c flow.EncoderControl) EncoderControl {
 	return EncoderControl{
+		TargetBitrateBps:      c.TargetBitrateBps,
 		RecoveryCadenceFrames: c.RecoveryCadenceFrames,
 		Resync:                c.Resync,
 		ResyncRefFrameID:      c.ResyncRefFrameID,
@@ -510,9 +537,6 @@ func (c Config) Check() []string {
 				"simpler — use AutoGenSize, which measures it itself.")
 		}
 	}
-	if c.Sliding && c.CongestionControl {
-		w = append(w, "meld: CongestionControl is generation-mode only today; Sliding will use the static MaxBitrate ceiling.")
-	}
 	return w
 }
 
@@ -559,7 +583,7 @@ func (s *Sender) Write(p []byte) (int, error) { return s.s.Write(p) }
 // higher = protect harder; the priority a media shaper assigns from the bitstream).
 // The coder sizes that generation's repair to the tier and, under a budget ceiling,
 // sheds disposable repair before critical — unequal protection that keeps parameter
-// sets, keyframes, and the base layer decodable when the budget is tight (WP6).
+// sets, keyframes, and the base layer decodable when the budget is tight.
 func (s *Sender) WriteUnit(p []byte, priority uint8) (int, error) { return s.s.WriteUnit(p, priority) }
 
 // WriteFrame streams one media chunk carrying the full access-unit descriptor (tier +
@@ -581,10 +605,19 @@ func (s *Sender) Stats() SenderStats {
 func senderStatsFromFlow(st flow.SenderStats) SenderStats {
 	return SenderStats{
 		Source: st.Source, Repair: st.Repair, ReactiveRepair: st.ReactiveRepair,
-		Throttled: st.Throttled, HeadroomTightens: st.HeadroomTightens,
-		RecoveryCadenceFrames: st.RecoveryCadenceFrames,
-		RepairProactive:       st.RepairProactive, RepairProactiveCold: st.RepairProactiveCold,
+		Throttled: st.Throttled, DeadlineRepairSkips: st.DeadlineRepairSkips, HeadroomTightens: st.HeadroomTightens,
+		RecoveryCadenceFrames: st.RecoveryCadenceFrames, SourceWireBytesMean: st.SourceWireBytesMean,
+		RepairProactive: st.RepairProactive, RepairProactiveCold: st.RepairProactiveCold,
 		RepairSingleton: st.RepairSingleton, RepairSparse: st.RepairSparse, RepairDeficit: st.RepairDeficit,
+		RepairExact: st.RepairExact, RepairBurstDuplicate: st.RepairBurstDuplicate,
+		RepairOutageDiversity: st.RepairOutageDiversity,
+		RepairEpoch:           st.RepairEpoch,
+		EpochBlocks:           st.EpochBlocks,
+		EpochDemandQ8:         st.EpochDemandQ8,
+		EpochCorrelationQ8:    st.EpochCorrelationQ8,
+		EpochMemoryQ8:         st.EpochMemoryQ8,
+		EpochShareQ8:          st.EpochShareQ8,
+		RepairCompacted:       st.RepairCompacted, RepairBytesSaved: st.RepairBytesSaved,
 	}
 }
 
@@ -651,7 +684,7 @@ func (r *Receiver) FrameStats() FrameStats { return frameStatsFromFlow(r.r.Frame
 func (r *Receiver) Close() error { return r.r.Close() }
 
 // MultipathSender transmits a coded media flow spread across two network paths
-// (coding-native multipath, N5): the generation is split across the paths and the
+// using coding-native multipath: the generation is split across the paths and the
 // receiver decodes from the union, so two lossy paths add diversity rather than the
 // N× cost of duplicating every packet (ST 2022-7). Repair is sized against the JOINT
 // erasure tail of the paths and metered toward the better deliverer.
@@ -671,13 +704,13 @@ func NewMultipathSender(remotes []string, cfg Config) (*MultipathSender, error) 
 // Write streams one media chunk (<= SymbolSize bytes); the core places it on a path.
 func (s *MultipathSender) Write(p []byte) (int, error) { return s.s.Write(p) }
 
-// WriteUnit streams one media chunk carrying a protection tier (unequal protection,
-// WP6); the core sizes its repair to the tier and places it across the paths.
+// WriteUnit streams one media chunk carrying a protection tier; the core sizes its
+// repair to the tier and places it across the paths.
 func (s *MultipathSender) WriteUnit(p []byte, priority uint8) (int, error) {
 	return s.s.WriteUnit(p, priority)
 }
 
-// WriteFrame streams one media chunk carrying the full access-unit descriptor (WP6); the
+// WriteFrame streams one media chunk carrying the full access-unit descriptor; the
 // core sizes its repair to the tier, places it across the paths, and stamps the
 // dependency so the receiver computes decodable-frame stats parse-free.
 func (s *MultipathSender) WriteFrame(p []byte, fd FrameDesc) (int, error) {

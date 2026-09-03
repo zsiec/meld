@@ -131,7 +131,7 @@ func NewMultipathSender(remotes []string, cfg flow.Config, sec *SecurityConfig) 
 		select {
 		case <-s.hsDone:
 		case <-time.After(handshakeTimeout):
-			s.Close()
+			_ = s.Close()
 			return nil, errHandshakeTimeout
 		}
 	}
@@ -145,12 +145,12 @@ func (s *MultipathSender) Write(p []byte) (int, error) {
 	return s.write(p, func(now clock.Timestamp, data []byte) { s.flow.Write(now, data) })
 }
 
-// WriteUnit hands one media chunk carrying a protection tier (unequal protection, WP6).
+// WriteUnit hands one media chunk carrying an unequal-protection tier.
 func (s *MultipathSender) WriteUnit(p []byte, priority uint8) (int, error) {
 	return s.write(p, func(now clock.Timestamp, data []byte) { s.flow.WriteUnit(now, data, priority) })
 }
 
-// WriteFrame hands one media chunk carrying the full access-unit descriptor (WP6).
+// WriteFrame hands one media chunk carrying the full access-unit descriptor.
 func (s *MultipathSender) WriteFrame(p []byte, fd flow.FrameDesc) (int, error) {
 	return s.write(p, func(now clock.Timestamp, data []byte) { s.flow.WriteFrame(now, data, fd) })
 }
@@ -253,7 +253,7 @@ func (s *MultipathSender) broadcast(msg []byte) {
 
 func (s *MultipathSender) sendOut(out [][]byte) error {
 	if s.pace != nil {
-		return s.pace.put(out)
+		return s.pace.putFlow(out)
 	}
 	return s.transmit(out)
 }
@@ -282,7 +282,7 @@ func (s *MultipathSender) transmit(out [][]byte) error {
 }
 
 // recvLoop services one path substrate: it feeds back feedback reports, answers clock
-// probes (N4), and completes the encryption handshake (path 0), exactly like the
+// probes, and completes the encryption handshake (path 0), exactly like the
 // single-path host but per path.
 func (s *MultipathSender) recvLoop(path int) {
 	sub := s.subs[path]
@@ -450,7 +450,7 @@ func (s *MultipathSender) tickLoop() {
 				s.pace.setRate(budget / 8)
 				s.pace.offer(out)
 			} else {
-				s.transmit(out)
+				_ = s.transmit(out) // background repair has no synchronous caller to report to
 			}
 			for _, p := range probes {
 				_ = writeDatagram(s.subs[p.path], p.data, nil)
@@ -463,7 +463,7 @@ func (s *MultipathSender) tickLoop() {
 // and feeds every inbound symbol into the one shared flow.Receiver, which reads the
 // path from wire.Symbol.PathID and decodes from the union across paths. Feedback is
 // returned on every path's learned peer (idempotent and tiny, so duplicating it keeps
-// the control loop alive if a path dies); the clock and encryption handshakes (N4 /
+// the control loop alive if a path dies); the clock and encryption handshakes
 // docs/encryption.md) run on path 0. The per-symbol open (embedded openState) is
 // path-agnostic.
 type MultipathReceiver struct {
@@ -601,7 +601,7 @@ func (r *MultipathReceiver) LocalAddrs() []string {
 }
 
 // coreNow translates local time into the sender's frame by the estimated clock offset
-// (N4), so the deterministic core compares sender-stamped deadlines correctly.
+// so the deterministic core compares sender-stamped deadlines correctly.
 func (r *MultipathReceiver) coreNow() clock.Timestamp { return r.clk.Now().Add(r.cs.offsetMicros()) }
 
 // Read returns the next in-order delivered media chunk, blocking until one is
@@ -624,7 +624,7 @@ func (r *MultipathReceiver) Read(p []byte) (int, error) {
 	case c := <-r.deliverCh:
 		n := copy(p, c)
 		if r.ptPool != nil {
-			r.ptPool.Put(c) // encrypted session: recycle the decrypt buffer after copying it out
+			r.ptPool.put(c) // encrypted session: recycle the decrypt buffer after copying it out
 		}
 		return n, nil
 	case <-timeout:
@@ -649,7 +649,7 @@ func (r *MultipathReceiver) Stats() flow.ReceiverStats {
 	return addStats(r.statAccum, r.flow.Stats())
 }
 
-// FrameStats returns the receiver's parse-free media-frame decodability snapshot (WP6).
+// FrameStats returns the receiver's parse-free media-frame decodability snapshot.
 func (r *MultipathReceiver) FrameStats() flow.FrameStats {
 	r.mu.Lock()
 	defer r.mu.Unlock()

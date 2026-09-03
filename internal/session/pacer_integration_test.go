@@ -21,9 +21,9 @@ func TestPacerSeamOverPipe(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newReceiver: %v", err)
 	}
-	defer rx.Close()
+	defer func() { _ = rx.Close() }()
 	tx, _ := newSender(txEnd, cfg, clock.NewRealClock(), nil)
-	defer tx.Close()
+	defer func() { _ = tx.Close() }()
 
 	const n = 200
 	want := make([][]byte, n)
@@ -39,7 +39,9 @@ func TestPacerSeamOverPipe(t *testing.T) {
 	}
 	tx.Flush()
 
-	rx.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if err := rx.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
 	buf := make([]byte, cfg.SymbolSize)
 	for i := 0; i < n; i++ {
 		m, err := rx.Read(buf)
@@ -150,7 +152,7 @@ func TestPacerSmoothsBurstAtSession(t *testing.T) {
 			time.Sleep(500 * time.Millisecond)
 		}
 		peak, span = cap.maxInWindow(5*time.Millisecond), cap.span()
-		tx.Close()
+		_ = tx.Close()
 		return peak, span
 	}
 

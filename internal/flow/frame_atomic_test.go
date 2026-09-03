@@ -14,7 +14,7 @@ import (
 func TestFrameAtomicDelivery(t *testing.T) {
 	// Drive one RAP frame of `chunks` chunks (ids 0..chunks-1), losing the systematic for
 	// `lose` (no repair ⇒ unrecoverable), and return which ids the receiver delivered.
-	run := func(atomic bool, chunks int, lose int) []uint32 {
+	run := func(atomic bool, chunks, lose int) []uint32 {
 		cfg := Config{Flow: 1, SymbolSize: testSym, GenSize: 16, Redundancy: 0, BufferMicros: 50_000, FrameAtomic: atomic}
 		s := NewSender(cfg)
 		r := NewReceiver(cfg)

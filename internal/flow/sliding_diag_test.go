@@ -53,7 +53,7 @@ func slidingClassify(t *testing.T, cfg Config, n int, owd, src, jit int64, seed 
 			genDec[bucket]++
 		}
 	}
-	return
+	return deliv, prem, gen, premDec, genDec, sstats
 }
 
 // TestSlidingResidualDiag is a non-asserting diagnostic: it locates the sliding

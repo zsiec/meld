@@ -3,8 +3,7 @@ package flow
 import "github.com/zsiec/meld/internal/clock"
 
 // This file is the LTR-resync controller: the sender half of the reference-chain
-// recovery loop validated by the pre-registered burst-cell experiment
-// (ltr_resync_test.go; decision notes in docs/decisions). The burst-frontier failure
+// recovery loop exercised by ltr_resync_test.go. The burst-frontier failure
 // mode is dependency-island death — a burst kills a reference anchor and every frame
 // until the next scheduled IDR decodes into garbage — and the repair-ceiling arm
 // showed more repair does not fix it: the island is structural. The proven media-side
@@ -33,7 +32,7 @@ type resyncController struct {
 // detection-lag hold-down: after raising a request, no re-raise until it elapses —
 // the resync's own fate (it can die in the same burst that caused it) cannot be
 // KNOWN sooner than deadline-expiry plus transit plus a feedback interval, so firing
-// faster is blind re-spending. The experiment showed the hold-down is load-bearing:
+// faster is blind re-spending. The hold-down is load-bearing:
 // without it, large recovery frames retrigger-storm during a burst and drown the
 // stream they are meant to save. An unhonored request also expires after one hold
 // window (the application may not support resync at all).

@@ -32,8 +32,8 @@ func writeMacroCharts(outDir string, rows []macroFrontierRow, gaps []macroGapRow
 func writeChartsIndex(path string) error {
 	return os.WriteFile(path, []byte(`# Charts
 
-- [Delta bars](delta-bars.svg): deployable Meld minus best ARQ, sorted by absolute frame delta.
-- [Frontier heatmap](frontier-heatmap.svg): Meld-vs-ARQ frame delta across RTT and latency-budget cells.
+- [Delta bars](delta-bars.svg): deployable Meld minus best SRT/RIST competitor, sorted by absolute frame delta.
+- [Frontier heatmap](frontier-heatmap.svg): Meld-versus-best-competitor frame delta across RTT and latency-budget cells.
 - [Arm frames](arm-frames.svg): ffprobe decoded-frame means for selected high-signal cases.
 - [Cost/gain](cost-gain.svg): frame delta versus observed relay byte delta and Meld repair overhead.
 `), 0o644)
@@ -60,8 +60,8 @@ func writeDeltaBarsSVG(path string, gaps []macroGapRow, opts macroFrontierOption
 		}
 	}
 	var b strings.Builder
-	svgHeader(&b, width, height, "Meld vs best ARQ frame delta")
-	fmt.Fprintf(&b, `<text x="24" y="32" class="title">Meld-auto minus best ARQ, ffprobe frames</text>`)
+	svgHeader(&b, width, height, "Meld vs best competitor frame delta")
+	fmt.Fprintf(&b, `<text x="24" y="32" class="title">Meld-auto minus best SRT/RIST competitor, ffprobe frames</text>`)
 	fmt.Fprintf(&b, `<line x1="%d" y1="46" x2="%d" y2="%d" class="axis"/>`, center, center, height-20)
 	for i, g := range cp {
 		y := top + i*rowH
@@ -90,7 +90,7 @@ func signLabelOffset(v float64) int {
 func writeHeatmapSVG(path string, gaps []macroGapRow, opts macroFrontierOptions) error {
 	byFacet := map[string][]macroGapRow{}
 	for _, g := range gaps {
-		key := fmt.Sprintf("%s loss, %s", pctName(g.Loss), burstLabel(g.Burst))
+		key := fmt.Sprintf("%s loss, %s, %d ms jitter", pctName(g.Loss), burstLabel(g.Burst), g.Jitter)
 		byFacet[key] = append(byFacet[key], g)
 	}
 	facets := make([]string, 0, len(byFacet))
@@ -108,7 +108,7 @@ func writeHeatmapSVG(path string, gaps []macroGapRow, opts macroFrontierOptions)
 	maxDelta := maxAbsDelta(gaps)
 	var b strings.Builder
 	svgHeader(&b, width, height, "Frontier heatmap")
-	fmt.Fprintf(&b, `<text x="24" y="32" class="title">Frame delta heatmap (Meld-auto - best ARQ)</text>`)
+	fmt.Fprintf(&b, `<text x="24" y="32" class="title">Frame delta heatmap (Meld-auto - best competitor)</text>`)
 	for fi, facet := range facets {
 		y0 := 56 + fi*facetH
 		fmt.Fprintf(&b, `<text x="24" y="%d" class="facet">%s</text>`, y0, svgText(facet))

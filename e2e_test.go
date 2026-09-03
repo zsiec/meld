@@ -27,18 +27,20 @@ func makeChunk(rng *rand.Rand, id uint32) []byte {
 }
 
 // streamSource writes n id-encoded chunks to tx, lightly paced, then flushes.
-func streamSource(tx *meld.Sender, rng *rand.Rand, n int) map[uint32][]byte {
+func streamSource(tx *meld.Sender, rng *rand.Rand, n int) (map[uint32][]byte, error) {
 	src := make(map[uint32][]byte, n)
 	for i := 0; i < n; i++ {
 		c := makeChunk(rng, uint32(i))
 		src[uint32(i)] = c
-		tx.Write(c)
+		if _, err := tx.Write(c); err != nil {
+			return nil, err
+		}
 		if i%8 == 0 {
 			time.Sleep(time.Millisecond)
 		}
 	}
 	tx.Flush()
-	return src
+	return src, nil
 }
 
 // readStream reads delivered chunks until a read idles out (stream ended),
@@ -46,13 +48,16 @@ func streamSource(tx *meld.Sender, rng *rand.Rand, n int) map[uint32][]byte {
 func readStream(t *testing.T, rx interface {
 	Read([]byte) (int, error)
 	SetReadDeadline(time.Time) error
-}, idle time.Duration) ([]uint32, map[uint32][]byte) {
+}, idle time.Duration,
+) ([]uint32, map[uint32][]byte) {
 	t.Helper()
 	var ids []uint32
 	byID := map[uint32][]byte{}
 	buf := make([]byte, 4096)
 	for {
-		rx.SetReadDeadline(time.Now().Add(idle))
+		if err := rx.SetReadDeadline(time.Now().Add(idle)); err != nil {
+			t.Fatalf("set read deadline: %v", err)
+		}
 		n, err := rx.Read(buf)
 		if err != nil {
 			break
@@ -97,17 +102,24 @@ func TestE2ELoopbackClean(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewReceiver: %v", err)
 	}
-	defer rx.Close()
+	defer func() { _ = rx.Close() }()
 	tx, err := meld.NewSender(rx.LocalAddr(), cfg)
 	if err != nil {
 		t.Fatalf("NewSender: %v", err)
 	}
-	defer tx.Close()
+	defer func() { _ = tx.Close() }()
 
 	rng := rand.New(rand.NewSource(1))
-	go streamSource(tx, rng, e2eN)
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := streamSource(tx, rng, e2eN)
+		writeDone <- err
+	}()
 
 	ids, byID := readStream(t, rx, 3*time.Second)
+	if err := <-writeDone; err != nil {
+		t.Fatalf("stream source: %v", err)
+	}
 	assertOrderedCorrect(t, ids, byID, mustSrc(rng, e2eN))
 	if len(ids) != e2eN {
 		st := rx.Stats()
@@ -125,19 +137,22 @@ func TestE2EHeavyLossSurvival(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewReceiver: %v", err)
 	}
-	defer rx.Close()
+	defer func() { _ = rx.Close() }()
 
 	proxy := startLossyProxy(t, 0.25, 7, rx.LocalAddr())
-	defer proxy.Close()
+	defer func() { _ = proxy.Close() }()
 
 	tx, err := meld.NewSender(proxy.addr(), cfg)
 	if err != nil {
 		t.Fatalf("NewSender: %v", err)
 	}
-	defer tx.Close()
+	defer func() { _ = tx.Close() }()
 
 	rng := rand.New(rand.NewSource(2))
-	src := streamSourceCollect(tx, rng, e2eN)
+	src, err := streamSourceCollect(tx, rng, e2eN)
+	if err != nil {
+		t.Fatalf("stream source: %v", err)
+	}
 
 	ids, byID := readStream(t, rx, 4*time.Second)
 	assertOrderedCorrect(t, ids, byID, src)
@@ -179,45 +194,39 @@ func mustSrc(_ *rand.Rand, n int) map[uint32][]byte {
 
 // streamSourceCollect streams and returns the exact source map (for the loss
 // test, which runs the writer inline so timing overlaps the reader).
-func streamSourceCollect(tx *meld.Sender, rng *rand.Rand, n int) map[uint32][]byte {
+func streamSourceCollect(tx *meld.Sender, rng *rand.Rand, n int) (map[uint32][]byte, error) {
 	src := make(map[uint32][]byte, n)
-	done := make(chan struct{})
-	go func() {
-		for i := 0; i < n; i++ {
-			c := makeChunk(rng, uint32(i))
-			src[uint32(i)] = c
-			tx.Write(c)
-			if i%8 == 0 {
-				time.Sleep(time.Millisecond)
-			}
+	for i := 0; i < n; i++ {
+		c := makeChunk(rng, uint32(i))
+		src[uint32(i)] = c
+		if _, err := tx.Write(c); err != nil {
+			return nil, err
 		}
-		tx.Flush()
-		close(done)
-	}()
-	<-done
-	return src
+		if i%8 == 0 {
+			time.Sleep(time.Millisecond)
+		}
+	}
+	tx.Flush()
+	return src, nil
 }
 
 // streamSourcePaced streams n chunks at ~0.5 ms/symbol (1 ms every 2 chunks),
 // modeling a real media cadence so the sliding band's recovery window spans many
 // feedback round-trips. Returns the exact source map.
-func streamSourcePaced(tx *meld.Sender, rng *rand.Rand, n int) map[uint32][]byte {
+func streamSourcePaced(tx *meld.Sender, rng *rand.Rand, n int) (map[uint32][]byte, error) {
 	src := make(map[uint32][]byte, n)
-	done := make(chan struct{})
-	go func() {
-		for i := 0; i < n; i++ {
-			c := makeChunk(rng, uint32(i))
-			src[uint32(i)] = c
-			tx.Write(c)
-			if i%2 == 0 {
-				time.Sleep(time.Millisecond)
-			}
+	for i := 0; i < n; i++ {
+		c := makeChunk(rng, uint32(i))
+		src[uint32(i)] = c
+		if _, err := tx.Write(c); err != nil {
+			return nil, err
 		}
-		tx.Flush()
-		close(done)
-	}()
-	<-done
-	return src
+		if i%2 == 0 {
+			time.Sleep(time.Millisecond)
+		}
+	}
+	tx.Flush()
+	return src, nil
 }
 
 // lossyProxy forwards sender->receiver datagrams with random loss and relays
@@ -261,7 +270,7 @@ func (p *lossyProxy) run() {
 		}
 		if src.Port == p.rxAddr.Port && src.IP.Equal(p.rxAddr.IP) {
 			if p.sender != nil { // feedback receiver -> sender, lossless
-				p.conn.WriteToUDP(buf[:n], p.sender)
+				_, _ = p.conn.WriteToUDP(buf[:n], p.sender)
 			}
 			continue
 		}
@@ -271,7 +280,7 @@ func (p *lossyProxy) run() {
 			continue
 		}
 		atomic.AddInt64(&p.fwd, 1)
-		p.conn.WriteToUDP(buf[:n], p.rxAddr)
+		_, _ = p.conn.WriteToUDP(buf[:n], p.rxAddr)
 	}
 }
 
@@ -290,14 +299,14 @@ func TestE2ESlidingHeavyLoss(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewReceiver: %v", err)
 	}
-	defer rx.Close()
+	defer func() { _ = rx.Close() }()
 	proxy := startLossyProxy(t, 0.25, 11, rx.LocalAddr())
-	defer proxy.Close()
+	defer func() { _ = proxy.Close() }()
 	tx, err := meld.NewSender(proxy.addr(), cfg)
 	if err != nil {
 		t.Fatalf("NewSender: %v", err)
 	}
-	defer tx.Close()
+	defer func() { _ = tx.Close() }()
 
 	rng := rand.New(rand.NewSource(3))
 	// Pace the write to ~0.5 ms/symbol: the 96-symbol band then spans ~48 ms,
@@ -305,7 +314,10 @@ func TestE2ESlidingHeavyLoss(t *testing.T) {
 	// while a lost symbol is still inside the recovery window (a burst write would
 	// overrun the band before feedback returns — that is a rate/window mismatch, not
 	// a coding failure).
-	src := streamSourcePaced(tx, rng, e2eN)
+	src, err := streamSourcePaced(tx, rng, e2eN)
+	if err != nil {
+		t.Fatalf("stream source: %v", err)
+	}
 	ids, byID := readStream(t, rx, 4*time.Second)
 	assertOrderedCorrect(t, ids, byID, src)
 
@@ -344,23 +356,21 @@ func makeEncChunk(rng *rand.Rand, id uint32) []byte {
 func streamEncrypted(tx interface {
 	Write([]byte) (int, error)
 	Flush()
-}, rng *rand.Rand, n int) map[uint32][]byte {
+}, rng *rand.Rand, n int,
+) (map[uint32][]byte, error) {
 	src := make(map[uint32][]byte, n)
-	done := make(chan struct{})
-	go func() {
-		for i := 0; i < n; i++ {
-			c := makeEncChunk(rng, uint32(i))
-			src[uint32(i)] = c
-			tx.Write(c)
-			if i%8 == 0 {
-				time.Sleep(time.Millisecond)
-			}
+	for i := 0; i < n; i++ {
+		c := makeEncChunk(rng, uint32(i))
+		src[uint32(i)] = c
+		if _, err := tx.Write(c); err != nil {
+			return nil, err
 		}
-		tx.Flush()
-		close(done)
-	}()
-	<-done
-	return src
+		if i%8 == 0 {
+			time.Sleep(time.Millisecond)
+		}
+	}
+	tx.Flush()
+	return src, nil
 }
 
 // TestE2EEncryptedClean: the full encryption stack over UDP loopback — the X25519 +
@@ -373,15 +383,18 @@ func TestE2EEncryptedClean(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewReceiver: %v", err)
 	}
-	defer rx.Close()
+	defer func() { _ = rx.Close() }()
 	tx, err := meld.NewSender(rx.LocalAddr(), cfg) // blocks until the handshake completes
 	if err != nil {
 		t.Fatalf("NewSender (handshake): %v", err)
 	}
-	defer tx.Close()
+	defer func() { _ = tx.Close() }()
 
 	rng := rand.New(rand.NewSource(5))
-	src := streamEncrypted(tx, rng, e2eN)
+	src, err := streamEncrypted(tx, rng, e2eN)
+	if err != nil {
+		t.Fatalf("stream source: %v", err)
+	}
 	ids, byID := readStream(t, rx, 3*time.Second)
 	assertOrderedCorrect(t, ids, byID, src)
 	if len(ids) != e2eN {
@@ -401,17 +414,20 @@ func TestE2EEncryptedLossSurvival(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewReceiver: %v", err)
 	}
-	defer rx.Close()
+	defer func() { _ = rx.Close() }()
 	proxy := startLossyProxy(t, 0.25, 13, rx.LocalAddr())
-	defer proxy.Close()
+	defer func() { _ = proxy.Close() }()
 	tx, err := meld.NewSender(proxy.addr(), cfg)
 	if err != nil {
 		t.Fatalf("NewSender (handshake through loss): %v", err)
 	}
-	defer tx.Close()
+	defer func() { _ = tx.Close() }()
 
 	rng := rand.New(rand.NewSource(6))
-	src := streamEncrypted(tx, rng, e2eN)
+	src, err := streamEncrypted(tx, rng, e2eN)
+	if err != nil {
+		t.Fatalf("stream source: %v", err)
+	}
 	ids, byID := readStream(t, rx, 4*time.Second)
 	assertOrderedCorrect(t, ids, byID, src)
 
@@ -437,15 +453,18 @@ func TestE2EEncryptedSliding(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewReceiver: %v", err)
 	}
-	defer rx.Close()
+	defer func() { _ = rx.Close() }()
 	tx, err := meld.NewSender(rx.LocalAddr(), cfg)
 	if err != nil {
 		t.Fatalf("NewSender: %v", err)
 	}
-	defer tx.Close()
+	defer func() { _ = tx.Close() }()
 
 	rng := rand.New(rand.NewSource(8))
-	src := streamEncrypted(tx, rng, e2eN)
+	src, err := streamEncrypted(tx, rng, e2eN)
+	if err != nil {
+		t.Fatalf("stream source: %v", err)
+	}
 	ids, byID := readStream(t, rx, 3*time.Second)
 	assertOrderedCorrect(t, ids, byID, src)
 	if len(ids) != e2eN {
@@ -462,15 +481,18 @@ func TestE2EEncryptedMultipath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMultipathReceiver: %v", err)
 	}
-	defer rx.Close()
+	defer func() { _ = rx.Close() }()
 	tx, err := meld.NewMultipathSender(rx.LocalAddrs(), cfg)
 	if err != nil {
 		t.Fatalf("NewMultipathSender (handshake): %v", err)
 	}
-	defer tx.Close()
+	defer func() { _ = tx.Close() }()
 
 	rng := rand.New(rand.NewSource(9))
-	src := streamEncrypted(tx, rng, e2eN)
+	src, err := streamEncrypted(tx, rng, e2eN)
+	if err != nil {
+		t.Fatalf("stream source: %v", err)
+	}
 	ids, byID := readStream(t, rx, 3*time.Second)
 	assertOrderedCorrect(t, ids, byID, src)
 	if len(ids) != e2eN {

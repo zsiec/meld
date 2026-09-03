@@ -79,7 +79,7 @@ func waitFor(d time.Duration, cond func() bool) bool {
 	return cond()
 }
 
-// TestPMTUD_EndToEndDiscoveryAndBlackHole exercises the FULL Phase-1 wiring over the real
+// TestPMTUD_EndToEndDiscoveryAndBlackHole exercises the full wiring over the real
 // Sender/Receiver goroutines + substrate: probes go out, the receiver acks them, the state
 // machine discovers the path MTU, and when the path silently shrinks the confirmation probe
 // trips a black hole and re-discovers the smaller MTU — the size loss that FEC and the CC
@@ -96,12 +96,12 @@ func TestPMTUD_EndToEndDiscoveryAndBlackHole(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newReceiver: %v", err)
 	}
-	defer rx.Close()
+	defer func() { _ = rx.Close() }()
 	tx, err := newSenderCfg(txEnd, cfg, clock.NewRealClock(), nil, fastProbeCfg())
 	if err != nil {
 		t.Fatalf("newSenderCfg: %v", err)
 	}
-	defer tx.Close()
+	defer func() { _ = tx.Close() }()
 
 	// 1) Discover the full ceiling.
 	if !waitFor(2*time.Second, func() bool { return tx.PathMTU() == 1500 }) {

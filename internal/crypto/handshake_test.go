@@ -45,8 +45,7 @@ func runHandshake(t *testing.T, initPSK, respPSK, initPro, respPro []byte) (*Ses
 }
 
 // sendEpochKey / recvEpochKey mirror what the host (internal/session/secure.go) derives:
-// the directional epoch-0 traffic secret expanded to a per-epoch AEAD key. They replace the
-// former Session.SendEpochKey/RecvEpochKey helpers, which the host never used.
+// the directional epoch-0 traffic secret expanded to a per-epoch AEAD key.
 func sendEpochKey(s *Session, epoch uint16) []byte { return EpochKey(s.SendTrafficSecret(), epoch) }
 func recvEpochKey(s *Session, epoch uint16) []byte { return EpochKey(s.RecvTrafficSecret(), epoch) }
 

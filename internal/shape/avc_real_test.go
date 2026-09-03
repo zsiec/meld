@@ -10,7 +10,7 @@ import (
 // the parameter sets, exactly one IDR keyframe, several P-frames, and the cascade holds
 // through the decodability oracle (losing a parameter set the keyframe needs poisons the
 // keyframe). This validates the shaper on real bitstream signaling, not just synthetic
-// NAL headers — the realistic input a prism glass-to-glass run would feed it.
+// NAL headers — realistic input from a glass-to-glass media run.
 func TestAVCShaperRealStream(t *testing.T) {
 	data, err := os.ReadFile("testdata/bbb.h264")
 	if err != nil {

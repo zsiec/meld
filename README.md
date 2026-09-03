@@ -1,56 +1,39 @@
 # Meld
 
 Meld is a low-latency coded media transport for live video. It sends media as
-systematic source symbols plus sliding-window repair symbols, so the receiver can
-recover from erasures without waiting for a named-packet retransmission to make a
-round trip.
+compact systematic source symbols plus adaptive sliding-window recovery, so the
+receiver can recover from erasures even when a named-packet retransmission cannot
+make a round trip before playout.
 
 The current product direction is deliberately narrow:
 
 - one deployable profile: `meld-auto`
 - automatic adaptation, not a menu of profiles
 - source mostly FIFO
-- repair count capped by the configured rate budget
+- recovery bytes capped by the configured rate budget
 - proactive coded repair where latency is too tight for ARQ
+- fixed-geometry repair epochs when measured deep fades make continuous
+  sliding geometry less effective
+- compact coded equations when their zero tail can be omitted without changing rank
+- compact exact closure when feedback can still help
+- burst-spaced compact copies when a measured fade fits but a reactive cycle does not
 - conservative fallback behavior when the channel is uncertain
 
-The strongest measured frontier is not "Meld beats SRT/RIST everywhere." The
-credible frontier is **iid or tail-erasure loss at tight playout budgets,
-especially when the budget is below one RTT**. In that region, coded repair can
-land before an ARQ round trip can return. As the budget grows to one RTT and
-beyond, SRT/RIST catch up and the advantage compresses.
+Applications do not choose among these mechanisms. The sender selects them from
+measured RTT, deadline slack, source cadence, loss memory, and available byte
+headroom.
 
-## Current Frontier Result
+## Validation Status
 
-The latest curated macro run compared the same encoded source across Meld, SRT,
-RIST, and oracle rows:
+The deterministic unit, integration, fuzz-seed, and media-shaper suites exercise the
+coding invariants, deadline behavior, malformed-input bounds, encryption, multipath, and
+codec dependency models. `cmd/glassbench` provides capacity-matched, same-source
+comparisons against external SRT and RIST tools with source and ideal oracle rows.
 
-```sh
-go run ./cmd/glassbench -macrofrontier -buf 0 \
-  -arms oracle-source,oracle-ideal,meld-auto,libsrt,librist \
-  -frontierlosses 0.05,0.10 \
-  -frontierbursts 0 \
-  -rtts 50,100,200 \
-  -frontiermults 0.75,1,1.5 \
-  -reps 8 \
-  -reportdir scratchpad/glassbench-results/frontier-iid-samesource-oracles-reps8-20260627
-```
-
-Summary:
-
-| Cell | Meld | Best ARQ | Delta | Notes |
-|---|---:|---:|---:|---|
-| 10% iid loss, 0.75x RTT budget, RTT 50/100/200 ms | 144.0 frames | 121.1 frames, RIST | +22.9 frames | Meld reached the source ceiling in all three RTT cells. |
-| 5% iid loss, 0.75x RTT budget, RTT 50/100/200 ms | 143.8-144.0 frames | 133.6 frames, RIST | about +10 frames | Stable win across RTTs. |
-| 5-10% iid loss, 1x RTT budget | 144.0 frames in several cells | SRT usually best ARQ | small single-digit gains | ARQ starts to catch up. |
-| 5-10% iid loss, 1.5x RTT budget | near ceiling | SRT/RIST near ceiling | no stable Meld advantage | Budget is generous enough for ARQ. |
-
-No stable Meld deficits appeared in that iid frontier run.
-
-The burst48/burst96 experiments did not produce a stable deployable target.
-Repair placement, refresh-island repair, and fixed-keyint source shortcuts are not
-kept as user-facing profiles. See [Benchmarking](docs/bench.md) and the decision
-notes in [docs/decisions](docs/decisions).
+Benchmark results are intentionally not frozen into this README: they depend on the
+source, tool versions, host, revision, capacity, impairment model, and matched seeds. See
+[Benchmarking](docs/bench.md) for the current suites, required artifacts, and acceptance
+bar.
 
 ## What Meld Optimizes
 
@@ -75,24 +58,34 @@ remaining codec-blind at the core.
 
 Meld has three layers:
 
-1. **Application/media layer**: writes fixed-size media chunks. It may attach a
-   `FrameDesc` describing priority, references, RAP/recovery-refresh markers,
-   temporal layer, and discardability.
+1. **Application/media layer**: writes media chunks up to `SymbolSize` bytes. It
+   may attach a `FrameDesc` describing priority, references,
+   RAP/recovery-refresh markers, temporal layer, and discardability.
 2. **Sans-I/O flow core**: emits source and repair symbols, tracks deadlines,
    estimates loss/burstiness/reorder, sizes repair, and decodes from any
    sufficient rank. The core does not open sockets or read clocks.
 3. **Session host**: owns UDP sockets or a caller-provided datagram substrate,
    pacing, timers, encryption, DPLPMTUD, and goroutines.
 
-The default sender uses the band-form sliding-window coder:
+The default sender uses the band-form sliding-window coder and continuously
+allocates some proactive repair to isolated 16-source Cauchy-MDS blocks without
+an application mode switch:
 
 - source symbols are sent immediately
+- systematic packets carry only their exact application bytes
 - repair symbols cover an elastic trailing window
-- feedback adjusts future repair rate and sends reactive top-up when useful
+- compact repair omits only a zero equation tail and reconstructs the
+  identical full-width equation before decoding
+- feedback adjusts future repair rate and closes persistent holes when useful
+- deadline-admissible fixed blocks receive a continuously adjusted
+  share of the same proactive credit; loss memory raises the share, while
+  reactive reachability and long slack reduce it without turning MDS off
+- measured bursts may trigger one delayed compact copy when ARQ cannot fit
 - `BufferMicros` is the playout deadline
 - `MaxBitrate` and `RepairWithinBudget` keep repair inside the rate budget
 - the host pacer smooths output and backpressures `Write` instead of queueing
-  media past its deadline
+  media past its deadline; within that budget it releases source first, then
+  feedback-proven exact repair, then fungible recovery
 
 The receiver delivers recovered source chunks in order. It also reports
 pre-recovery wire loss, recovered source count, rejected symbols, evictions, and
@@ -216,17 +209,26 @@ RTP, container, or dependency metadata.
 
 See [Integration](docs/integration.md) and [Media Awareness](docs/media-awareness.md).
 
-## Encoder Cadence Actuator
+## Encoder Control
 
 Meld does not expose multiple deployable profiles for source structure. Instead,
 the sender can produce an advisory encoder request:
 
 ```go
 ctrl := s.EncoderControl()
+if ctrl.TargetBitrateBps != 0 {
+	encoder.SetBitrate(ctrl.TargetBitrateBps)
+}
 if ctrl.RecoveryCadenceFrames != 0 {
 	encoder.SetMaxRecoveryInterval(int(ctrl.RecoveryCadenceFrames))
 }
 ```
+
+`TargetBitrateBps` asks the encoder to leave enough of the live aggregate rate
+budget for measured recovery demand. It activates only after sustained overload,
+remains stable when the encoder complies, and relaxes only after sustained spare
+capacity. Source media always retains the majority of the budget, so a large
+burst estimate cannot collapse picture quality merely to maximize packet counts.
 
 `RecoveryCadenceFrames` asks the encoder to shorten dependency damage with a
 bounded recovery point cadence. Encoders may implement this with intra-refresh,
@@ -251,7 +253,7 @@ Important fields:
 | Field | Default | Use |
 |---|---:|---|
 | `Flow` | `0` | Wire flow id. Both ends must match. |
-| `SymbolSize` | `1316` | Fixed coded-symbol payload size. Use `MaxChunk()` when encrypted. |
+| `SymbolSize` | `1316` | Maximum application chunk and fixed algebraic width. Systematic packets carry only the bytes written. Use `MaxChunk()` when encrypted. |
 | `BufferMicros` | `200000` | Playout/deadline budget. This is the main latency knob. |
 | `Sliding` | `true` | Default low-latency sliding-window coder. |
 | `CodingWindow` | `0` | Max sliding band width. `0` selects the internal default. |
@@ -259,6 +261,7 @@ Important fields:
 | `TargetFailure` | `1e-3` | Decode-failure target used by repair sizing. |
 | `MaxBitrate` | `0` | Aggregate media+repair ceiling. `0` selects the host default. |
 | `RepairWithinBudget` | `true` | Keep proactive repair inside the rate budget. |
+| `CongestionControl` | `false` | Derive the sliding or generation sender's total rate budget from delay and ECN. Sliding startup is seeded from its measured media-plus-recovery offer. |
 | `Pace` | `true` | Smooth datagrams to the budget and backpressure `Write`. |
 | `AutoReorderHoldoff` | `true` | Receiver adapts loss estimation under reorder. |
 | `Passphrase` | empty | Enables encrypted sessions. |
@@ -324,8 +327,8 @@ decoded from their union.
 | `internal/session` | UDP/custom-substrate host, pacer, timers, crypto, DPLPMTUD. |
 | `internal/shape` | Internal media shapers used by tests and glassbench. |
 | `internal/wire` | Symbol, feedback, handshake, and control encodings. |
-| `cmd/glassbench` | Glass-to-glass benchmark harness against SRT/RIST and oracles. |
-| `docs` | Protocol, integration, benchmark, media, and decision notes. |
+| `cmd/glassbench` | Glass-to-glass benchmark harness against SRT, RIST, and oracles. |
+| `docs` | Protocol, integration, benchmark, media, and wire documentation. |
 
 ## Documentation
 
@@ -336,17 +339,11 @@ Start here:
 - [Specification](docs/spec/README.md)
 - [Integration](docs/integration.md)
 - [Benchmarking](docs/bench.md)
-- [Publishable Benchmarks](docs/publishing-benchmarks.md)
 - [Coding](docs/coding.md)
 - [Media Awareness](docs/media-awareness.md)
 - [Wire Format](docs/wireformat.md)
 - [Encryption](docs/encryption.md)
 - [Substrate](docs/substrate.md)
-
-Decision notes:
-
-- [Macro frontier discovery](docs/decisions/2026-06-27-macro-frontier-discovery.md)
-- [Cleanup after frontier discovery](docs/decisions/2026-06-27-cleanup-after-frontier.md)
 
 ## Build And Test
 
@@ -361,13 +358,12 @@ benchmark output belongs under `scratchpad/`, which is ignored by git.
 
 ## Status
 
-Meld is an active research/prototype codebase with a real benchmark harness and a
-clear current frontier. The default direction is no longer "try every possible
-coding trick." It is:
+Meld is an active research/prototype codebase with a real benchmark harness and
+one automatic recovery path. The current direction is:
 
 1. keep one adaptive profile
-2. optimize the tight-latency iid/tail-erasure frontier deliberately
-3. use macro frontier runs as the gate
+2. choose recovery from measured physical opportunity rather than operator modes
+3. use deterministic simulation and macro frontier runs as gates
 4. preserve oracle rows so we know whether the protocol, the source structure, or
    the benchmark ceiling is responsible for a gap
 

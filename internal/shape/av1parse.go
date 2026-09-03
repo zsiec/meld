@@ -58,10 +58,7 @@ type av1FrameInfo struct {
 // uvlc reads an unsigned variable-length code (AV1 §4.10.3), capped to avoid a runaway read.
 func uvlc(r *bitReader) uint {
 	zeros := 0
-	for {
-		if r.bit() == 1 {
-			break
-		}
+	for r.bit() == 0 {
 		zeros++
 		if zeros >= 32 {
 			return (1 << 32) - 1
@@ -324,7 +321,7 @@ func setFrameRefs(lastIdx, goldIdx, orderHint, orderHintBits int, refOrderHint [
 	for i := 0; i < av1NumRefFrames; i++ {
 		shifted[i] = curHint + getRelativeDist(refOrderHint[i], orderHint, orderHintBits)
 	}
-	find := func(forward bool, latest bool) int {
+	find := func(forward, latest bool) int {
 		ref, best := -1, 0
 		for i := 0; i < av1NumRefFrames; i++ {
 			h := shifted[i]

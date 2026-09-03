@@ -83,6 +83,33 @@ func (d *BandDecoder) MissingIn(base uint32) uint64 {
 	return m
 }
 
+// ClosureIn returns the rank-closing subset of MissingIn over [base, base+64).
+// Each set bit is a free column in the decoder's reduced system: supplying its
+// exact value removes one independent degree of freedom. Pivot columns are
+// unresolved too, but asking for an arbitrary set of them can be redundant (two
+// requested pivots may depend on the same free variable) and leave the system
+// rank-deficient even after every requested value arrives.
+func (d *BandDecoder) ClosureIn(base uint32) uint64 {
+	var m uint64
+	for k := uint32(0); k < 64; k++ {
+		id := base + k
+		if id >= d.highest {
+			break
+		}
+		if id < d.cursor {
+			continue
+		}
+		if _, ok := d.known[id]; ok {
+			continue
+		}
+		if _, pivot := d.rows[id]; pivot {
+			continue
+		}
+		m |= 1 << k
+	}
+	return m
+}
+
 // DroppedRows reports how many equations the span cap has discarded (see the
 // droppedRows field doc).
 func (d *BandDecoder) DroppedRows() uint64 { return d.droppedRows }
@@ -182,6 +209,17 @@ func (d *BandDecoder) AddSystematic(id uint32, data []byte) {
 	}
 	d.reduce(&beq{start: id, coeffs: []byte{1}, pay: d.pad(data)})
 	d.deliverReady()
+}
+
+// Cover advances the observed source frontier through id without adding an
+// equation. A host uses it when an independently decoded recovery lane covers a
+// source range but has not yet surfaced any source values. The normal delivery
+// window bound and deadline-driven Skip semantics still apply.
+func (d *BandDecoder) Cover(id uint32) {
+	if id < d.cursor {
+		return
+	}
+	d.grow(id)
 }
 
 // eliminateKnown folds the now-known source symbol at column id out of the earlier rows

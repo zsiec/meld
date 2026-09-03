@@ -108,7 +108,7 @@ func TestMultipathPlacement(t *testing.T) {
 // TestMultipathSizingProvisionsForCorrelation: at the SENDER, the proactive repair
 // count rises when the two paths' losses are correlated (the joint erasure tail is
 // heavier), and reduces to the single-path binomial set-point when they are
-// independent — the money test expressed through repairCountFor, the function the
+// independent. This is expressed through repairCountFor, the function the
 // generation close actually calls.
 func TestMultipathSizingProvisionsForCorrelation(t *testing.T) {
 	cfg := mpSenderConfig()

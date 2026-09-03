@@ -1,5 +1,6 @@
-// Package code implements Meld's recovery substrate: a sliding-window random
-// linear network code (RLNC) over GF(2^8) (internal/gf). It is the pure,
+// Package code implements Meld's recovery substrate: bounded systematic Cauchy
+// MDS blocks and a sliding-window random linear network code (RLNC) over GF(2^8)
+// (internal/gf). It is the pure,
 // deterministic heart of the transport — no clock, no I/O, no goroutines.
 //
 // An Encoder accumulates fixed-size source symbols and emits two kinds of coded
@@ -18,22 +19,43 @@
 //
 // Repair coefficients are not carried explicitly: a repair symbol carries a
 // (window base, width, repair key) triple and both ends regenerate the identical
-// GF(2^8) coefficient vector from the key via GenCoeffs (the seeded-coefficient
-// approach of RFC 8681 sliding-window RLC). Distinct repair symbols over one
-// window must use distinct keys to stay independent.
+// GF(2^8) coefficient vector from the key via GenCoeffs. The bounded MDS key
+// namespace forms a Cauchy parity matrix; sliding-window lanes use deterministic
+// seeded RFC-8681-style coefficients.
 package code
 
 import "github.com/zsiec/meld/internal/gf"
 
+const (
+	mdsRepairKeyMask   uint16 = 0xc000
+	mdsRepairIndexMask uint16 = 0x3fff
+)
+
+// BlockRepairKey maps a bounded parity-row index into the Cauchy-MDS key namespace.
+func BlockRepairKey(index uint16) uint16 { return mdsRepairKeyMask | (index & mdsRepairIndexMask) }
+
+// BlockRepairIndex returns the bounded row index and whether key names the Cauchy-MDS namespace.
+func BlockRepairIndex(key uint16) (uint16, bool) {
+	return key & mdsRepairIndexMask, key&mdsRepairKeyMask == mdsRepairKeyMask
+}
+
 // GenCoeffs deterministically derives n GF(2^8) coefficients for a repair symbol
 // from repairKey. The encoder and decoder call it identically, so the coefficient
 // vector never travels on the wire. Coefficient i scales the source symbol at
-// window offset i (window base + i). The vector is guaranteed not to be all-zero
-// (a degenerate, information-free repair), so distinct keys yield distinct,
-// almost-always-independent vectors.
+// window offset i (window base + i). Keys in the MDS namespace name rows of a
+// Cauchy matrix disjoint from the n systematic points, so any n rows from that
+// bounded systematic+repair set are independent. Other keys use deterministic
+// seeded RLNC and are guaranteed not to be all-zero.
 func GenCoeffs(repairKey uint16, n int) []byte {
 	c := make([]byte, n)
 	if n == 0 {
+		return c
+	}
+	if row, mds := BlockRepairIndex(repairKey); mds && n <= 254 && int(row)+n < 255 {
+		x := byte(n + int(row))
+		for i := range c {
+			c[i] = gf.Inv(x ^ byte(i))
+		}
 		return c
 	}
 	// SplitMix64 seeded by the key; 8 coefficient bytes per 64-bit draw.
@@ -124,6 +146,29 @@ func NewEncoderAt(symSize int, base uint32) *Encoder {
 func (e *Encoder) Add(data []byte) uint32 {
 	buf := e.symBuf() // zeroed, so the tail beyond len(data) is the zero pad
 	copy(buf, data)
+	id := e.base + uint32(len(e.syms))
+	e.syms = append(e.syms, buf)
+	return id
+}
+
+// AddWithSuffix adds a source while copying suffix at suffixOffset in the same
+// pooled symbol buffer. It avoids an intermediate allocation for small coded
+// metadata trailers. Out-of-range suffix bytes are safely truncated.
+func (e *Encoder) AddWithSuffix(data []byte, suffixOffset int, suffix []byte) uint32 {
+	buf := e.symBuf()
+	copy(buf, data)
+	if suffixOffset < 0 {
+		skip := -suffixOffset
+		if skip >= len(suffix) {
+			suffix = nil
+		} else {
+			suffix = suffix[skip:]
+		}
+		suffixOffset = 0
+	}
+	if suffixOffset < len(buf) {
+		copy(buf[suffixOffset:], suffix)
+	}
 	id := e.base + uint32(len(e.syms))
 	e.syms = append(e.syms, buf)
 	return id

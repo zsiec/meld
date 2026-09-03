@@ -75,8 +75,10 @@ func TestForgedDeadlineNoOverflow(t *testing.T) {
 	r := NewReceiver(cfg)
 	now := clock.Timestamp(1_000_000)
 	for i := uint32(0); i < 6; i++ {
-		s := wire.Symbol{Flow: 1, Kind: wire.Systematic, WindowBase: genBaseOf(i, 16), SrcIndex: i, N: 16,
-			Deadline: int64(1) << 61, Payload: make([]byte, 64)} // absurd forged deadline
+		s := wire.Symbol{
+			Flow: 1, Kind: wire.Systematic, WindowBase: genBaseOf(i, 16), SrcIndex: i, N: 16,
+			Deadline: int64(1) << 61, Payload: make([]byte, 64),
+		} // absurd forged deadline
 		r.FeedSymbol(now, wire.EncodeSymbol(nil, s))
 		now = now.Add(1000)
 	}

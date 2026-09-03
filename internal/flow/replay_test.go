@@ -81,10 +81,12 @@ func TestReplayGlassTrace(t *testing.T) {
 	const owdMicros = 30_000 // the cell's one-way delay (rtt60)
 	symSize := 4 + 1316      // seqHdr + chunk (the bench wire symbol payload size)
 
-	cfg := Config{Flow: 1, SymbolSize: symSize, Sliding: true, CodingWindow: 256,
+	cfg := Config{
+		Flow: 1, SymbolSize: symSize, Sliding: true, CodingWindow: 256,
 		Redundancy: 0.15, TargetFailure: 1e-3, BufferMicros: tr.BudgetMicros,
 		OutageAware: true, AutoReorderHoldoff: true, RepairWithinBudget: true,
-		ProtectedRepairPhasing: true}
+		ProtectedRepairPhasing: true,
+	}
 	if v := os.Getenv("MELD_REPLAY_NOFRAMES"); v != "" {
 		t.Log("frames stripped from replay")
 	}
@@ -140,9 +142,11 @@ func TestReplayGlassTrace(t *testing.T) {
 				lost[seq] = true
 				continue
 			}
-			sym := wire.Symbol{Flow: 1, Kind: wire.Systematic, WindowBase: seq, SrcIndex: seq, N: 1,
+			sym := wire.Symbol{
+				Flow: 1, Kind: wire.Systematic, WindowBase: seq, SrcIndex: seq, N: 1,
 				Priority: e.Priority, Deadline: e.Deadline, SendTimestamp: e.SendTimestamp,
-				Payload: getSrc(seq)}
+				Payload: getSrc(seq),
+			}
 			if e.HasFrameDesc && !stripFrames {
 				sym.HasFrameDesc = true
 				sym.FrameStart, sym.FrameLen = e.FrameStart, e.FrameLen
@@ -159,9 +163,11 @@ func TestReplayGlassTrace(t *testing.T) {
 		if e.Kind == "sparse_repair" {
 			kind = wire.SparseRepair
 		}
-		sym := wire.Symbol{Flow: 1, Kind: kind, WindowBase: e.WindowBase, SrcIndex: e.SrcIndex,
+		sym := wire.Symbol{
+			Flow: 1, Kind: kind, WindowBase: e.WindowBase, SrcIndex: e.SrcIndex,
 			N: e.N, RepairKey: e.RepairKey, SparseIDs: e.SparseIDs, Priority: e.Priority,
-			Deadline: e.Deadline, SendTimestamp: e.SendTimestamp, Payload: buildRepair(e)}
+			Deadline: e.Deadline, SendTimestamp: e.SendTimestamp, Payload: buildRepair(e),
+		}
 		stream = append(stream, inEv{at, wire.EncodeSymbol(nil, sym)})
 	}
 	sort.SliceStable(stream, func(i, j int) bool { return stream[i].at < stream[j].at })
@@ -193,7 +199,7 @@ func TestReplayGlassTrace(t *testing.T) {
 		sentAt int64
 	}
 	trigOf := map[uint32]trig{}
-	lastFed := trig{}
+	var lastFed trig
 	repairsIngested, repairsInnovative := 0, 0
 
 	// Two replay clocks: virtual (default; 1ms grid, decode CPU is free) and REAL
@@ -237,9 +243,10 @@ func TestReplayGlassTrace(t *testing.T) {
 			for idx < len(stream) && stream[idx].at <= now {
 				sym, _ := wire.DecodeSymbol(stream[idx].dat)
 				k := "systematic"
-				if sym.Kind == wire.Repair {
+				switch sym.Kind {
+				case wire.Repair:
 					k = "repair"
-				} else if sym.Kind == wire.SparseRepair {
+				case wire.SparseRepair:
 					k = "sparse"
 				}
 				lastFed = trig{k, now, sym.WindowBase, sym.N, sym.SendTimestamp}

@@ -71,8 +71,10 @@ func glassPerceptual(t *testing.T, cfg Config, shaped []shape.Shaped, lossP floa
 		}
 		chunksPer[ui] = nch
 		firstChunk[ui] = nextID
-		fd := FrameDesc{Priority: sh.Unit.Class.Wire(), FrameID: sh.Unit.ID, RefFrameIDs: sh.Unit.RefersTo,
-			Chunks: uint16(nch), RAP: sh.Unit.RAP, Discardable: sh.Unit.Discardable, TemporalID: sh.Unit.TemporalID}
+		fd := FrameDesc{
+			Priority: sh.Unit.Class.Wire(), FrameID: sh.Unit.ID, RefFrameIDs: sh.Unit.RefersTo,
+			Chunks: uint16(nch), RAP: sh.Unit.RAP, Discardable: sh.Unit.Discardable, TemporalID: sh.Unit.TemporalID,
+		}
 		for c := 0; c < nch; c++ {
 			s.WriteFrame(now, makeChunkN(nextID), fd)
 			nextID++

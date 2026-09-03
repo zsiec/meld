@@ -83,9 +83,11 @@ func TestRTTMinExcursionCellRecovered(t *testing.T) {
 		cfg.ReorderHoldoffMicros = holdUs
 		s := NewSlidingSender(cfg)
 		r := NewSlidingReceiver(cfg)
-		sl := simLink{cfg: cfg, owdMicros: 30_000, srcMicros: 500, n: 6_000,
+		sl := simLink{
+			cfg: cfg, owdMicros: 30_000, srcMicros: 500, n: 6_000,
 			sliding: true, drop: geDrop(13, 0.10, 48),
-			paceBytesPerSec: 1 << 20, timingJitterMicros: 2_000, timingSeed: 3}
+			paceBytesPerSec: 1 << 20, timingJitterMicros: 2_000, timingSeed: 3,
+		}
 		return sl.runCores(s, r), s
 	}
 	base, _ := run(0)
@@ -123,9 +125,11 @@ func TestZHoleCellDecoderDiscards(t *testing.T) {
 		cfg.CodingWindow = cw
 		s := NewSlidingSender(cfg)
 		r := NewSlidingReceiver(cfg)
-		sl := simLink{cfg: cfg, owdMicros: 30_000, srcMicros: 500, n: 6_000,
+		sl := simLink{
+			cfg: cfg, owdMicros: 30_000, srcMicros: 500, n: 6_000,
 			sliding: true, drop: geDrop(13, 0.10, 48),
-			paceBytesPerSec: 1 << 20, timingJitterMicros: 2_000, timingSeed: 3}
+			paceBytesPerSec: 1 << 20, timingJitterMicros: 2_000, timingSeed: 3,
+		}
 		res := sl.runCores(s, r)
 		t.Logf("cw=%d: deliv=%d/%d ovh=%.0f%% p99=%dms | decoder dropped-rows=%d recovered=%d",
 			cw, res.delivered, res.n, res.overhead()*100, pctlMicros(res.latencyMicros, 0.99)/1000,
@@ -146,9 +150,11 @@ func TestZHoleCellArbitered(t *testing.T) {
 		cfg.CodingWindow = 256
 		s := NewSlidingSender(cfg)
 		r := NewSlidingReceiver(cfg)
-		sl := simLink{cfg: cfg, owdMicros: 30_000, srcMicros: 1_316, n: 5_456,
+		sl := simLink{
+			cfg: cfg, owdMicros: 30_000, srcMicros: 1_316, n: 5_456,
 			sliding: true, drop: geDrop(seed*7919+55, 0.10, 48),
-			paceBytesPerSec: 1 << 20, timingJitterMicros: 2_000, timingSeed: seed}
+			paceBytesPerSec: 1 << 20, timingJitterMicros: 2_000, timingSeed: seed,
+		}
 		res := sl.runCores(s, r)
 		t.Logf("seed %d: raw-deliv=%.1f%% ARBITERED=%.1f%% (glass this cell: 9-70%% by seed)",
 			seed, 100*float64(res.delivered)/float64(res.n), 100*float64(res.deliveredInTime)/float64(res.n))

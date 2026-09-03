@@ -3,7 +3,7 @@ package session
 import "sync"
 
 // clockSync estimates the offset of the remote (sender) clock relative to the local
-// (receiver) clock from NTP-style 2-message probes (N4). It keeps the estimate from
+// (receiver) clock from NTP-style two-message probes. It keeps the estimate from
 // the probe with the smallest round trip — the least queuing noise, so the cleanest
 // offset — and lets that best slowly inflate so a fresher probe re-anchors as the
 // clocks drift apart. The receiver adds the offset to its local time to land in the

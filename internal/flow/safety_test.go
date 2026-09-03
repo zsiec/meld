@@ -7,15 +7,17 @@ import (
 	"github.com/zsiec/meld/internal/wire"
 )
 
-// N1 resource-safety + honest-signal tests.
+// Resource-safety and honest-signal tests.
 
 // TestAdmissionCapRejectsWideWindow: a forged symbol declaring a window far wider
 // than ls_max_size must be refused before any decoder is allocated.
 func TestAdmissionCapRejectsWideWindow(t *testing.T) {
 	cfg := testConfig()
 	r := NewReceiver(cfg)
-	sym := wire.Symbol{Flow: cfg.Flow, Kind: wire.Repair, WindowBase: 0, N: 60000, RepairKey: 1,
-		Payload: make([]byte, testSym)}
+	sym := wire.Symbol{
+		Flow: cfg.Flow, Kind: wire.Repair, WindowBase: 0, N: 60000, RepairKey: 1,
+		Payload: make([]byte, testSym),
+	}
 	r.FeedSymbol(0, wire.EncodeSymbol(nil, sym))
 	if r.Stats().Rejected == 0 {
 		t.Fatal("wide-window symbol was not rejected")
@@ -36,8 +38,10 @@ func TestAdmissionCapBoundsState(t *testing.T) {
 		base := uint32(i) * uint32(cfg.GenSize)
 		// Feed base+1 (never base), so source id `base` is always missing and the
 		// in-order cursor can never advance past generation 0 → nothing is reaped.
-		sym := wire.Symbol{Flow: cfg.Flow, Kind: wire.Systematic, WindowBase: base,
-			SrcIndex: base + 1, N: uint16(cfg.GenSize), Payload: make([]byte, testSym)}
+		sym := wire.Symbol{
+			Flow: cfg.Flow, Kind: wire.Systematic, WindowBase: base,
+			SrcIndex: base + 1, N: uint16(cfg.GenSize), Payload: make([]byte, testSym),
+		}
 		r.FeedSymbol(0, wire.EncodeSymbol(nil, sym))
 	}
 	if len(r.gens) > cfg.MaxRetainedGens {
@@ -57,8 +61,10 @@ func TestHonestLossCountsPreRecovery(t *testing.T) {
 	// Deliver source ids 0,1,2 then 5,6 (a 2-long wire-loss run at 3,4).
 	for _, id := range []uint32{0, 1, 2, 5, 6} {
 		base := genBaseOf(id, cfg.GenSize)
-		sym := wire.Symbol{Flow: cfg.Flow, Kind: wire.Systematic, WindowBase: base,
-			SrcIndex: id, N: uint16(cfg.GenSize), Payload: make([]byte, testSym)}
+		sym := wire.Symbol{
+			Flow: cfg.Flow, Kind: wire.Systematic, WindowBase: base,
+			SrcIndex: id, N: uint16(cfg.GenSize), Payload: make([]byte, testSym),
+		}
 		r.FeedSymbol(0, wire.EncodeSymbol(nil, sym))
 	}
 	if got := r.Stats().WireLost; got != 2 {

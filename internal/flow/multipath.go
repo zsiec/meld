@@ -2,7 +2,7 @@ package flow
 
 import "math/bits"
 
-// This file is N5's correlation-aware multipath sizing: when a generation is split
+// This file implements correlation-aware multipath sizing: when a generation is split
 // across N paths and the receiver decodes from the union (RLNC combines symbols from
 // all of them), the failure probability is governed by the TOTAL erasure count — and
 // when the paths' losses are correlated (they go bad together), that tail is far
@@ -11,7 +11,7 @@ import "math/bits"
 // per-slot erasure-count histogram. The decoder needs no change; this is purely how
 // much repair to provision.
 
-// pathScheduler places each outgoing symbol on one of the paths (PLAN §3.6). The
+// pathScheduler places each outgoing symbol on one of the paths. The
 // decoder is path-agnostic — RLNC decodes from the union — so placement only shapes
 // the per-path load and thus the diversity, never correctness. Systematic symbols
 // round-robin for an even spread across paths; repair is metered toward each path in
@@ -183,7 +183,7 @@ const (
 
 // coLossEstimator measures, over aligned windows of N paths, the per-path marginal loss
 // (for the scheduler) and the per-slot erasure-COUNT histogram (for the joint-tail sizer,
-// N5). The receiver feeds it one aligned slot at a time — a length-N vector of which paths
+// paths). The receiver feeds it one aligned slot at a time — a length-N vector of which paths
 // lost their symbol; a window's per-path loss fractions and count histogram are folded into
 // smoothed parts-per-million rates by EWMA. The histogram's high-count tail beyond the
 // independent product is the correlation the joint-tail sizer needs and the i.i.d.-union

@@ -29,12 +29,12 @@ func TestEncryptedEpochRotation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewReceiver: %v", err)
 	}
-	defer rx.Close()
+	defer func() { _ = rx.Close() }()
 	tx, err := NewSender(rx.LocalAddr(), cfg, sec)
 	if err != nil {
 		t.Fatalf("NewSender: %v", err)
 	}
-	defer tx.Close()
+	defer func() { _ = tx.Close() }()
 
 	const n = 200
 	chunkLen := cfg.SymbolSize - 16
@@ -49,7 +49,10 @@ func TestEncryptedEpochRotation(t *testing.T) {
 	}
 	go func() {
 		for i := 0; i < n; i++ {
-			tx.Write(want[i]) // read-only access to want[i] (no race)
+			if _, err := tx.Write(want[i]); err != nil {
+				t.Errorf("write %d: %v", i, err)
+				return
+			}
 			time.Sleep(2 * time.Millisecond)
 		}
 		tx.Flush()
@@ -57,7 +60,9 @@ func TestEncryptedEpochRotation(t *testing.T) {
 
 	got, buf := 0, make([]byte, 512)
 	for got < n {
-		rx.SetReadDeadline(time.Now().Add(2 * time.Second))
+		if err := rx.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+			t.Fatalf("set read deadline: %v", err)
+		}
 		m, err := rx.Read(buf)
 		if err != nil {
 			break
@@ -189,7 +194,7 @@ func TestEncryptedReHandshakeDelivers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewReceiver: %v", err)
 	}
-	defer rx.Close()
+	defer func() { _ = rx.Close() }()
 	chunkLen := cfg.SymbolSize - 16
 	const n = 16
 
@@ -209,13 +214,15 @@ func TestEncryptedReHandshakeDelivers(t *testing.T) {
 		}
 		tx.Flush()
 		time.Sleep(30 * time.Millisecond) // let the tail drain before the socket closes
-		tx.Close()
+		_ = tx.Close()
 	}
 	count := func(tag byte, want int) int {
 		buf := make([]byte, 512)
 		got := 0
 		for got < want {
-			rx.SetReadDeadline(time.Now().Add(2 * time.Second))
+			if err := rx.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+				t.Fatalf("set read deadline: %v", err)
+			}
 			m, err := rx.Read(buf)
 			if err != nil {
 				break
@@ -281,20 +288,22 @@ func TestReceiverClockOffsetConverges(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newReceiver: %v", err)
 	}
-	defer rx.Close()
+	defer func() { _ = rx.Close() }()
 
 	tx, err := NewSender(rx.LocalAddr(), testCfg(), nil)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer tx.Close()
+	defer func() { _ = tx.Close() }()
 
 	// Stream a little media so the receiver learns the peer and the probe loop runs;
 	// then let several probe rounds (≈200 ms apart) complete.
 	go func() {
 		msg := make([]byte, 256)
 		for i := 0; i < 400; i++ {
-			tx.Write(msg)
+			if _, err := tx.Write(msg); err != nil {
+				return
+			}
 			time.Sleep(3 * time.Millisecond)
 		}
 	}()
@@ -318,7 +327,7 @@ func abs(x int64) int64 {
 }
 
 // TestCrossHostLatencyUnderOffset: with the receiver's clock offset 2 s from the
-// sender's, the N4 handshake corrects the deadline frame so media is delivered
+// sender's, the clock handshake corrects the deadline frame so media is delivered
 // normally — and the (real-time) latency is within budget. Without the correction the
 // receiver would judge every symbol ~2 s past its deadline and deliver nothing.
 func TestCrossHostLatencyUnderOffset(t *testing.T) {
@@ -333,12 +342,12 @@ func TestCrossHostLatencyUnderOffset(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newReceiver: %v", err)
 	}
-	defer rx.Close()
+	defer func() { _ = rx.Close() }()
 	tx, err := NewSender(rx.LocalAddr(), cfg, nil)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer tx.Close()
+	defer func() { _ = tx.Close() }()
 
 	stop := make(chan struct{})
 	go func() {
@@ -350,7 +359,9 @@ func TestCrossHostLatencyUnderOffset(t *testing.T) {
 			}
 			msg := make([]byte, cfg.SymbolSize)
 			binary.BigEndian.PutUint64(msg[0:8], uint64(time.Now().UnixMicro()))
-			tx.Write(msg)
+			if _, err := tx.Write(msg); err != nil {
+				return
+			}
 			time.Sleep(2 * time.Millisecond)
 		}
 	}()
@@ -373,7 +384,9 @@ func TestCrossHostLatencyUnderOffset(t *testing.T) {
 	base := time.Now().UnixMicro()
 	var lats []int64
 	for d := time.Now().Add(1500 * time.Millisecond); time.Now().Before(d); {
-		rx.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+		if err := rx.SetReadDeadline(time.Now().Add(200 * time.Millisecond)); err != nil {
+			t.Fatalf("set read deadline: %v", err)
+		}
 		buf := make([]byte, cfg.SymbolSize)
 		n, err := rx.Read(buf)
 		if err != nil || n < 8 {
@@ -409,12 +422,12 @@ func TestEncryptedCookieUnderLoad(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewReceiver: %v", err)
 	}
-	defer rx.Close()
+	defer func() { _ = rx.Close() }()
 	tx, err := NewSender(rx.LocalAddr(), cfg, sec) // completes only via the cookie round trip
 	if err != nil {
 		t.Fatalf("NewSender (cookie handshake): %v", err)
 	}
-	defer tx.Close()
+	defer func() { _ = tx.Close() }()
 
 	const n = 16
 	chunkLen := cfg.SymbolSize - 16
@@ -429,7 +442,10 @@ func TestEncryptedCookieUnderLoad(t *testing.T) {
 	}
 	go func() {
 		for i := 0; i < n; i++ {
-			tx.Write(want[i])
+			if _, err := tx.Write(want[i]); err != nil {
+				t.Errorf("write %d: %v", i, err)
+				return
+			}
 			time.Sleep(2 * time.Millisecond)
 		}
 		tx.Flush()
@@ -437,7 +453,9 @@ func TestEncryptedCookieUnderLoad(t *testing.T) {
 
 	got, buf := 0, make([]byte, 512)
 	for got < n {
-		rx.SetReadDeadline(time.Now().Add(2 * time.Second))
+		if err := rx.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+			t.Fatalf("set read deadline: %v", err)
+		}
 		m, err := rx.Read(buf)
 		if err != nil {
 			break

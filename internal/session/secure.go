@@ -230,10 +230,9 @@ type sealState struct {
 	sealEpoch  uint32         // FULL epoch (no truncation) so the ratchet count is monotonic
 	nextSrc    uint32         // mirrors the core's src_index assignment, for the nonce
 
-	// Warm-path scratch, sized once: a chunk's zero-padded plaintext and the sealed-symbol
-	// output, reused across seal calls so the encrypt path allocates nothing per symbol (the
-	// core copies the ciphertext into its window, so it never retains these buffers).
-	padBuf []byte
+	// Warm-path sealed-symbol output, reused across calls. The flow copies the
+	// ciphertext into its coded window and protects its exact length in the
+	// metadata trailer, so plaintext does not need pre-encryption padding.
 	ctBuf  []byte
 	aadBuf [crypto.AADSize]byte
 }
@@ -244,7 +243,6 @@ func newSealState(sec *SecurityConfig, symSize int, flowID uint32) sealState {
 		ss.sec = sec
 		ss.psk = sec.psk() // stretch the passphrase ONCE (Argon2id), cache it
 		ss.ctl.active = true
-		ss.padBuf = make([]byte, symSize-crypto.Overhead)
 		ss.ctBuf = make([]byte, 0, symSize)
 	}
 	return ss
@@ -252,8 +250,9 @@ func newSealState(sec *SecurityConfig, symSize int, flowID uint32) sealState {
 
 // seal AEAD-encrypts one media chunk for the next source index (the nonce input),
 // advancing the mirror of the core's id assignment. A nil sec is a pass-through. The
-// plaintext is padded to SymbolSize-Overhead so the ciphertext is exactly SymbolSize and
-// the coder never zero-pads (which would corrupt the tag); a chunk larger than that is
+// ciphertext length is plaintext length plus the AEAD tag. The flow codes that
+// exact length before zero-padding its algebraic symbol, so recovery trims the
+// padding before authentication. A chunk larger than SymbolSize-Overhead is
 // rejected with ErrChunkTooLarge rather than silently truncated. The FULL epoch (no
 // uint16 truncation) drives the ratchet so its count is strictly monotonic across the
 // whole flow — the per-epoch key never repeats, which is what prevents (key, nonce)
@@ -285,12 +284,8 @@ func (s *sealState) seal(p []byte) ([]byte, error) {
 		}
 		s.sealer, s.sealEpoch = sl, epoch
 	}
-	// Pad into the reused scratch, clearing the tail so a short chunk never leaks the
-	// previous chunk's bytes; seal into the reused output (the core copies it).
-	copy(s.padBuf, p)
-	clear(s.padBuf[len(p):])
 	crypto.PutAAD(&s.aadBuf, s.flowID, uint16(epoch), s.nextSrc)
-	ct, err := s.sealer.Seal(s.ctBuf[:0], s.padBuf, s.aadBuf[:], s.nextSrc)
+	ct, err := s.sealer.Seal(s.ctBuf[:0], p, s.aadBuf[:], s.nextSrc)
 	if err != nil {
 		return nil, err
 	}
@@ -364,6 +359,41 @@ type pendingState struct {
 	epochSize uint32 // the (re-handshaked) sender's epoch size, adopted on promotion
 }
 
+// plaintextPool is a small typed buffer cache shared by the receive and Read paths.
+// A typed cache avoids the interface allocation incurred by storing []byte values in
+// sync.Pool, while the cap prevents an idle receiver from retaining an unbounded number
+// of application-sized buffers.
+type plaintextPool struct {
+	mu   sync.Mutex
+	bufs [][]byte
+}
+
+const plaintextPoolCap = 256
+
+func (p *plaintextPool) get() []byte {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n := len(p.bufs)
+	if n == 0 {
+		return nil
+	}
+	b := p.bufs[n-1]
+	p.bufs[n-1] = nil
+	p.bufs = p.bufs[:n-1]
+	return b[:0]
+}
+
+func (p *plaintextPool) put(b []byte) {
+	if b == nil {
+		return
+	}
+	p.mu.Lock()
+	if len(p.bufs) < plaintextPoolCap {
+		p.bufs = append(p.bufs, b[:0])
+	}
+	p.mu.Unlock()
+}
+
 // openState is the receiver-side encryption keying shared by both hosts: a ratcheting
 // per-epoch AEAD opener driven by the delivered source id. Nil sec ⇒ cleartext
 // (pass-through). Not safe for concurrent use; the host opens under its mutex.
@@ -399,7 +429,7 @@ type openState struct {
 	// it has copied the plaintext out. Safe because in an encrypted session EVERY delivered buffer
 	// comes from a decrypt (the cleartext passthrough in openAll is unreachable when sec != nil), so
 	// Read can recycle unconditionally; a pointer so the embedding Receiver is copy-safe (go vet).
-	ptPool *sync.Pool
+	ptPool *plaintextPool
 }
 
 func newOpenState(sec *SecurityConfig, flowID uint32) (openState, error) {
@@ -414,7 +444,7 @@ func newOpenState(sec *SecurityConfig, flowID uint32) (openState, error) {
 			return openState{}, err // surface the RNG failure rather than silently disable the gate
 		}
 		os.cookies = cc
-		os.ptPool = &sync.Pool{}
+		os.ptPool = &plaintextPool{}
 	}
 	return os, nil
 }
@@ -571,8 +601,15 @@ func (o *openState) trialOpen(base epochKeyer, epochSize uint32, sym wire.Symbol
 	if op == nil {
 		return false
 	}
+	payload := sym.Payload
+	if sym.HasSourceLength {
+		if sym.SourceLength > uint32(len(payload)) {
+			return false
+		}
+		payload = payload[:sym.SourceLength]
+	}
 	crypto.PutAAD(&o.aadBuf, o.flowID, uint16(epoch), sym.SrcIndex)
-	_, err := op.Open(nil, sym.Payload, o.aadBuf[:], sym.SrcIndex)
+	_, err := op.Open(nil, payload, o.aadBuf[:], sym.SrcIndex)
 	return err == nil
 }
 
@@ -649,11 +686,11 @@ func (o *openState) openAll(ds []delivered) [][]byte {
 			continue
 		}
 		crypto.PutAAD(&o.aadBuf, o.flowID, uint16(epoch), d.id)
-		buf, _ := o.ptPool.Get().([]byte) // nil on a pool miss ⇒ Open allocates; recycled buffers self-size
+		buf := o.ptPool.get() // nil on a pool miss ⇒ Open allocates; recycled buffers self-size
 		pt, err := op.Open(buf[:0], d.data, o.aadBuf[:], d.id)
 		if err != nil {
 			if buf != nil {
-				o.ptPool.Put(buf[:0]) // auth failure: nothing was delivered, so return the buffer
+				o.ptPool.put(buf) // auth failure: nothing was delivered, so return the buffer
 			}
 			continue
 		}

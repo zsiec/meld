@@ -133,22 +133,27 @@ func supportedArms(arms []string) []string {
 	return out
 }
 
-func writeFairnessCSV(path string, rows []fairnessRow) error {
+func writeFairnessCSV(path string, rows []fairnessRow) (err error) {
 	f, err := os.Create(path)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() {
+		if closeErr := f.Close(); err == nil {
+			err = closeErr
+		}
+	}()
 	w := csv.NewWriter(f)
-	defer w.Flush()
-	w.Write([]string{
+	if err := w.Write([]string{
 		"source_id", "case", "successful_arms", "missing_arms", "same_source_packets", "same_source_bytes",
 		"source_packet_min", "source_packet_max", "source_byte_min", "source_byte_max",
 		"oracle_source_ff", "oracle_ideal_ff", "source_ceiling_ok", "meld_auto_present", "arq_present",
 		"conservative_regression", "conservative_regression_ff",
-	})
+	}); err != nil {
+		return err
+	}
 	for _, r := range rows {
-		w.Write([]string{
+		if err := w.Write([]string{
 			r.SourceID,
 			r.Case,
 			strings.Join(r.SuccessfulArms, ";"),
@@ -166,8 +171,11 @@ func writeFairnessCSV(path string, rows []fairnessRow) error {
 			strconv.FormatBool(r.ARQPresent),
 			strconv.FormatBool(r.ConservativeRegression),
 			fmt.Sprintf("%.3f", r.ConservativeRegressionFF),
-		})
+		}); err != nil {
+			return err
+		}
 	}
+	w.Flush()
 	return w.Error()
 }
 
@@ -191,7 +199,12 @@ func writeFairnessMD(path string, rows []fairnessRow, opts macroFrontierOptions)
 	}
 	fmt.Fprintf(&b, "# Fairness Guard\n\n")
 	if opts.SourceID != "" {
-		fmt.Fprintf(&b, "Source: `%s` (`%s`).\n\n", opts.SourceID, opts.SourceClip)
+		fmt.Fprintf(&b, "Source: `%s` (`%s`, codec `%s`).\n\n", opts.SourceID, opts.SourceClip, opts.SourceCodec)
+	}
+	if opts.WireMbps > 0 {
+		fmt.Fprintf(&b, "Shared forward-link capacity: `%.1f Mbps`.\n\n", opts.WireMbps)
+	} else {
+		fmt.Fprintf(&b, "Shared forward-link capacity: `unbounded`; this run may validate plumbing and quality but cannot support an equal-capacity cost claim.\n\n")
 	}
 	fmt.Fprintf(&b, "- Cases checked: `%d`\n", total)
 	fmt.Fprintf(&b, "- Cases with missing required arms: `%d`\n", missing)

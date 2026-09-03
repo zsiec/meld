@@ -79,7 +79,8 @@ func TestEnqueueEmitDoesNotHoldMuAcrossBlockingSend(t *testing.T) {
 	locked := make(chan struct{})
 	go func() {
 		r.mu.Lock()
-		r.mu.Unlock() //nolint:staticcheck // empty critical section: probing availability only
+		_ = r.peer // representative guarded read; acquiring the lock is the assertion
+		r.mu.Unlock()
 		close(locked)
 	}()
 	select {

@@ -17,10 +17,10 @@ type ReceiverStats struct {
 	Duplicates uint64 // symbols arriving for an id already delivered/ready
 	// WireLost is the cumulative PRE-recovery source wire-loss — symbols the network
 	// dropped, counted before the decoder and NEVER decremented on a successful
-	// decode. The honest congestion signal (RFC 9265, N1): coding cannot hide it.
+	// decode. This is the honest congestion signal required by RFC 9265: coding cannot hide it.
 	WireLost uint64
 	// Rejected counts inbound symbols refused by the resource-safety admission cap
-	// (declared window too wide, or too many live generations) — the DoS bound (N1).
+	// (declared window too wide, or too many live generations) — the DoS bound.
 	Rejected uint64
 	// Evicted counts source ids dropped by media-aware early eviction
 	// (Config.EvictBrokenFrames): ids of a frame already known undecodable (its own loss
@@ -39,7 +39,7 @@ type ReceiverStats struct {
 }
 
 // FrameStats reports media-frame decodability the receiver computes parse-free from the
-// per-symbol frame descriptors (WP6): how many access units / keyframes were decodable
+// per-symbol frame descriptors: how many access units / keyframes were decodable
 // (delivered with their whole dependency closure intact) versus total. It turns Meld's
 // byte-level delivery into a picture-level QoE signal without the receiver parsing the
 // codec. Approximate where a frame had NO directly-received symbol (coding rebuilds
@@ -94,19 +94,20 @@ type genState struct {
 // strict order, recovering erasures from repair symbols and skipping any
 // generation whose deadline passes. Deterministic; not safe for concurrent use.
 type Receiver struct {
-	cfg         Config
-	pool        *code.Pool // recycles symbol payload buffers across generation decoders
-	gens        map[uint32]*genState
-	ready       map[uint32][]byte          // recovered/received payloads not yet delivered
-	symDL       map[uint32]clock.Timestamp // exact stamped deadline (write time + budget) of each directly-received id at/above the cursor; pruned as the cursor advances. A received symbol is delivered/evicted by its OWN deadline, so a generation written as one burst (a whole access unit at one instant) is not gated by the uniform-spacing deadline fit it violates.
-	cursor      uint32                     // next source id to deliver
-	highestSeen uint32                     // one past the highest source id any symbol has covered
-	lastFB      clock.Timestamp
-	fedOnce     bool
-	fbDue       bool // loss-onset event: emit feedback now (rate-limited), don't wait the cadence
-	deliverQ    []deliveredSym
-	sendQ       [][]byte
-	stats       ReceiverStats
+	cfg           Config
+	pool          *code.Pool // recycles symbol payload buffers across generation decoders
+	gens          map[uint32]*genState
+	ready         map[uint32][]byte          // recovered/received payloads not yet delivered
+	symDL         map[uint32]clock.Timestamp // exact stamped deadline (write time + budget) of each directly-received id at/above the cursor; pruned as the cursor advances. A received symbol is delivered/evicted by its OWN deadline, so a generation written as one burst (a whole access unit at one instant) is not gated by the uniform-spacing deadline fit it violates.
+	cursor        uint32                     // next source id to deliver
+	highestSeen   uint32                     // one past the highest source id any symbol has covered
+	lastFB        clock.Timestamp
+	fedOnce       bool
+	fbDue         bool // loss-onset event: emit feedback now (rate-limited), don't wait the cadence
+	deliverQ      []deliveredSym
+	sendQ         [][]byte
+	stats         ReceiverStats
+	repairScratch []byte // reusable expansion buffer for compact equations
 
 	// A structural gap is a generation at the delivery cursor for which no symbol has
 	// arrived, so there is no decoder state to report a rank deficit from. Hold the verdict
@@ -115,7 +116,7 @@ type Receiver struct {
 	structGapCursor uint32
 	structGapAt     clock.Timestamp
 
-	// ECN / L4S congestion signal (N3): over each feedback interval, the CE-marked
+	// ECN / L4S congestion signal: over each feedback interval, the CE-marked
 	// fraction of ADMITTED symbols, echoed to the sender's congestion controller so it
 	// reacts to the marks an L4S AQM sets before a standing queue forms. ecnSeen counts
 	// admitted symbols, ecnCE the CE-marked subset; reported as parts-per-65535 in
@@ -146,7 +147,7 @@ type Receiver struct {
 	pEWMA            float64
 	pHold            float64
 
-	// Forward-gap walk over the dense source-id sequence (N1 honest loss + N2 burst
+	// Forward-gap walk over the dense source-id sequence (wire loss and burst
 	// structure): a first-arrival id past the expected one means [expectNext, id)
 	// were dropped on the wire — one loss RUN of that length. Assumes near-in-order
 	// arrival; reorder over-counts loss, which is conservative for sizing. Feeds the
@@ -164,7 +165,7 @@ type Receiver struct {
 	// fictitious loss that over-sizes repair.
 	reorder reorderWindow
 
-	// Multipath co-loss estimation (N5). When the sender spreads across N paths, systematic
+	// Multipath co-loss estimation. When the sender spreads across N paths, systematic
 	// id k rides path k mod N, so each block of N consecutive ids forms one aligned slot. The
 	// forward-gap walk's in-order arrived/lost decisions are grouped into slots and folded
 	// into coEst, whose per-path marginals (→ PathLoss) and per-slot erasure-count histogram
@@ -197,7 +198,7 @@ type Receiver struct {
 	mpRevived    uint8  // paths cleared from deadPaths whose on-model return is not yet confirmed
 	mpGraceUntil uint32 // hard cap on the mpRevived suspension (id horizon)
 
-	// Frame-level loss propagation (WP6). Systematic symbols carry an access-unit
+	// Frame-level loss propagation. Systematic symbols carry an access-unit
 	// descriptor (FrameStart = the frame's first source id + the dominant reference's
 	// FrameStart + a RAP flag). The receiver learns the frame boundaries from
 	// directly-received systematics (frameStarts, kept sorted) and attributes EVERY id —
@@ -220,7 +221,7 @@ type Receiver struct {
 func NewReceiver(cfg Config) *Receiver {
 	r := &Receiver{
 		cfg:             cfg,
-		pool:            code.NewPool(cfg.SymbolSize),
+		pool:            code.NewPool(codedSymbolSize(cfg.SymbolSize)),
 		gens:            make(map[uint32]*genState),
 		ready:           make(map[uint32][]byte),
 		symDL:           make(map[uint32]clock.Timestamp),
@@ -234,8 +235,10 @@ func NewReceiver(cfg Config) *Receiver {
 		r.mpLost = make([]bool, r.paths)
 		r.pathRun = make([]int, r.paths)
 	}
-	r.reorder = reorderWindow{cfgHoldoff: cfg.ReorderHoldoffMicros, auto: cfg.AutoReorderHoldoff,
-		budget: cfg.BufferMicros, sink: r.observeLoss}
+	r.reorder = reorderWindow{
+		cfgHoldoff: cfg.ReorderHoldoffMicros, auto: cfg.AutoReorderHoldoff,
+		budget: cfg.BufferMicros, sink: r.observeLoss,
+	}
 	return r
 }
 
@@ -248,19 +251,36 @@ func (r *Receiver) FeedSymbol(now clock.Timestamp, datagram []byte) {
 
 // FeedSymbolECN is FeedSymbol carrying the datagram's ECN codepoint (read by the host from
 // the IP header). A CE mark on an admitted symbol is counted toward the CE-marked fraction
-// reported to the sender's congestion controller (N3 / L4S); the codepoint does not affect
+// reported to the sender's congestion controller; the codepoint does not affect
 // decoding.
 func (r *Receiver) FeedSymbolECN(now clock.Timestamp, datagram []byte, ecn ECN) {
 	sym, err := wire.DecodeSymbol(datagram)
 	if err != nil || sym.Flow != r.cfg.Flow {
 		return
 	}
+	var repairPayload []byte
+	if sym.Kind == wire.Systematic || sym.Kind == wire.UnitRepair {
+		if _, ok := systematicSourceLength(sym, r.cfg.SymbolSize); !ok {
+			r.stats.Rejected++
+			return
+		}
+	} else {
+		var ok bool
+		repairPayload, ok = expandRepairPayloadInto(sym, r.cfg.SymbolSize, r.repairScratch)
+		if !ok {
+			r.stats.Rejected++
+			return
+		}
+		if sym.HasSourceLength {
+			r.repairScratch = repairPayload
+		}
+	}
 	n := int(sym.N)
 	if n <= 0 {
 		n = r.cfg.GenSize
 	}
 	base := sym.WindowBase
-	// Resource-safety admission cap (N1): refuse a symbol whose declared window is
+	// Resource-safety admission cap: refuse a symbol whose declared window is
 	// wider than ls_max_size, whose window sits beyond the bounded look-ahead horizon,
 	// or that would push the live-decoder count past its cap — so a forged symbol
 	// cannot allocate unbounded decoder state or explode the delivery range. Checked
@@ -319,6 +339,7 @@ func (r *Receiver) FeedSymbolECN(now clock.Timestamp, datagram []byte, ecn ECN) 
 	g := r.gen(base, n)
 	switch sym.Kind {
 	case wire.Systematic:
+		sourceLen, _ := systematicSourceLength(sym, r.cfg.SymbolSize) // admit validated it
 		r.updateRef(sym.SrcIndex, dl)
 		r.observeSlack(now, dl)
 		if sym.SrcIndex >= r.cursor {
@@ -327,10 +348,17 @@ func (r *Receiver) FeedSymbolECN(now clock.Timestamp, datagram []byte, ecn ECN) 
 		if sym.SrcIndex < r.cursor || r.hasReady(sym.SrcIndex) {
 			r.stats.Duplicates++
 		}
-		r.absorb(g.dec.AddSystematic(sym.SrcIndex, sym.Payload), false)
+		r.absorb(g.dec.AddSystematic(sym.SrcIndex, makeCodedSource(sym.Payload[:sourceLen], r.cfg.SymbolSize, dl)), false)
+	case wire.UnitRepair:
+		sourceLen, _ := systematicSourceLength(sym, r.cfg.SymbolSize) // admit validated it
+		r.updateRef(sym.SrcIndex, dl)
+		if sym.SrcIndex >= r.cursor {
+			r.symDL[sym.SrcIndex] = dl
+		}
+		r.absorb(g.dec.AddSystematic(sym.SrcIndex, makeCodedSource(sym.Payload[:sourceLen], r.cfg.SymbolSize, dl)), true)
 	case wire.Repair:
 		r.updateRef(base+uint32(n)-1, dl)
-		r.absorb(g.dec.AddRepair(base, n, sym.RepairKey, sym.Payload), true)
+		r.absorb(g.dec.AddRepair(base, n, sym.RepairKey, repairPayload), true)
 	}
 	if end := base + uint32(n); end > r.highestSeen {
 		r.highestSeen = end
@@ -389,17 +417,11 @@ func (r *Receiver) MeanBurstQ8() uint32 { return r.meanBurstQ8 }
 // nothing and is always admitted. Honest symbols (N ≤ GenSize, window near the
 // cursor) always pass; the caps bite only on forged input.
 func (r *Receiver) admit(sym wire.Symbol, n int, base uint32) bool {
-	if len(sym.Payload) != r.cfg.SymbolSize {
-		// Every coded symbol (systematic or repair) is exactly SymbolSize on the wire; a different
-		// length means the peer's SymbolSize disagrees with ours — and SymbolSize is configured
-		// independently on each end, not negotiated. Reject it rather than zero-pad/truncate it
-		// into the GF math, which would silently corrupt the recovered bytes (the genBaseOf class).
-		return false
-	}
 	if n < 1 || n > r.cfg.maxGenSymbols() {
 		return false
 	}
-	if sym.Kind == wire.Systematic && (sym.SrcIndex < base || sym.SrcIndex >= base+uint32(n)) {
+	if (sym.Kind == wire.Systematic || sym.Kind == wire.UnitRepair) &&
+		(sym.SrcIndex < base || sym.SrcIndex >= base+uint32(n)) {
 		return false // a systematic id must lie within its declared window
 	}
 	if base+uint32(n) <= r.cursor {
@@ -418,7 +440,7 @@ func (r *Receiver) admit(sym wire.Symbol, n int, base uint32) bool {
 func (r *Receiver) gen(base uint32, n int) *genState {
 	g := r.gens[base]
 	if g == nil {
-		dec := code.NewDecoder(r.cfg.SymbolSize, base, n)
+		dec := code.NewDecoder(codedSymbolSize(r.cfg.SymbolSize), base, n)
 		dec.SetPool(r.pool)
 		g = &genState{dec: dec, n: n}
 		r.gens[base] = g
@@ -436,7 +458,12 @@ func (r *Receiver) absorb(rec []code.Recovered, repaired bool) {
 		if _, ok := r.ready[x.ID]; ok {
 			continue
 		}
-		r.ready[x.ID] = append([]byte(nil), x.Data...)
+		payload, _, dl, ok := parseCodedSource(x.Data, r.cfg.SymbolSize)
+		if !ok {
+			continue
+		}
+		r.ready[x.ID] = append([]byte(nil), payload...)
+		r.symDL[x.ID] = dl
 		if repaired {
 			r.stats.Recovered++
 		}
@@ -841,7 +868,7 @@ func (r *Receiver) structuralGapHoldoff() int64 {
 func (r *Receiver) maybeFeedback(now clock.Timestamp) {
 	if r.fedOnce {
 		since := now.Sub(r.lastFB)
-		if since < feedbackIntervalMicros && !(r.fbDue && since >= eventFeedbackMinMicros) {
+		if since < feedbackIntervalMicros && (!r.fbDue || since < eventFeedbackMinMicros) {
 			return // not yet due: neither the cadence nor a rate-limited loss-onset event
 		}
 	}
@@ -884,7 +911,7 @@ func (r *Receiver) maybeFeedback(now clock.Timestamp) {
 	}
 	var ceFrac uint16
 	if r.ecnSeen > 0 {
-		ceFrac = uint16(uint64(r.ecnCE) * 65535 / uint64(r.ecnSeen)) // CE-marked fraction (N3 / L4S)
+		ceFrac = uint16(uint64(r.ecnCE) * 65535 / uint64(r.ecnSeen)) // CE-marked fraction for L4S
 	}
 	frames, decFrames, keys, decKeys := feedbackFrameStats(r.fstats)
 	fb := wire.Feedback{
@@ -895,7 +922,7 @@ func (r *Receiver) maybeFeedback(now clock.Timestamp) {
 		EcnCE:              ceFrac,
 		LossRate:           uint16(r.lossEstimate() * 65535),
 		Deficits:           defs,
-		CongestionLoss:     uint16(r.clSinceFB), // pre-recovery loss this interval (N1)
+		CongestionLoss:     uint16(r.clSinceFB), // pre-recovery loss this interval
 		Burstiness:         uint16(r.meanBurstQ8),
 		Frames:             frames,
 		DecodableFrames:    decFrames,
@@ -904,6 +931,7 @@ func (r *Receiver) maybeFeedback(now clock.Timestamp) {
 		NewestDecodableLTR: r.newestDecLTR,
 		BrokenAnchors:      r.brokenAnchors,
 		DeadPaths:          r.deadPaths,
+		OutageRun:          r.outageRunSinceFB,
 	}
 	r.ecnSeen, r.ecnCE = 0, 0 // per-interval; the CC integrates the reported fraction
 	// Deliberately NO "deficit still open" latch here: under sustained loss a deficit
@@ -914,7 +942,7 @@ func (r *Receiver) maybeFeedback(now clock.Timestamp) {
 	if r.mpEnabled && r.coEst.primed {
 		// Per-path marginals (→ scheduler weighting) + the per-slot erasure-count histogram
 		// (→ joint-tail sizer), ppm → parts per 65535 (matching LossRate), so the sender sees
-		// the cross-path correlation an i.i.d.-union sizer misses (N5).
+		// the cross-path correlation an i.i.d.-union sizer misses.
 		marg, dist := r.coEst.marginals(), r.coEst.slotDist()
 		fb.PathLoss = make([]uint16, len(marg))
 		for i, m := range marg {
@@ -926,7 +954,8 @@ func (r *Receiver) maybeFeedback(now clock.Timestamp) {
 		}
 	}
 	r.sendQ = append(r.sendQ, wire.EncodeFeedback(nil, fb))
-	r.clSinceFB = 0 // per-interval; the CC loop integrates the reported deltas
+	r.clSinceFB = 0        // per-interval; the CC loop integrates the reported deltas
+	r.outageRunSinceFB = 0 // per-interval time-diversity evidence
 }
 
 // ppmToP65535 converts a rate in parts per million to parts per 65535 (the wire
@@ -960,7 +989,7 @@ func (r *Receiver) reorderMarginUs() int64 {
 // the network dropped, the signal the sender's controller sizes redundancy from).
 // pathID is the symbol's host-stamped path, used to validate multipath co-loss alignment.
 func (r *Receiver) observeLoss(id uint32, pathID uint8) {
-	r.walkGap(id, pathID) // pre-recovery loss count + burst run-lengths (N1/N2), before the windowed rate
+	r.walkGap(id, pathID) // pre-recovery loss count + burst run lengths, before the windowed rate
 	if !r.lossStarted {
 		r.lossStarted, r.lossBase, r.lossHighest, r.lossRecv = true, id, id, 1
 		return
@@ -1011,8 +1040,8 @@ func (r *Receiver) observeLoss(id uint32, pathID uint8) {
 
 // walkGap advances the forward-gap walk for a first-arrival source id: a jump past
 // the expected id means [expectNext, id) were dropped on the wire — one loss run of
-// that length. It accumulates the pre-recovery loss count (N1, never decremented on
-// decode) and smooths the mean loss-run length in Q8 (N2). Late/reorder arrivals
+// that length. It accumulates the pre-recovery loss count (never decremented on
+// decode) and smooths the mean loss-run length in Q8. Late/reorder arrivals
 // (id < expectNext) are already accounted and ignored.
 //
 // Two-regime classification: a run beyond the recovery horizon (outageThresholdSyms)

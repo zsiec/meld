@@ -6,7 +6,7 @@ import (
 	"github.com/zsiec/meld/internal/clock"
 )
 
-// TestEffectiveProtectionTier pins the temporal-depth UEP gradient (WP6 propagation-aware
+// TestEffectiveProtectionTier pins the temporal-depth unequal-protection gradient
 // protection): a PURE top-layer generation loosens one protection tier per temporal level past the
 // reference layer — the forward-looking proxy for descendant fan-out, since a frame deeper in the
 // hierarchical-B GOP is decoded FROM by exponentially fewer downstream frames. A generation carrying

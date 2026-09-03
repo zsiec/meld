@@ -1,9 +1,8 @@
 package flow
 
-// Coding-native path failover (the outage detector × the N5 multipath machinery):
-// pre-registered in scratchpad/outage-composure/PREREG-multipath-failover.md. A total
-// path outage is the ST 2022-7 survival case; round-robin placement otherwise keeps
-// feeding the dead path half the source for the outage's whole duration. The receiver
+// Coding-native path failover combines the outage detector with multipath scheduling.
+// A total path outage is the ST 2022-7 survival case; round-robin placement otherwise
+// keeps feeding the dead path half the source for the outage's whole duration. The receiver
 // detects a per-path outage from its aligned-slot walk (consecutive lost slots beyond
 // the recovery horizon while other paths deliver), reports it in Feedback.DeadPaths;
 // the sender fails systematic placement over to the live set, probes the dead path
@@ -44,8 +43,10 @@ func failoverCell(t *testing.T, off bool) (res simResult, rx *Receiver, deadSrcI
 		budget         = 100_000
 		outFrom, outTo = 2_000, 4_600 // ~800+ ms of emissions with path 0 dead
 	)
-	cfg := Config{Flow: 1, SymbolSize: testSym, GenSize: testGen, Redundancy: 0.15,
-		TargetFailure: 1e-3, BufferMicros: budget, Paths: 2}
+	cfg := Config{
+		Flow: 1, SymbolSize: testSym, GenSize: testGen, Redundancy: 0.15,
+		TargetFailure: 1e-3, BufferMicros: budget, Paths: 2,
+	}
 	ch := &pathOutageChannel{path: 0, from: outFrom, to: outTo}
 	var srcSeen int
 	var tailWindow []uint8
@@ -134,13 +135,15 @@ func TestPathFailoverMoney(t *testing.T) {
 }
 
 // TestPathFailoverQuietOnLossyPaths is bar F2: an ordinary lossy-but-alive 2-path
-// channel (the N5 operating regime) must never trip the dead-path verdict, and
+// channel must never trip the dead-path verdict, and
 // placement must stay byte-identical to plain round-robin.
 func TestPathFailoverQuietOnLossyPaths(t *testing.T) {
 	t.Parallel()
 	const n = 3_200 // a multiple of GenSize: a partial tail generation would add phantom ids to the accounting check
-	cfg := Config{Flow: 1, SymbolSize: testSym, GenSize: testGen, Redundancy: 0.15,
-		TargetFailure: 1e-3, BufferMicros: 150_000, Paths: 2}
+	cfg := Config{
+		Flow: 1, SymbolSize: testSym, GenSize: testGen, Redundancy: 0.15,
+		TargetFailure: 1e-3, BufferMicros: 150_000, Paths: 2,
+	}
 	var misplaced int
 	sl := simLink{
 		cfg: cfg, owdMicros: 20_000, srcMicros: 500, n: n,
@@ -223,9 +226,11 @@ func TestReceiverPathOutageDetection(t *testing.T) {
 	r := NewReceiver(cfg)
 	now := clock.Timestamp(0)
 	feed := func(id uint32, path uint8) {
-		sym := wire.Symbol{Flow: 1, Kind: wire.Systematic, WindowBase: genBaseOf(id, testGen),
+		sym := wire.Symbol{
+			Flow: 1, Kind: wire.Systematic, WindowBase: genBaseOf(id, testGen),
 			SrcIndex: id, N: testGen, PathID: path,
-			Deadline: int64(now.Add(cfg.BufferMicros)), Payload: make([]byte, testSym)}
+			Deadline: int64(now.Add(cfg.BufferMicros)), Payload: make([]byte, testSym),
+		}
 		r.FeedSymbol(now, wire.EncodeSymbol(nil, sym))
 		now = now.Add(500)
 	}
@@ -316,9 +321,11 @@ func TestReceiverAllPathsLostIsNotFailover(t *testing.T) {
 	r := NewReceiver(cfg)
 	now := clock.Timestamp(0)
 	feed := func(id uint32, path uint8) {
-		sym := wire.Symbol{Flow: 1, Kind: wire.Systematic, WindowBase: genBaseOf(id, testGen),
+		sym := wire.Symbol{
+			Flow: 1, Kind: wire.Systematic, WindowBase: genBaseOf(id, testGen),
 			SrcIndex: id, N: testGen, PathID: path,
-			Deadline: int64(now.Add(cfg.BufferMicros)), Payload: make([]byte, testSym)}
+			Deadline: int64(now.Add(cfg.BufferMicros)), Payload: make([]byte, testSym),
+		}
 		r.FeedSymbol(now, wire.EncodeSymbol(nil, sym))
 		now = now.Add(500)
 	}

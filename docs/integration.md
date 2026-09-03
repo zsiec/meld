@@ -11,8 +11,8 @@ go get github.com/zsiec/meld
 
 ## Basic Byte-Stream Mode
 
-Byte-stream mode is the simplest integration. The sender writes fixed-size media
-chunks; the receiver reads recovered chunks in order.
+Byte-stream mode is the simplest integration. The sender writes media chunks up
+to `MaxChunk()` bytes; the receiver reads the exact recovered chunks in order.
 
 ### Sender
 
@@ -131,6 +131,9 @@ Poll encoder control from the sender:
 
 ```go
 ctrl := sender.EncoderControl()
+if ctrl.TargetBitrateBps != 0 {
+	encoder.SetTargetBitrate(ctrl.TargetBitrateBps)
+}
 if ctrl.RecoveryCadenceFrames != 0 {
 	encoder.SetMaxRecoveryInterval(int(ctrl.RecoveryCadenceFrames))
 } else {
@@ -142,13 +145,41 @@ The request is advisory. Meld continues operating even if the encoder ignores it
 
 Recommended behavior:
 
+- apply `TargetBitrateBps` as an encoder payload ceiling, not an additional
+  transport pacer
 - satisfy with bounded intra-refresh or recovery-point cadence when possible
 - avoid frequent full IDR/keyint shortcuts unless that is the codec's only
   actuator
 - relax the encoder request when Meld returns `0`
 - do not expose this as a separate user profile
 
+The bitrate request is derived from the sender's measured source packet cadence,
+payload/header split, live total-rate budget, and uncapped recovery set point.
+Activation and relaxation are hysteretic. A recovery-share bound preserves most
+of the aggregate budget for media even when a burst-tail estimate is extreme.
+
 ## Configuration Recipes
+
+Recovery does not require a recipe. `DefaultConfig` uses one automatic policy:
+
+- before feedback is credible, conservative sliding equations cover cold start;
+- burst-correlated loss keeps recovery fungible across a window;
+- the sender continuously allocates a measured share of proactive repair
+  to isolated 16-source Cauchy-MDS blocks when cadence, deadline, and row
+  economics admit them; correlated loss raises the share, while reactive room
+  and long slack reduce it without turning MDS off;
+- coded equations automatically omit a zero payload
+  tail when the four-byte length extension still produces a net byte saving;
+- a persistent residual can receive compact exact closure when a feedback cycle
+  fits its deadline;
+- when a feedback cycle cannot fit, one copy may be delayed past the measured
+  fade if one-way transit and the byte budget still fit;
+- source bytes are charged first and every recovery action shares the remaining
+  `MaxBitrate` allowance.
+
+Exact-unit, compact-equation, and epoch repair are part of wire version 1.
+Applications set the latency and capacity contract; they do not switch recovery
+algorithms as the path changes.
 
 ### Low-Latency Frontier
 
@@ -214,14 +245,36 @@ Sender stats:
 
 ```go
 st := sender.Stats()
-log.Printf("source=%d repair=%d reactive=%d throttled=%d cadence=%d",
+log.Printf("source=%d repair=%d reactive=%d arq=%d burst_copy=%d outage_delayed=%d block_mds=%d mds_demand=%d/256 mds_correlation=%d/256 mds_memory=%d/256 mds_mix=%d/256 compact=%d saved_bytes=%d throttled=%d cadence=%d",
 	st.Source,
 	st.Repair,
 	st.ReactiveRepair,
+	st.RepairExact,
+	st.RepairBurstDuplicate,
+	st.RepairOutageDiversity,
+	st.RepairEpoch,
+	st.EpochDemandQ8,
+	st.EpochCorrelationQ8,
+	st.EpochMemoryQ8,
+	st.EpochShareQ8,
+	st.RepairCompacted,
+	st.RepairBytesSaved,
 	st.Throttled,
 	st.RecoveryCadenceFrames,
 )
 ```
+
+`RepairExact` is a subset of deficit repair; `RepairBurstDuplicate`,
+`RepairOutageDiversity`, and `RepairEpoch` are subsets of proactive repair.
+Do not add them to `Repair` when computing total traffic. Outage diversity counts
+existing RLNC credits moved in time; automatic MDS counts existing proactive
+credit emitted as fixed Cauchy rows. Neither is additional redundancy.
+`EpochDemandQ8`, `EpochCorrelationQ8`, and
+`EpochMemoryQ8` expose the live automatic evidence. `EpochShareQ8`
+is the epoch fraction selected for the latest stable block; 256 means all of that
+block's proactive opportunities were assigned to MDS.
+`RepairCompacted` and `RepairBytesSaved` describe wire serialization savings;
+they do not add equations or weaken control-budget accounting.
 
 Receiver stats:
 
@@ -261,8 +314,10 @@ Interpretation:
 
 ## Packetization And Chunk Size
 
-`SymbolSize` is the coded-symbol payload size. The default, 1316 bytes, matches
-seven 188-byte MPEG-TS packets and fits common RTP/UDP MTU practice.
+`SymbolSize` is the maximum application chunk and the fixed algebraic width. The
+default, 1316 bytes, matches seven 188-byte MPEG-TS packets and fits common
+RTP/UDP MTU practice. Systematic datagrams carry only the exact bytes written;
+repair equations internally zero-pad values to this width.
 
 Rules:
 
@@ -287,7 +342,8 @@ to shrink.
 
 Before a real deployment:
 
-- set the same `Flow`, `SymbolSize`, `GenSize`, and `BufferMicros` on both ends
+- set the same `Flow`, `SymbolSize`, and `BufferMicros` on both ends; generation
+  deployments must also agree on `GenSize`
 - use `MaxChunk()` for sender buffers
 - keep `Pace` enabled unless your host layer already enforces the same deadline
   contract

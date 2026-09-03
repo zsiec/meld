@@ -7,14 +7,20 @@ import (
 
 // FuzzDecodeNoPanic asserts the decoders never panic on arbitrary input and that
 // anything they accept survives a semantic round-trip: decode(encode(decode(b)))
-// equals decode(b). (Re-encoding is not byte-identical to b because reserved
-// header bytes are intentionally ignored on decode for forward compatibility, so
-// the property is over the decoded values, not the raw bytes.)
+// equals decode(b). The property is over decoded values rather than raw bytes.
 func FuzzDecodeNoPanic(f *testing.F) {
 	f.Add([]byte{})
 	f.Add([]byte{typeSystematic})
 	f.Add(EncodeSymbol(nil, Symbol{Flow: 1, Kind: Repair, N: 4, Payload: []byte("abc")}))
 	f.Add(EncodeSymbol(nil, Symbol{Flow: 1, Kind: SparseRepair, SparseIDs: []uint32{3, 8, 13}, Payload: []byte("abc")}))
+	f.Add(EncodeSymbol(nil, Symbol{
+		Flow: 1, Kind: UnitRepair, SrcIndex: 3, N: 1,
+		HasSourceLength: true, SourceLength: 3, Payload: []byte("abc"),
+	}))
+	f.Add(EncodeSymbol(nil, Symbol{
+		Flow: 1, Kind: Repair, WindowBase: 2, N: 4, RepairKey: 7,
+		HasSourceLength: true, SourceLength: 3, Payload: []byte("compact-repair-metadata"),
+	}))
 	f.Add(EncodeFeedback(nil, Feedback{Flow: 9, Deficit: 2}))
 	f.Add(EncodeMTUProbe(nil, 0xdeadbeef, 1400))
 	f.Add(EncodeMTUProbeAck(nil, 0xdeadbeef, 1400))
@@ -65,6 +71,7 @@ func symbolEqual(a, b Symbol) bool {
 		a.SrcIndex == b.SrcIndex && a.N == b.N && a.RepairKey == b.RepairKey &&
 		u32eq(a.SparseIDs, b.SparseIDs) &&
 		a.Priority == b.Priority && a.Deadline == b.Deadline && a.SendTimestamp == b.SendTimestamp &&
+		a.HasSourceLength == b.HasSourceLength && a.SourceLength == b.SourceLength &&
 		a.HasFrameDesc == b.HasFrameDesc && a.FrameLen == b.FrameLen && a.FrameStart == b.FrameStart && u32eq(a.FrameRefs, b.FrameRefs) &&
 		a.FrameRAP == b.FrameRAP && a.FrameRecoveryRefresh == b.FrameRecoveryRefresh &&
 		a.FrameDiscardable == b.FrameDiscardable && a.FrameNonPicture == b.FrameNonPicture &&

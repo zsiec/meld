@@ -213,7 +213,9 @@ func ffprobeFramesExt(t *testing.T, data []byte, ext string) int {
 	if _, err := f.Write(data); err != nil {
 		return -1
 	}
-	f.Close()
+	if err := f.Close(); err != nil {
+		return -1
+	}
 	out, err := exec.Command(bin, "-v", "error", "-count_frames", "-select_streams", "v:0",
 		"-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", f.Name()).Output()
 	if err != nil {
@@ -226,7 +228,7 @@ func ffprobeFramesExt(t *testing.T, data []byte, ext string) int {
 	return n
 }
 
-// TestGlassToGlassReal is the WP6 glass-to-glass: a real H.264 clip is shaped, streamed
+// TestGlassToGlassReal shapes a real H.264 clip, streams it
 // through Meld over loss, and the receiver-visible DECODABLE set is reassembled and
 // handed to a real decoder (ffprobe). The decoder must produce exactly the predicted
 // number of frames — confirming the shaper's dependency model against ffmpeg on real

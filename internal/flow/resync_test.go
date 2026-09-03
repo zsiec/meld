@@ -3,10 +3,9 @@ package flow
 // Tests for the LTR-resync mechanism (resync.go + the receiver's LTR feedback state
 // + the EncoderControl plumbing): the controller's trigger/hold/expiry rules in
 // isolation, the receiver's NewestDecodableLTR / BrokenAnchors reporting, and the
-// end-to-end money test — the REAL closed loop (app marks FrameDesc.LTR, polls
+// end-to-end closed-loop test (the app marks FrameDesc.LTR, polls
 // EncoderControl, honors Resync) recovering decodable pictures where the
-// wait-for-IDR baseline collapses, on the burst cell the pre-registered Phase-1
-// experiment validated (ltr_resync_test.go; decision notes in docs/decisions).
+// wait-for-IDR baseline collapses (ltr_resync_test.go).
 
 import (
 	"testing"
@@ -139,8 +138,10 @@ func (e *ltrEncoder) frameIDKnown(fid uint32) (ltrUnit, bool) {
 func (e *ltrEncoder) emitRecovery(fid uint32) []chunkWrite {
 	e.sinceResync++
 	chunks := int(2 * ltrChunksP)
-	out := e.addUnit(shape.Unit{Class: shape.ClassBase, Picture: true,
-		Confidence: shape.Signaled, RefersTo: []uint32{fid}}, chunks, true, true)
+	out := e.addUnit(shape.Unit{
+		Class: shape.ClassBase, Picture: true,
+		Confidence: shape.Signaled, RefersTo: []uint32{fid},
+	}, chunks, true, true)
 	id := e.units[len(e.units)-1].u.ID
 	e.prevAnchor = int64(id)
 	e.lastResync = int64(id)
@@ -152,7 +153,7 @@ func (e *ltrEncoder) emitRecovery(fid uint32) []chunkWrite {
 // runResyncLoop drives the real sliding sender/receiver with the real feedback loop
 // (no test-side verdict channel: damage detection and safe-LTR selection ride
 // wire.Feedback into the resyncController) over a seeded channel, and scores
-// decodable pictures with the WP6 oracle.
+// decodable pictures with the dependency-closure oracle.
 func runResyncLoop(t *testing.T, honor bool, drop func(wire.Symbol) bool, frames int, jitterUs int64) (picRate float64, honors int, ec0 bool, srcChunks uint64) {
 	t.Helper()
 	const (
@@ -263,7 +264,7 @@ func runResyncLoop(t *testing.T, honor bool, drop func(wire.Symbol) bool, frames
 	}
 
 	// Score: a unit is delivered iff all its chunk ids were delivered; decodability by
-	// the WP6 closure oracle.
+	// the dependency-closure oracle.
 	units := make([]shape.Unit, len(enc.units))
 	deliveredWhole := make(map[uint32]bool, len(enc.units))
 	for i, u := range enc.units {
@@ -295,14 +296,13 @@ func runResyncLoop(t *testing.T, honor bool, drop func(wire.Symbol) bool, frames
 	return float64(decPics) / float64(pics), app.honors, ec0, st.Source
 }
 
-// TestLTRResyncEndToEnd is the mechanism's money test: over a Gilbert-Elliott burst
+// TestLTRResyncEndToEnd verifies the mechanism over a Gilbert-Elliott burst
 // channel (10% loss, mean burst 48 — the burst-frontier cell), an application that
 // honors EncoderControl.Resync keeps decisively more decodable pictures than one
 // that ignores it, using ONLY the real wire loop (FrameDesc.LTR → descriptor flag →
 // receiver frame graph → Feedback.NewestDecodableLTR/BrokenAnchors →
 // resyncController → EncoderControl). Thresholds sit far outside the arms' measured
-// spreads (Phase-1: base ≤ 0.62 vs ltr ≥ 0.68 per-seed at 900 frames, gap stable
-// across seeds/cells).
+// spreads in the pinned cases.
 func TestLTRResyncEndToEnd(t *testing.T) {
 	t.Parallel()
 	const frames = 900
@@ -322,8 +322,7 @@ func TestLTRResyncEndToEnd(t *testing.T) {
 		if got < base+0.05 {
 			t.Fatalf("seed %d: honored resync %.3f did not beat ignore %.3f by ≥0.05", seed, got, base)
 		}
-		// The recovery frames must stay a small source-byte overhead (the Phase-1
-		// bar was ≤ +10%).
+		// Recovery frames must stay within the pinned 10% source-byte overhead bound.
 		if float64(honorSrc) > float64(baseSrc)*1.10 {
 			t.Fatalf("seed %d: resync source overhead too high: %d vs %d", seed, honorSrc, baseSrc)
 		}

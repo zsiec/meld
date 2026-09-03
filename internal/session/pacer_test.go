@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/zsiec/meld/internal/clock"
+	"github.com/zsiec/meld/internal/wire"
 )
 
 // dg builds a datagram of n bytes whose first byte tags its sequence (for order checks).
@@ -108,6 +109,107 @@ func TestPacerState_NeverDropsInOrder(t *testing.T) {
 	}
 	if outBytes != inBytes {
 		t.Fatalf("byte total not conserved: out %d != in %d", outBytes, inBytes)
+	}
+}
+
+// TestPacerState_SourcePriority proves the central scheduler invariant: later
+// source jumps queued recovery, while FIFO order remains stable within each class.
+func TestPacerState_SourcePriority(t *testing.T) {
+	var p pacerState
+	p.setRate(10_000_000, 5_000)
+	p.enqueue(dg(10, 510))
+	p.enqueueSource(dg(1, 501))
+	p.enqueue(dg(11, 511))
+	p.enqueueSource(dg(2, 502))
+
+	out, _ := step(&p, 0, 1_000_000, 500)
+	if len(out) != 4 {
+		t.Fatalf("released %d/4 datagrams", len(out))
+	}
+	want := []byte{1, 2, 10, 11}
+	for i, d := range out {
+		if d[0] != want[i] {
+			t.Fatalf("release[%d] tag = %d, want %d", i, d[0], want[i])
+		}
+	}
+}
+
+func TestPacerState_SourceThenExactThenCodedPriority(t *testing.T) {
+	var p pacerState
+	p.setRate(10_000_000, 5_000)
+	p.enqueue(dg(10, 510))
+	p.enqueueExact(dg(20, 520))
+	p.enqueueSource(dg(1, 501))
+	p.enqueue(dg(11, 511))
+	p.enqueueExact(dg(21, 521))
+	p.enqueueSource(dg(2, 502))
+
+	out, _ := step(&p, 0, 1_000_000, 500)
+	if len(out) != 6 {
+		t.Fatalf("released %d/6 datagrams", len(out))
+	}
+	want := []byte{1, 2, 20, 21, 10, 11}
+	for i, d := range out {
+		if d[0] != want[i] {
+			t.Fatalf("release[%d] tag = %d, want %d", i, d[0], want[i])
+		}
+	}
+}
+
+func TestPacerState_RepairDebtCannotStallSource(t *testing.T) {
+	var p pacerState
+	p.setRate(1_000_000, 5_000)
+	p.tokens = -20_000
+	p.sourceTokens = p.burstBytes
+	p.enqueue(dg(10, 510))
+	p.enqueueSource(dg(1, 501))
+
+	out := p.due(0)
+	if len(out) != 1 || out[0][0] != 1 {
+		t.Fatalf("repair debt released %v, want only source tag 1", datagramTags(out))
+	}
+	if len(p.queue) != 1 || p.queue[0][0] != 10 {
+		t.Fatalf("queued tags = %v, want repair tag 10", datagramTags(p.queue))
+	}
+}
+
+func datagramTags(ds [][]byte) []byte {
+	tags := make([]byte, len(ds))
+	for i, d := range ds {
+		if len(d) > 0 {
+			tags[i] = d[0]
+		}
+	}
+	return tags
+}
+
+func TestHostPacerRepairAdmissionDoesNotBlockSourceWriter(t *testing.T) {
+	hp := &hostPacer{
+		limitMicros: 1,
+		sig:         make(chan struct{}, 1),
+		done:        make(chan struct{}),
+	}
+	hp.cond = sync.NewCond(&hp.mu)
+	hp.st.setRate(1, 5_000)
+	repair := wire.EncodeSymbol(nil, wire.Symbol{
+		Kind: wire.Repair, N: 1, Payload: make([]byte, 256),
+	})
+
+	done := make(chan error, 1)
+	go func() { done <- hp.putFlow([][]byte{repair, repair}) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("put repair: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("repair admission blocked the source-facing writer")
+	}
+
+	hp.mu.Lock()
+	defer hp.mu.Unlock()
+	if hp.st.sourceCount != 0 || len(hp.st.queue) != 2 {
+		t.Fatalf("queued source/total = %d/%d, want 0/2", hp.st.sourceCount, len(hp.st.queue))
 	}
 }
 
