@@ -17,7 +17,6 @@ coverage.*
 /docs/spec/*.log
 /docs/spec/*.lof
 /docs/spec/*.out
-/docs/spec/*.pdf
 /docs/spec/*.run.xml
 /docs/spec/*.synctex.gz
 /docs/spec/*.toc
