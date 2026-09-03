@@ -104,9 +104,8 @@ type Config struct {
 	// first loss evidence restores full sizing instantly. Cleanliness is judged by
 	// the receiver's SETTLED walk (an id counts lost only after a reorder holdoff
 	// proves it absent), so plain reorder neither blocks the decay nor fakes
-	// cleanliness; against a peer predating that evidence, every raw loss signal
-	// must be quiet instead. Warmup, absent feedback, idle intervals, and tight
-	// budgets always retain the full floor.
+	// cleanliness. Warmup, absent feedback, idle intervals, and tight budgets
+	// always retain the full floor.
 	Redundancy float64
 	// TargetFailure is the per-generation decode-failure probability the redundancy
 	// controller sizes the proactive code rate to (the QoS knob). 0 ⇒ default 1e-3.
@@ -226,8 +225,10 @@ type Config struct {
 	Argon2MemoryKiB uint32
 	Argon2Threads   uint8
 	// EpochSize is the number of source symbols sealed under one epoch key before the
-	// sender ratchets to a fresh key (forward secrecy granularity). Both ends must agree.
-	// 0 ⇒ default. Ignored unless Passphrase is set.
+	// sender ratchets to a fresh key (forward secrecy granularity). The sender carries
+	// its value in the authenticated handshake and the receiver adopts it; the receiver's
+	// local value does not control the session. 0 ⇒ default. Ignored unless Passphrase
+	// is set.
 	EpochSize uint32
 	// CookieThreshold is the per-tick handshake-attempt count above which the Receiver
 	// switches on the mac2 return-routability cookie (anti-amplification under flood). 0 ⇒
@@ -676,8 +677,8 @@ func (r *Receiver) Stats() ReceiverStats {
 	return receiverStatsFromFlow(r.r.Stats())
 }
 
-// FrameStats returns the parse-free media-frame decodability snapshot (populated only
-// for generation-profile senders using WriteFrame; zero otherwise).
+// FrameStats returns the parse-free media-frame decodability snapshot populated by
+// WriteFrame descriptors; it is zero for plain Write byte streams.
 func (r *Receiver) FrameStats() FrameStats { return frameStatsFromFlow(r.r.FrameStats()) }
 
 // Close releases the socket.

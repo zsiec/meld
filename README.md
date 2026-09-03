@@ -222,6 +222,9 @@ if ctrl.TargetBitrateBps != 0 {
 if ctrl.RecoveryCadenceFrames != 0 {
 	encoder.SetMaxRecoveryInterval(int(ctrl.RecoveryCadenceFrames))
 }
+if ctrl.Resync {
+	encoder.RequestLTRResync(ctrl.ResyncRefFrameID)
+}
 ```
 
 `TargetBitrateBps` asks the encoder to leave enough of the live aggregate rate
@@ -234,6 +237,10 @@ burst estimate cannot collapse picture quality merely to maximize packet counts.
 bounded recovery point cadence. Encoders may implement this with intra-refresh,
 recovery-point SEI, or keyframes. If the encoder cannot comply, Meld continues
 with the same transport loop.
+
+`Resync` names an encoder-retained LTR that the receiver has confirmed decodable
+and asks the encoder to reference it for the next frame after the live chain
+breaks. If the encoder no longer retains that LTR, it can ignore the request.
 
 This is intentionally advisory. It is an actuator for `meld-auto`, not a second
 profile.

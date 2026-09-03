@@ -331,10 +331,10 @@ func TestClusteredExactRepairCrossesAtLastUsefulDispatch(t *testing.T) {
 
 	control, now := newSender(true)
 	if got := control.answerMissing(now, fb); got != 0 {
-		t.Fatalf("legacy persistence control answered %d, want 0", got)
+		t.Fatalf("persistence-only control answered %d, want 0", got)
 	}
 	if got := len(drainSlidingSymbols(t, control)); got != 0 {
-		t.Fatalf("legacy persistence control emitted %d symbols", got)
+		t.Fatalf("persistence-only control emitted %d symbols", got)
 	}
 }
 

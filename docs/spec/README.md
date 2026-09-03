@@ -21,5 +21,6 @@ make -C docs/spec
 ```
 
 The build uses `latexmk` when available, otherwise `tectonic`, otherwise
-`pdflatex`. Generated PDF and auxiliary files are intentionally ignored by git;
-commit the `.tex` source and curated notes, not build output.
+`pdflatex`. The generated `meld-protocol.pdf` is tracked and must be rebuilt and
+committed whenever the authoritative `.tex` source changes. Auxiliary files are
+ignored.

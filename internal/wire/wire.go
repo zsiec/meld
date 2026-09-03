@@ -10,7 +10,7 @@
 // The leading byte packs a 4-bit format VERSION in its high nibble and the
 // message-type tag in its low nibble: byte0 = (Version<<4) | type. A decoder that
 // sees any other version returns ErrVersion. Version 1 is the authoritative
-// research format; the codec intentionally carries no alternate-layout decoder.
+// research format; the codec accepts exactly the layout defined in this package.
 //
 // The codec never panics on malformed input (Meld's no-panic-in-library rule):
 // short, mis-versioned, or corrupt buffers return an error. All multi-byte fields

@@ -131,7 +131,7 @@ Standards Track document.
 Wire version \wireversion{} is the sole research format. It carries exact source
 length and deadline metadata, bounded Cauchy-MDS keys, sliding RLNC, exact unit
 repair, and isolated epoch repair directly. Implementations reject any other
-version nibble; this specification defines no preceding-layout decoder.
+version nibble and accept exactly the complete layout in this document.
 
 \section*{How to Read This Specification}
 \label{sec:reading-guide}
@@ -715,7 +715,7 @@ current encrypted-session suite pins the following payload lengths:
 Type & Direction & Payload bytes & Payload layout \\
 \midrule
 \endhead
-\code{0x6} & Init to resp & 1248 & X25519 public key (32), ML-KEM-768 encapsulation key (1184), \field{mac1} (16), \field{mac2} (16). \\
+\code{0x6} & Init to resp & 1252 & X25519 public key (32), ML-KEM-768 encapsulation key (1184), sender \field{EpochSize} (4), \field{mac1} (16), \field{mac2} (16). \\
 \code{0x7} & Resp to init & 1152 & X25519 public key (32), ML-KEM-768 ciphertext (1088), confirmation tag (16), \field{mac1} (16). \\
 \code{0x8} & Resp to init & 56 & Cookie nonce (24), encrypted cookie body (32). \\
 \bottomrule
@@ -1258,6 +1258,10 @@ The descriptor fields are:
   Number of chunks in the access unit.
 \item[\field{RefStart[]}]
   First source ids of dependency access units.
+\item[\field{TemporalID}]
+  Sender-local temporal-scalability layer used for optional pre-assignment
+  shedding. It is an API input and is not serialized in the frame-descriptor
+  extension.
 \item[RAP]
   Random-access point or equivalent recovery anchor.
 \item[Recovery-refresh]
@@ -1267,22 +1271,40 @@ The descriptor fields are:
   Unit that no later unit depends on.
 \item[Non-picture]
   Parameter, metadata, or other non-displayed coded material.
+\item[LTR]
+  Long-term-reference candidate retained by the encoder. The receiver uses
+  decodable candidates to report a safe resynchronization anchor.
 \end{description}
 
 The descriptor does not mandate a codec structure. A media shaper maps codec or
 container facts into this generic form.
 
-\section{Encoder Recovery-Cadence Actuator}
+\section{Encoder Control Actuators}
 
-\meld{} MAY expose an advisory encoder-control output. When feedback indicates
-that long bursts are damaging dependency islands, the sender MAY request a
-bounded maximum recovery interval from an attached encoder. An encoder can satisfy
-that request with bounded intra-refresh, recovery-point signaling, keyframes, or
-another codec-native mechanism.
+\meld{} MAY expose one advisory encoder-control output containing three independent
+requests:
 
-This actuator is advisory. It MUST NOT create multiple deployed Meld profiles. If
-the encoder cannot comply, Meld continues with the same transport loop and
-configured repair budget.
+\begin{description}[leftmargin=3.5cm,style=nextline]
+\item[\field{TargetBitrateBps}]
+  A source-payload ceiling that leaves room for measured recovery demand inside
+  the live aggregate rate budget. The calculation prices source headers and
+  recovery serialization, activates and relaxes with hysteresis, and bounds the
+  recovery share so transport completeness cannot consume most of the media
+  budget. Zero means no active reduction request.
+\item[\field{RecoveryCadenceFrames}]
+  A bounded maximum distance between recovery points when long bursts damage
+  dependency islands. An encoder may satisfy it with bounded intra-refresh,
+  recovery-point signaling, keyframes, or another codec-native mechanism. Zero
+  means no active cadence request.
+\item[\field{Resync}, \field{ResyncRefFrameID}]
+  A request to code the next frame against the named, encoder-retained LTR after
+  the receiver reports a broken live reference chain and confirms that LTR
+  decodable. An encoder that no longer retains the reference ignores the request.
+\end{description}
+
+These actuators are advisory. They MUST NOT create multiple deployed Meld
+profiles. If the encoder cannot comply, Meld continues with the same transport
+loop and configured repair budget.
 
 \section{Multipath}
 
@@ -1321,7 +1343,10 @@ The encrypted session handshake uses an Argon2id-stretched passphrase as a PSK,
 an NNpsk0-style Noise pattern, X25519, ML-KEM-768, HKDF-SHA256, and
 ChaCha20-Poly1305. Handshake message bytes are carried as opaque payloads behind
 message types \code{0x6}, \code{0x7}, and \code{0x8}. The cookie reply is an
-anti-amplification mechanism used under load.
+anti-amplification mechanism used under load. The initiator carries the media
+sender's nonzero \field{EpochSize} in message 1 under \field{mac1} and the
+transcript; the responder adopts that authenticated value for traffic-key
+rotation.
 
 \subsection{Encrypt-then-code}
 

@@ -93,7 +93,7 @@ type Config struct {
 	// estimators that size proactive repair) once it has been missing this long — not the instant a
 	// higher id arrives. Under real-timing reorder/jitter a higher id routinely arrives before the
 	// lower ones (which are merely late, not lost), and the estimators over-count it as loss: a
-	// jittered bench and cref both show ~220% proactive overhead at 1% loss where ~17% suffices,
+	// a jittered external-stack benchmark shows ~220% proactive overhead at 1% loss where ~17% suffices,
 	// because the receiver reports a fictitious ~50% loss + high burstiness. Holding the loss verdict
 	// one reorder window lets the late symbols arrive and be counted received; genuine loss survives
 	// the wait. Trades a slice of loss-onset responsiveness (the estimate lags a genuine onset by the
@@ -1030,7 +1030,7 @@ func genBaseOf(id uint32, genSize int) uint32 {
 const maxAdaptiveGenWidth = 64
 
 // adaptiveMaxFillMicros is the gen-fill latency tax the width gate tolerates: a generation may be
-// widened only while it still fills within this. The cref bench shows a ~13 ms fill (a 64-wide gen
+// widened only while it still fills within this. The real-time benchmark shows a ~13 ms fill (a 64-wide gen
 // at 50 Mbps) is invisible to delivery latency, while a ~134 ms fill (the same at 5 Mbps) regresses
 // p50 4-5× — so 15 ms widens fully at ≳45 Mbps and holds the width near GenSize below ~10 Mbps.
 const adaptiveMaxFillMicros = 15_000

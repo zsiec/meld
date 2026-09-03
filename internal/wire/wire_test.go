@@ -162,6 +162,34 @@ func TestFeedbackRoundTrip(t *testing.T) {
 	}
 }
 
+// TestSpecificationWireLengths pins the literal sizes published in the protocol
+// specification. These are interoperability values, not merely implementation
+// constants, so changing one requires an intentional specification edit.
+func TestSpecificationWireLengths(t *testing.T) {
+	tests := []struct {
+		name string
+		got  int
+		want int
+	}{
+		{"symbol base header", len(EncodeSymbol(nil, Symbol{})), 30},
+		{"single-path feedback", len(EncodeFeedback(nil, Feedback{})), 93},
+		{"three-path feedback", len(EncodeFeedback(nil, Feedback{
+			PathLoss: []uint16{1, 2, 3}, SlotDist: []uint16{4, 5, 6, 7},
+		})), 95 + 4*3},
+		{"clock probe", len(EncodeClockProbe(nil, ClockProbe{})), 9},
+		{"clock echo", len(EncodeClockEcho(nil, ClockEcho{})), 25},
+		{"MTU acknowledgement", len(EncodeMTUProbeAck(nil, 0, 0)), 7},
+	}
+	for _, tt := range tests {
+		if tt.got != tt.want {
+			t.Errorf("%s length = %d, specification says %d", tt.name, tt.got, tt.want)
+		}
+	}
+	if got := len(EncodeMTUProbe(nil, 0, 1400)); got != 1400 {
+		t.Errorf("MTU probe length = %d, requested 1400", got)
+	}
+}
+
 func TestDecodeShortAndBadType(t *testing.T) {
 	if _, err := DecodeSymbol([]byte{typeSystematic, 1, 2}); err != ErrShort {
 		t.Fatalf("want ErrShort, got %v", err)

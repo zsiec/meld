@@ -887,7 +887,7 @@ func (s *Sender) repairCountForPolicy(n int, enforceBudget bool) int {
 	//     because a concentrated run needs this margin proactively — reactive cannot recover it in
 	//     time). Single-path only (multipath keeps the joint-tail set-point).
 	//
-	// Keeping them separate is what the cref bench forced: folding both into one discount made the
+	// The real-time benchmark requires keeping them separate: folding both into one discount made the
 	// burst guard drop the burst-margin discount too, so a bursty channel paid MORE overhead than
 	// the default — strictly worse. They must be discounted on their own clocks.
 	burstMargin := ge - r // ge is max(binomial, GE); r is the i.i.d./joint set-point

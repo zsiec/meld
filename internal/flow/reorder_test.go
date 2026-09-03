@@ -199,7 +199,7 @@ func TestReorderHoldoffInvariants(t *testing.T) {
 	}
 }
 
-// TestReorderHoldoffCutsOverSend is the regression guard for the win cref confirmed: under reorder
+// TestReorderHoldoffCutsOverSend guards the measured improvement under reorder:
 // the receiver over-reports loss and the proactive set-point inflates; the holdoff must cut that
 // over-send materially WITHOUT losing delivery. Compares proactive repair (sstats.Repair) off vs on
 // at equal recoverable loss, with the paced+jittered sim (the reorder the deterministic sim hides).

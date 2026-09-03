@@ -9,6 +9,21 @@ import (
 // proves the value was negotiated from the initiator, not defaulted independently on each side.
 const testEpochSize uint32 = 4096
 
+// These payload lengths are published by the wire specification. Keep the
+// independent literals here so a layout edit cannot update an implementation
+// constant while silently leaving the specification behind.
+func TestSpecificationHandshakePayloadLengths(t *testing.T) {
+	if msg1Len != 1252 {
+		t.Errorf("handshake message 1 payload = %d bytes, specification says 1252", msg1Len)
+	}
+	if msg2Len != 1152 {
+		t.Errorf("handshake message 2 payload = %d bytes, specification says 1152", msg2Len)
+	}
+	if cookieReplyLen != 56 {
+		t.Errorf("cookie reply payload = %d bytes, specification says 56", cookieReplyLen)
+	}
+}
+
 // runHandshake drives a full exchange and returns both sessions (or a fatal error).
 func runHandshake(t *testing.T, initPSK, respPSK, initPro, respPro []byte) (*Session, *Session, error) {
 	t.Helper()

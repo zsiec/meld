@@ -145,8 +145,8 @@ const maxReorderDepth = 1024
 // (ReorderHoldoffMicros / AutoReorderHoldoff): a small reorder window in front of
 // the loss estimators that settles a source id received-or-lost only after lower
 // ids have had a holdoff to arrive, so a reordered-late id is counted RECEIVED —
-// not a fictitious loss that over-sizes repair (the pEst 0.01→0.51 pathology the
-// cref reorder runs pinned). seen holds arrived ids in (next, high]; gapAt is when
+// not a fictitious loss that over-sizes repair (the measured pEst 0.01→0.51
+// pathology under reorder). seen holds arrived ids in (next, high]; gapAt is when
 // `next` first became a gap. Config is copied at construction (it is immutable);
 // sink is the receiver's observeLoss, fed ids in strict increasing order with
 // their own stamped pathID (single-path receivers ignore it).

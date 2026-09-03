@@ -160,11 +160,12 @@ func TestReorderHoldoffScreen(t *testing.T) {
 	}
 }
 
-// TestBenchMapDefault uses the now-paced+jittered sim to MAP where default meld actually has headroom
-// across the budget axis — delivery, p99, and overhead — and to check the bench reproduces cref's
-// real-timing overhead explosion (the unpaced sim shows ~23% repair at 1%/2×RTT; cref shows ~220%,
-// the reactive controller thrashing under jitter). If jitter explodes the sim's overhead toward cref,
-// the bench is predictive for overhead AND the destination is named: reactive over-send under jitter.
+// TestBenchMapDefault uses the now-paced+jittered sim to map where default Meld actually has headroom
+// across the budget axis — delivery, p99, and overhead — and checks that it reproduces the external
+// real-time benchmark's overhead explosion (the unpaced sim shows ~23% repair at 1%/2×RTT; the
+// external stacks show ~220%, with the reactive controller thrashing under jitter). If jitter drives
+// the simulation toward that result, the benchmark is predictive for overhead and identifies reactive
+// over-send under jitter as the target.
 // Env-gated (measurement).
 func TestBenchMapDefault(t *testing.T) {
 	if os.Getenv("AUTORED_SWEEP") == "" {
@@ -201,7 +202,7 @@ func TestBenchMapDefault(t *testing.T) {
 		jit     int64
 	}
 	conds := []cond{{"no jitter (orig sim)", 1e12, 0}, {"pacer100M + jit 80ms", 12_500_000, 80_000}}
-	t.Logf("default meld @ 20Mbps 1%% burst2, %d seeds (cref ref: 2×RTT ovhd~220%%, 4×RTT ovhd~140%%, deliv unstable@2× ~100@4×)", seeds)
+	t.Logf("default meld @ 20Mbps 1%% burst2, %d seeds (external-stack ref: 2×RTT ovhd~220%%, 4×RTT ovhd~140%%, deliv unstable@2× ~100@4×)", seeds)
 	for _, c := range conds {
 		t.Logf("=== %s ===  budget | deliv%% [min-max] | p99ms | ovhd%%", c.name)
 		for _, mult := range []float64{2, 3, 4, 6} {

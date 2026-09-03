@@ -151,10 +151,10 @@ func TestExtendedExactClosureDeepBurst(t *testing.T) {
 		maxBitrate      = 3_200_000
 		paceBytesPerSec = maxBitrate / 8
 	)
-	var legacyTotal, extendedTotal int
+	var bitmap64Total, extendedTotal int
 	var extendedExact uint64
 	for seed := int64(1); seed <= 8; seed++ {
-		run := func(legacy64 bool) simResult {
+		run := func(bitmap64Only bool) simResult {
 			cfg := DefaultConfig()
 			cfg.Flow = 1
 			cfg.SymbolSize = 256
@@ -163,28 +163,28 @@ func TestExtendedExactClosureDeepBurst(t *testing.T) {
 			s := NewSlidingSender(cfg)
 			s.disableEpochRepair = true
 			r := NewSlidingReceiver(cfg)
-			r.disableExtendedClosure = legacy64
+			r.disableExtendedClosure = bitmap64Only
 			return (simLink{
 				cfg: cfg, owdMicros: rttMicros / 2, srcMicros: sourceMicros, n: n,
 				sliding: true, drop: geTimeDrop(seed, sourceMicros, 0.20, 96),
 				paceBytesPerSec: paceBytesPerSec,
 			}).runCores(s, r)
 		}
-		legacy := run(true)
+		bitmap64 := run(true)
 		extended := run(false)
-		assertCoreInvariants(t, legacy, n, "64-value exact feedback")
+		assertCoreInvariants(t, bitmap64, n, "64-value exact feedback")
 		assertCoreInvariants(t, extended, n, "extended exact feedback")
-		legacyTotal += legacy.deliveredInTime
+		bitmap64Total += bitmap64.deliveredInTime
 		extendedTotal += extended.deliveredInTime
 		extendedExact += extended.sstats.RepairExact
 	}
-	t.Logf("legacy64=%d extended=%d delta=%d exact=%d", legacyTotal,
-		extendedTotal, extendedTotal-legacyTotal, extendedExact)
+	t.Logf("bitmap64=%d extended=%d delta=%d exact=%d", bitmap64Total,
+		extendedTotal, extendedTotal-bitmap64Total, extendedExact)
 	if extendedExact == 0 {
 		t.Fatal("extended closure never emitted exact repair")
 	}
-	if extendedTotal <= legacyTotal {
-		t.Fatalf("extended closure did not improve deep-burst delivery: legacy=%d extended=%d",
-			legacyTotal, extendedTotal)
+	if extendedTotal <= bitmap64Total {
+		t.Fatalf("extended closure did not improve deep-burst delivery: bitmap64=%d extended=%d",
+			bitmap64Total, extendedTotal)
 	}
 }

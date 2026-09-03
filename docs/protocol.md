@@ -282,6 +282,7 @@ descriptor:
 - temporal layer
 - discardability
 - non-picture metadata
+- long-term-reference candidates
 
 This is how the protocol avoids treating every packet equally. Parameter sets,
 RAP anchors, base references, and recovery-critical metadata can receive stronger
@@ -308,6 +309,10 @@ active reduction request.
 `RecoveryCadenceFrames` asks an attached encoder to bound recovery distance when
 feedback shows long bursts causing frame damage. The encoder may implement that
 with intra-refresh, recovery-point SEI, or keyframes.
+
+`Resync` asks the encoder to code its next frame against `ResyncRefFrameID`, an
+LTR candidate the receiver has confirmed decodable, after the live reference
+chain breaks. An encoder that no longer retains the named LTR may ignore it.
 
 This is not a profile switch. It is an actuator for the same adaptive transport
 loop. If the encoder cannot comply, Meld continues with transport-only repair.

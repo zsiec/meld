@@ -139,6 +139,9 @@ if ctrl.RecoveryCadenceFrames != 0 {
 } else {
 	encoder.RelaxRecoveryInterval()
 }
+if ctrl.Resync {
+	encoder.RequestLTRResync(ctrl.ResyncRefFrameID)
+}
 ```
 
 The request is advisory. Meld continues operating even if the encoder ignores it.
@@ -150,6 +153,7 @@ Recommended behavior:
 - satisfy with bounded intra-refresh or recovery-point cadence when possible
 - avoid frequent full IDR/keyint shortcuts unless that is the codec's only
   actuator
+- honor `Resync` with the named retained LTR when available; otherwise ignore it
 - relax the encoder request when Meld returns `0`
 - do not expose this as a separate user profile
 

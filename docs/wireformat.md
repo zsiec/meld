@@ -4,8 +4,8 @@ This document defines the on-wire encoding implemented by `internal/wire`. All
 multi-byte integers are big-endian. A decoder returns `ErrShort`, `ErrType`,
 `ErrVersion`, or `ErrInvalid` for malformed input and never panics.
 
-Version 1 is the sole research format. The repository does not encode or decode
-any preceding layout.
+Version 1 is the sole research format. The repository encodes and decodes exactly
+the layout below.
 
 ## Datagram lead byte
 

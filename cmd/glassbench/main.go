@@ -7,7 +7,7 @@
 // actually decode. The metric is picture-level QoE (decodable frames / keyframes), not
 // byte delivery: the point is that a lost keyframe poisons a whole GOP, so WHICH packets
 // survive matters as much as how many. Meld (in-module) can use internal/shape for the
-// dependency model; the C stacks are driven exactly as in the cref byte-level harness.
+// dependency model; the C stacks use the same byte-level harness as the SRT/RIST benchmark.
 package main
 
 import (
